@@ -1,18 +1,20 @@
 import {
-  BadRequestException, Body, Controller, Get, Inject, Logger, Param, Post, Req,
+  Controller, Get, Param, Post, Req,
 } from '@nestjs/common';
-import Redis from 'ioredis';
 import {
-  CREDIT_REDIS_CLIENT,
   CreditCost,
   CreditRecoveryService,
   CreditService,
 } from '../src';
-import { Cron } from '@nestjs/schedule';
-
-interface ResetBalanceBody {
-  amount?: number;
-}
+import {
+  BLOCKCHAIN_API_CREDIT_POLICY,
+  BLOCKCHAIN_TRANSACTION_COST,
+  BLOCKCHAIN_TRANSACTION_SUBJECT,
+  CHEAP_CREDIT_POLICY,
+  EXAMPLE_ACCOUNT_ID,
+  EXAMPLE_SUBJECT,
+  exampleBalanceProvider,
+} from './credit-demo.config';
 
 interface DemoRequest { requestId: string }
 
@@ -21,7 +23,6 @@ export class ExampleDemoController {
   constructor(
     private readonly credits: CreditService,
     private readonly recovery: CreditRecoveryService,
-    @Inject(CREDIT_REDIS_CLIENT) private readonly redis: Redis,
   ) {}
 
   /** No @CreditCost: useful for checking that undecorated routes remain free. */
@@ -38,8 +39,13 @@ export class ExampleDemoController {
   @Get('balance')
   async balance() {
     return {
-      accountId: 'user_123',
-      balance: await this.credits.getBalance('user_123'),
+      accountId: EXAMPLE_ACCOUNT_ID,
+      balances: {
+        API_CREDIT: await this.credits.getBalance(EXAMPLE_SUBJECT),
+        BLOCKCHAIN_TXN_CREDIT: await this.credits.getBalance(
+          BLOCKCHAIN_TRANSACTION_SUBJECT,
+        ),
+      },
     };
   }
 
@@ -49,27 +55,65 @@ export class ExampleDemoController {
     return await this.credits.getReservation(reservationId) ?? { found: false };
   }
 
-  /** Reset the playground between experiments. Defaults to 100 credits. */
-  @Post('reset')
-  async reset(@Body() body: ResetBalanceBody = {}) {
-    const amount = body.amount ?? 100;
-    if (!Number.isSafeInteger(amount) || amount < 0) {
-      throw new BadRequestException('amount must be a non-negative safe integer');
-    }
-
-    await this.redis.set('credit:balance:user_123', amount);
-    return { accountId: 'user_123', balance: amount };
-  }
-
   /** Create an intentionally abandoned reservation for recovery experiments. */
   @Post('orphan')
   async orphan(@Req() request: DemoRequest) {
     return this.credits.reserve({
-      accountId: 'user_123',
+      subject: EXAMPLE_SUBJECT,
       requestId: request.requestId,
-      serviceId: 'recovery-demo',
       amount: 15,
     });
+  }
+
+  /** Programmatic/deferred: caller settles this reservation later. */
+  @Post('deferred')
+  async deferred(@Req() request: DemoRequest) {
+    return this.credits.reserve({
+      subject: EXAMPLE_SUBJECT,
+      requestId: `${request.requestId}:deferred`,
+      operation: 'DEFERRED_DEMO',
+      amount: 25,
+      settlementMode: 'DEFERRED',
+    });
+  }
+
+  /**
+   * One business operation with two independent credit lifecycles:
+   * - the decorator commits 5 API_CREDIT after this handler succeeds;
+   * - the manual reservation emits a RESERVED event and remains DEFERRED.
+   *
+   * This demo intentionally has no worker. The reservation opts out of
+   * scheduled recovery and must eventually be committed or rolled back by its
+   * owner. The configured event handler logs its RESERVED event.
+   */
+  @Post('blockchain-operation')
+  @CreditCost(BLOCKCHAIN_API_CREDIT_POLICY)
+  async blockchainOperation(@Req() request: DemoRequest) {
+    await this.credits.reserve({
+      subject: BLOCKCHAIN_TRANSACTION_SUBJECT,
+      requestId: `${request.requestId}:blockchain-transaction`,
+      operation: 'EXECUTE_BLOCKCHAIN_TRANSACTION',
+      amount: BLOCKCHAIN_TRANSACTION_COST,
+      settlementMode: 'DEFERRED',
+      autoRecover: false,
+    });
+
+    return {};
+  }
+
+  @Post('deferred/:reservationId/commit')
+  commitDeferred(@Param('reservationId') id: string) {
+    return this.credits.commit(id);
+  }
+
+  @Post('deferred/:reservationId/rollback')
+  rollbackDeferred(@Param('reservationId') id: string) {
+    return this.credits.rollback(id, 'deferred_operation_failed');
+  }
+
+  @Get('provider-calls')
+  providerCalls() {
+    return { calls: exampleBalanceProvider.calls };
   }
 
   /** Manually run one recovery pass (production should use an external worker). */
@@ -80,12 +124,12 @@ export class ExampleDemoController {
 
   /** Successful low-cost request: 100 becomes 90. */
   @Post('cheap')
-  @CreditCost(10)
+  @CreditCost(CHEAP_CREDIT_POLICY)
   async cheap() {
     return {
       success: true,
       cost: 10,
-      balanceDuringController: await this.credits.getBalance('user_123'),
+      balanceDuringController: await this.credits.getBalance(EXAMPLE_SUBJECT),
     };
   }
 
@@ -96,7 +140,7 @@ export class ExampleDemoController {
     return {
       success: true,
       cost: 70,
-      balanceDuringController: await this.credits.getBalance('user_123'),
+      balanceDuringController: await this.credits.getBalance(EXAMPLE_SUBJECT),
     };
   }
 
@@ -106,20 +150,4 @@ export class ExampleDemoController {
   fail(): never {
     throw new Error('Intentional demo failure');
   }
-
-
-
-  @Cron('*/60 * * * * *')
-  async cronRecover() {
-    const recovered = await this.recovery.runOnce();
-    Logger.log(`Cron job ran; recovered ${recovered} expired reservations`);
-    if (recovered > 0) {
-      console.log(`Cron recovered ${recovered} expired reservations`);
-    }
-  }
-
 }
-
-
-
-

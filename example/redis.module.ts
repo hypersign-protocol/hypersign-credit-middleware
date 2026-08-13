@@ -35,8 +35,6 @@ class RedisShutdown implements OnApplicationShutdown {
         });
 
         await redis.ping();
-        // Make a fresh demo usable while preserving any existing balance.
-        await redis.set('credit:balance:user_123', '100', 'NX');
         return redis;
       },
     },

@@ -1,79 +1,126 @@
-import { BadRequestException, Inject, Injectable } from '@nestjs/common';
-import { randomUUID } from 'node:crypto';
 import {
-  BALANCE_PREFIX,
-  EXPIRATION_KEY,
-  REQUEST_PREFIX,
-  RESERVATION_PREFIX,
-} from './credit.constants';
+  BadRequestException,
+  HttpException,
+  HttpStatus,
+  Inject,
+  Injectable,
+} from '@nestjs/common';
+import { randomUUID } from 'node:crypto';
+import { GET_BALANCE_SCRIPT, GET_RESERVATION_SCRIPT } from './credit.constants';
+import { CreditKeyspace } from './credit-keyspace';
 import {
   CREDIT_OPTIONS,
   CREDIT_REDIS_CLIENT,
-  CreditOptions,
   CreditRedisClient,
   CreditReservation,
   CreditReservationStatus,
+  CreditSubject,
+  GrantCreditsInput,
+  GrantCreditsResult,
   ReserveCreditInput,
   ReserveCreditResult,
   ResolvedCreditOptions,
 } from './credit.types';
+import { CreditEventDispatcher } from './events/credit.event-dispatcher';
 
 const RESERVE_SCRIPT = `
 local existingId = redis.call('HGET', KEYS[3], 'reservationId')
 if existingId then
+  if redis.call('HGET', KEYS[3], 'amount') ~= ARGV[1]
+    or redis.call('HGET', KEYS[3], 'settlementMode') ~= ARGV[14]
+    or redis.call('HGET', KEYS[3], 'operation') ~= ARGV[15]
+    or redis.call('HGET', KEYS[3], 'autoRecover') ~= ARGV[16] then
+    return {-2}
+  end
   return {existingId, redis.call('HGET', KEYS[3], 'remainingBalance'),
-    redis.call('HGET', KEYS[3], 'expiresAt'), 1}
+    redis.call('HGET', KEYS[3], 'expiresAt'), 1,
+    redis.call('HGET', KEYS[3], 'leaseToken'),
+    redis.call('HGET', KEYS[3], 'autoRecover')}
 end
-local balance = tonumber(redis.call('GET', KEYS[1]) or '0')
+local rawBalance = redis.call('GET', KEYS[1])
+if not rawBalance then return {-3} end
+local balance = tonumber(rawBalance)
 local amount = tonumber(ARGV[1])
 if balance < amount then return {-1} end
-local now = tonumber(ARGV[6])
-local expiresAt = now + tonumber(ARGV[7])
+local expiresAt = tonumber(ARGV[10]) + tonumber(ARGV[11])
 local remaining = redis.call('DECRBY', KEYS[1], amount)
-redis.call('HSET', KEYS[2], 'reservationId', ARGV[2], 'accountId', ARGV[3],
-  'requestId', ARGV[4], 'serviceId', ARGV[5], 'amount', amount,
-  'remainingBalance', remaining, 'status', 'RESERVED', 'ownerId', ARGV[8],
-  'createdAt', now, 'expiresAt', expiresAt, 'version', 1)
-redis.call('ZADD', KEYS[4], expiresAt, ARGV[2])
+redis.call('HSET', KEYS[2],
+  'reservationId', ARGV[2], 'scopeId', ARGV[3], 'accountId', ARGV[4],
+  'tenantId', ARGV[5], 'accountType', ARGV[6], 'serviceId', ARGV[7],
+  'creditType', ARGV[8], 'requestId', ARGV[9], 'amount', ARGV[1],
+  'remainingBalance', remaining, 'status', 'RESERVED', 'leaseToken', ARGV[12],
+  'createdAt', ARGV[10], 'expiresAt', expiresAt, 'version', 1,
+  'settlementMode', ARGV[14], 'operation', ARGV[15],
+  'autoRecover', ARGV[16], 'balanceKey', KEYS[1])
+if ARGV[16] == '1' then redis.call('ZADD', KEYS[4], expiresAt, ARGV[2]) end
 redis.call('HSET', KEYS[3], 'reservationId', ARGV[2],
-  'remainingBalance', remaining, 'expiresAt', expiresAt)
-redis.call('PEXPIRE', KEYS[3], tonumber(ARGV[9]))
-return {ARGV[2], remaining, expiresAt, 0}
+  'remainingBalance', remaining, 'expiresAt', expiresAt,
+  'amount', ARGV[1], 'settlementMode', ARGV[14], 'operation', ARGV[15],
+  'leaseToken', ARGV[12], 'autoRecover', ARGV[16])
+redis.call('XADD', KEYS[5], 'MAXLEN', '~', ARGV[17], '*',
+  'event', 'RESERVED', 'timestamp', ARGV[10], 'scopeId', ARGV[3],
+  'accountId', ARGV[4], 'tenantId', ARGV[5], 'accountType', ARGV[6],
+  'serviceId', ARGV[7], 'creditType', ARGV[8], 'requestId', ARGV[9],
+  'operation', ARGV[15], 'amount', ARGV[1], 'reservationId', ARGV[2],
+  'settlementMode', ARGV[14], 'autoRecover', ARGV[16],
+  'expiresAt', expiresAt,
+  'balanceAfter', remaining)
+return {ARGV[2], remaining, expiresAt, 0, ARGV[12], ARGV[16]}
 `;
 
 const COMMIT_SCRIPT = `
 local status = redis.call('HGET', KEYS[1], 'status')
-if not status then return -2 end
-if status == 'COMMITTED' then return 0 end
-if status ~= 'RESERVED' then return -1 end
+if not status then return {-2} end
+if status == 'COMMITTED' then return {0} end
+if status ~= 'RESERVED' then return {-1} end
+local fields = redis.call('HMGET', KEYS[1], 'scopeId', 'accountId', 'tenantId',
+  'accountType', 'serviceId', 'creditType', 'amount', 'operation',
+  'remainingBalance')
 redis.call('HSET', KEYS[1], 'status', 'COMMITTED', 'finalizedAt', ARGV[1],
   'finalizationReason', 'controller_succeeded')
 redis.call('ZREM', KEYS[2], ARGV[2])
 redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[3]))
-return 1
+redis.call('PEXPIRE', KEYS[4], tonumber(ARGV[3]))
+redis.call('XADD', KEYS[3], 'MAXLEN', '~', ARGV[4], '*',
+  'event', 'COMMITTED', 'timestamp', ARGV[1], 'reservationId', ARGV[2],
+  'scopeId', fields[1], 'accountId', fields[2], 'tenantId', fields[3],
+  'accountType', fields[4], 'serviceId', fields[5], 'creditType', fields[6],
+  'amount', fields[7], 'operation', fields[8], 'balanceAfter', fields[9])
+return {1, fields[1], fields[2], fields[3], fields[4], fields[5], fields[6],
+  fields[7], fields[8], fields[9]}
 `;
 
 const ROLLBACK_SCRIPT = `
 local status = redis.call('HGET', KEYS[1], 'status')
-if not status then return -2 end
-if status ~= 'RESERVED' then return 0 end
-local accountId = redis.call('HGET', KEYS[1], 'accountId')
-local amount = redis.call('HGET', KEYS[1], 'amount')
-redis.call('INCRBY', ARGV[1] .. accountId, amount)
-redis.call('HSET', KEYS[1], 'status', ARGV[2], 'finalizedAt', ARGV[3],
-  'finalizationReason', ARGV[4])
-redis.call('ZREM', KEYS[2], ARGV[5])
-redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[6]))
-return 1
+if not status or status ~= 'RESERVED' then return {0} end
+if redis.call('HGET', KEYS[1], 'balanceKey') ~= KEYS[4] then return {-2} end
+local fields = redis.call('HMGET', KEYS[1], 'scopeId', 'accountId', 'tenantId',
+  'accountType', 'serviceId', 'creditType', 'amount', 'operation')
+local remaining = redis.call('INCRBY', KEYS[4], fields[7])
+redis.call('HSET', KEYS[1], 'status', ARGV[1], 'finalizedAt', ARGV[2],
+  'finalizationReason', ARGV[3], 'remainingBalance', remaining)
+redis.call('ZREM', KEYS[2], ARGV[4])
+redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[5]))
+redis.call('PEXPIRE', KEYS[5], tonumber(ARGV[5]))
+redis.call('XADD', KEYS[3], 'MAXLEN', '~', ARGV[6], '*',
+  'event', ARGV[1], 'timestamp', ARGV[2], 'reservationId', ARGV[4],
+  'scopeId', fields[1], 'accountId', fields[2], 'tenantId', fields[3],
+  'accountType', fields[4], 'serviceId', fields[5], 'creditType', fields[6],
+  'amount', fields[7], 'operation', fields[8], 'reason', ARGV[3],
+  'balanceAfter', remaining)
+return {1, fields[1], fields[2], fields[3], fields[4], fields[5], fields[6],
+  fields[7], fields[8], remaining}
 `;
 
 const RENEW_SCRIPT = `
 if redis.call('HGET', KEYS[1], 'status') ~= 'RESERVED' then return -1 end
-if redis.call('HGET', KEYS[1], 'ownerId') ~= ARGV[1] then return -2 end
+if redis.call('HGET', KEYS[1], 'leaseToken') ~= ARGV[1] then return -2 end
 local expiresAt = tonumber(ARGV[2]) + tonumber(ARGV[3])
 redis.call('HSET', KEYS[1], 'expiresAt', expiresAt)
 redis.call('HINCRBY', KEYS[1], 'version', 1)
-redis.call('ZADD', KEYS[2], expiresAt, ARGV[4])
+if redis.call('HGET', KEYS[1], 'autoRecover') ~= '0' then
+  redis.call('ZADD', KEYS[2], expiresAt, ARGV[4])
+end
 return expiresAt
 `;
 
@@ -82,153 +129,566 @@ return redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1],
   'LIMIT', 0, tonumber(ARGV[2]))
 `;
 
-const RECOVER_SCRIPT = `
-if redis.call('HGET', KEYS[1], 'status') ~= 'RESERVED' then return 0 end
-local expiresAt = tonumber(redis.call('HGET', KEYS[1], 'expiresAt') or '0')
-if expiresAt > tonumber(ARGV[1]) then return 0 end
-local accountId = redis.call('HGET', KEYS[1], 'accountId')
-local amount = redis.call('HGET', KEYS[1], 'amount')
-redis.call('INCRBY', ARGV[2] .. accountId, amount)
-redis.call('HSET', KEYS[1], 'status', 'EXPIRED', 'finalizedAt', ARGV[1],
-  'finalizationReason', 'lease_expired')
-redis.call('ZREM', KEYS[2], ARGV[3])
-redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[4]))
-return 1
+const REMOVE_EXPIRATION_SCRIPT = `
+return redis.call('ZREM', KEYS[1], ARGV[1])
 `;
 
-export class InsufficientCreditsException extends BadRequestException {
-  constructor() { super('Insufficient credits'); }
+const RECOVER_SCRIPT = `
+if redis.call('HGET', KEYS[1], 'status') ~= 'RESERVED' then
+  redis.call('ZREM', KEYS[2], ARGV[2])
+  return {0}
+end
+if redis.call('HGET', KEYS[1], 'autoRecover') == '0' then
+  redis.call('ZREM', KEYS[2], ARGV[2])
+  return {0}
+end
+local expiresAt = tonumber(redis.call('HGET', KEYS[1], 'expiresAt') or '0')
+if expiresAt > tonumber(ARGV[1]) then return {0} end
+if redis.call('HGET', KEYS[1], 'balanceKey') ~= KEYS[4] then return {-2} end
+local fields = redis.call('HMGET', KEYS[1], 'scopeId', 'accountId', 'tenantId',
+  'accountType', 'serviceId', 'creditType', 'amount', 'operation')
+local remaining = redis.call('INCRBY', KEYS[4], fields[7])
+redis.call('HSET', KEYS[1], 'status', 'EXPIRED', 'finalizedAt', ARGV[1],
+  'finalizationReason', 'lease_expired', 'remainingBalance', remaining)
+redis.call('ZREM', KEYS[2], ARGV[2])
+redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[3]))
+redis.call('PEXPIRE', KEYS[5], tonumber(ARGV[3]))
+redis.call('XADD', KEYS[3], 'MAXLEN', '~', ARGV[4], '*',
+  'event', 'EXPIRED', 'timestamp', ARGV[1], 'reservationId', ARGV[2],
+  'scopeId', fields[1], 'accountId', fields[2], 'tenantId', fields[3],
+  'accountType', fields[4], 'serviceId', fields[5], 'creditType', fields[6],
+  'amount', fields[7], 'operation', fields[8], 'reason', 'lease_expired',
+  'balanceAfter', remaining)
+return {1, fields[1], fields[2], fields[3], fields[4], fields[5], fields[6],
+  fields[7], fields[8], remaining}
+`;
+
+const ACQUIRE_LOCK_SCRIPT = `
+if redis.call('SET', KEYS[1], ARGV[1], 'NX', 'PX', ARGV[2])
+then return 1 else return 0 end
+`;
+const INITIALIZE_BALANCE_SCRIPT = `
+if redis.call('GET', KEYS[1]) then return 0 end
+redis.call('SET', KEYS[1], ARGV[1])
+return 1
+`;
+const RELEASE_LOCK_SCRIPT = `
+if redis.call('GET', KEYS[1]) == ARGV[1]
+then return redis.call('DEL', KEYS[1]) else return 0 end
+`;
+
+const GRANT_SCRIPT = `
+local existingAmount = redis.call('HGET', KEYS[2], 'amount')
+if existingAmount then
+  if existingAmount ~= ARGV[1] then return {-1} end
+  local currentBalance = redis.call('GET', KEYS[1])
+  if not currentBalance then return {-2} end
+  return {currentBalance, 1}
+end
+if not redis.call('GET', KEYS[1]) then return {-2} end
+local balance = redis.call('INCRBY', KEYS[1], ARGV[1])
+redis.call('HSET', KEYS[2], 'amount', ARGV[1], 'balance', balance)
+redis.call('PEXPIRE', KEYS[2], tonumber(ARGV[11]))
+redis.call('XADD', KEYS[3], 'MAXLEN', '~', ARGV[12], '*',
+  'event', 'CREDIT_GRANTED', 'timestamp', ARGV[2], 'scopeId', ARGV[3],
+  'accountId', ARGV[4], 'tenantId', ARGV[5], 'accountType', ARGV[6],
+  'serviceId', ARGV[7], 'creditType', ARGV[8], 'referenceId', ARGV[9],
+  'reason', ARGV[10], 'amount', ARGV[1], 'balanceAfter', balance)
+return {balance, 0}
+`;
+
+export class InsufficientCreditsException extends HttpException {
+  constructor() { super('Insufficient credits', HttpStatus.PAYMENT_REQUIRED); }
+}
+
+export class CreditBalanceInitializationException extends HttpException {
+  constructor() {
+    super('Credit balance initialization is already in progress', HttpStatus.SERVICE_UNAVAILABLE);
+  }
+}
+
+export interface RecoveredReservation extends CreditSubject {
+  subject: CreditSubject;
+  scopeId: string;
+  reservationId: string;
+  amount: number;
+  operation?: string;
+  balanceAfter: number;
 }
 
 @Injectable()
 export class CreditService {
-  private readonly ownerId = randomUUID();
+  private readonly keys: CreditKeyspace;
 
   constructor(
     @Inject(CREDIT_REDIS_CLIENT) private readonly redis: CreditRedisClient,
     @Inject(CREDIT_OPTIONS) private readonly options: ResolvedCreditOptions,
-  ) {}
+    private readonly dispatcher: CreditEventDispatcher,
+  ) {
+    this.keys = new CreditKeyspace(options);
+  }
 
   async reserve(input: ReserveCreditInput): Promise<ReserveCreditResult> {
-    if (!input.accountId) throw new TypeError('accountId is required');
+    const subject = this.keys.subject(input.subject);
     if (!Number.isSafeInteger(input.amount) || input.amount <= 0) {
       throw new TypeError('amount must be a positive safe integer');
     }
-    const reservationId = randomUUID();
-    const requestId = input.requestId || randomUUID();
-    const now = Date.now();
-    const result = await this.redis.eval(RESERVE_SCRIPT, 4,
-      this.balanceKey(input.accountId), this.reservationKey(reservationId),
-      this.requestKey(input.accountId, requestId), EXPIRATION_KEY,
-      input.amount, reservationId, input.accountId, requestId,
-      input.serviceId ?? '', now, this.options.leaseMs, this.ownerId,
-      this.options.retentionMs,
-    );
-    const values = result as Array<string | number>;
-    if (Number(values[0]) === -1) throw new InsufficientCreditsException();
-    if (!Array.isArray(values) || values.length !== 4) {
-      throw new Error(`Unexpected Redis reserve result: ${String(result)}`);
+    const settlementMode = input.settlementMode ?? 'IMMEDIATE';
+    if (input.autoRecover === false && settlementMode !== 'DEFERRED') {
+      throw new TypeError('autoRecover can be disabled only for DEFERRED reservations');
     }
+    // Resolve configuration before mutating Redis. A bad dynamic threshold
+    // must not leave a reservation behind when reserve() throws.
+    const threshold = this.resolveThreshold(subject);
+    await this.initializeBalanceIfMissing(subject);
+
+    const reservationId = randomUUID();
+    const leaseToken = randomUUID();
+    const requestId = input.requestId?.trim() || randomUUID();
+    const scopeId = this.keys.scopeId(subject);
+    const now = Date.now();
+    const operation = input.operation ?? '';
+    const autoRecover = input.autoRecover ?? true;
+    const result = await this.redis.eval(
+      RESERVE_SCRIPT,
+      5,
+      this.keys.balance(subject),
+      this.keys.reservation(reservationId),
+      this.keys.request(subject, requestId),
+      this.keys.expirations(),
+      this.keys.eventStream(),
+      input.amount,
+      reservationId,
+      scopeId,
+      subject.accountId,
+      subject.tenantId ?? '',
+      subject.accountType ?? '',
+      subject.serviceId ?? '',
+      subject.creditType ?? '',
+      requestId,
+      now,
+      this.options.leaseMs,
+      leaseToken,
+      this.options.retentionMs,
+      settlementMode,
+      operation,
+      autoRecover ? '1' : '0',
+      this.options.eventStreamMaxLength,
+    ) as Array<string | number>;
+
+    if (!Array.isArray(result)) throw new Error(`Unexpected Redis reserve result: ${String(result)}`);
+    if (Number(result[0]) === -1) throw new InsufficientCreditsException();
+    if (Number(result[0]) === -2) {
+      throw new BadRequestException('requestId was reused with different credit semantics');
+    }
+    if (Number(result[0]) === -3) {
+      throw new Error('Scoped credit balance disappeared during reservation');
+    }
+    if (result.length !== 6) throw new Error(`Unexpected Redis reserve result: ${String(result)}`);
+
+    const remainingBalance = Number(result[1]);
+    const expiresAt = Number(result[2]);
+    const existing = Number(result[3]) === 1;
+    const storedAutoRecover = String(result[5]) !== '0';
+    if (!existing) {
+      this.dispatcher.dispatch({
+        ...this.eventBase(subject, scopeId, now),
+        type: 'RESERVED',
+        reservationId: String(result[0]),
+        requestId,
+        amount: input.amount,
+        balanceAfter: remainingBalance,
+        expiresAt,
+        settlementMode,
+        operation: input.operation,
+        autoRecover: storedAutoRecover,
+      });
+    }
+
+    if (!existing && remainingBalance <= threshold) {
+      this.dispatcher.dispatch({
+        ...this.eventBase(subject, scopeId, now),
+        type: 'CRITICAL_BALANCE',
+        balance: remainingBalance,
+        threshold,
+      });
+    }
+
     return {
-      reservationId: String(values[0]),
-      remainingBalance: Number(values[1]),
-      expiresAt: Number(values[2]),
-      existing: Number(values[3]) === 1,
+      reservationId: String(result[0]),
+      leaseToken: String(result[4]),
+      scopeId,
+      remainingBalance,
+      expiresAt,
+      autoRecover: storedAutoRecover,
+      existing,
+      settlementMode,
+      subject,
     };
   }
 
+  /** Atomically and idempotently tops up one scoped wallet. */
+  async grant(input: GrantCreditsInput): Promise<GrantCreditsResult> {
+    const subject = this.keys.subject(input.subject);
+    if (!Number.isSafeInteger(input.amount) || input.amount <= 0) {
+      throw new TypeError('grant amount must be a positive safe integer');
+    }
+    const referenceId = input.referenceId?.trim();
+    if (!referenceId) throw new TypeError('referenceId is required');
+    await this.initializeBalanceIfMissing(subject);
+    const now = Date.now();
+    const scopeId = this.keys.scopeId(subject);
+    const result = await this.redis.eval(
+      GRANT_SCRIPT,
+      3,
+      this.keys.balance(subject),
+      this.keys.grant(subject, referenceId),
+      this.keys.eventStream(),
+      input.amount,
+      now,
+      scopeId,
+      subject.accountId,
+      subject.tenantId ?? '',
+      subject.accountType ?? '',
+      subject.serviceId ?? '',
+      subject.creditType ?? '',
+      referenceId,
+      input.reason ?? '',
+      this.options.retentionMs,
+      this.options.eventStreamMaxLength,
+    ) as Array<string | number>;
+    if (Number(result[0]) === -1) {
+      throw new BadRequestException('referenceId was reused with a different grant amount');
+    }
+    if (Number(result[0]) === -2) throw new Error('Scoped balance disappeared during grant');
+    const balance = Number(result[0]);
+    const existing = Number(result[1]) === 1;
+    if (!existing) {
+      this.dispatcher.dispatch({
+        ...this.eventBase(subject, scopeId, now),
+        type: 'CREDIT_GRANTED',
+        referenceId,
+        amount: input.amount,
+        balanceAfter: balance,
+        reason: input.reason,
+      });
+    }
+    return { balance, existing, subject };
+  }
+
   async commit(reservationId: string): Promise<boolean> {
-    const result = await this.redis.eval(COMMIT_SCRIPT, 2,
-      this.reservationKey(reservationId), EXPIRATION_KEY,
-      Date.now(), reservationId, this.options.retentionMs,
-    );
-    return Number(result) === 1;
+    const reservation = await this.getReservation(reservationId);
+    if (!reservation) return false;
+    const now = Date.now();
+    const result = await this.redis.eval(
+      COMMIT_SCRIPT,
+      4,
+      this.keys.reservation(reservationId),
+      this.keys.expirations(),
+      this.keys.eventStream(),
+      this.keys.request(reservation.subject, reservation.requestId!),
+      now,
+      reservationId,
+      this.options.retentionMs,
+      this.options.eventStreamMaxLength,
+    ) as Array<string | number>;
+    if (Number(result[0]) !== 1) return false;
+    const parsed = this.parseFinalizationResult(result, true);
+    this.dispatcher.dispatch({
+      ...this.eventBase(parsed.subject, parsed.scopeId, now),
+      type: 'COMMITTED',
+      reservationId,
+      amount: parsed.amount,
+      balanceAfter: parsed.balanceAfter!,
+      operation: parsed.operation,
+    });
+    return true;
   }
 
   async rollback(reservationId: string, reason = 'controller_failed'): Promise<boolean> {
-    return this.finalizeWithRefund(reservationId, 'ROLLED_BACK', reason);
+    return this.refund(reservationId, 'ROLLED_BACK', reason, Date.now());
   }
 
-  async renew(reservationId: string): Promise<number> {
-    const result = Number(await this.redis.eval(RENEW_SCRIPT, 2,
-      this.reservationKey(reservationId), EXPIRATION_KEY,
-      this.ownerId, Date.now(), this.options.leaseMs, reservationId,
+  async renew(reservationId: string, leaseToken: string): Promise<number> {
+    if (!leaseToken) throw new TypeError('leaseToken is required');
+    const result = Number(await this.redis.eval(
+      RENEW_SCRIPT,
+      2,
+      this.keys.reservation(reservationId),
+      this.keys.expirations(),
+      leaseToken,
+      Date.now(),
+      this.options.leaseMs,
+      reservationId,
     ));
     if (result < 0) throw new Error(`Reservation ${reservationId} cannot be renewed`);
     return result;
   }
 
-  async recoverExpired(now = Date.now()): Promise<number> {
-    const ids = await this.redis.eval(FIND_EXPIRED_SCRIPT, 1, EXPIRATION_KEY,
-      now, this.options.recoveryBatchSize) as string[];
-    let recovered = 0;
-    for (const id of ids) {
-      const result = await this.redis.eval(RECOVER_SCRIPT, 2,
-        this.reservationKey(id), EXPIRATION_KEY,
-        now, BALANCE_PREFIX, id, this.options.retentionMs,
-      );
-      if (Number(result) === 1) recovered++;
+  async recoverExpired(now = Date.now()): Promise<RecoveredReservation[]> {
+    const ids = await this.redis.eval(
+      FIND_EXPIRED_SCRIPT,
+      1,
+      this.keys.expirations(),
+      now,
+      this.options.recoveryBatchSize,
+    ) as string[];
+    const recovered: RecoveredReservation[] = [];
+    for (const reservationId of ids) {
+      const reservation = await this.getReservation(reservationId);
+      if (!reservation) {
+        // A reservation hash may be absent after manual Redis maintenance,
+        // eviction, or retention misconfiguration. Remove the dangling member
+        // so it cannot permanently occupy every recovery batch.
+        await this.redis.eval(
+          REMOVE_EXPIRATION_SCRIPT,
+          1,
+          this.keys.expirations(),
+          reservationId,
+        );
+        continue;
+      }
+      const result = await this.redis.eval(
+        RECOVER_SCRIPT,
+        5,
+        this.keys.reservation(reservationId),
+        this.keys.expirations(),
+        this.keys.eventStream(),
+        this.keys.balance(reservation.subject),
+        this.keys.request(reservation.subject, reservation.requestId!),
+        now,
+        reservationId,
+        this.options.retentionMs,
+        this.options.eventStreamMaxLength,
+      ) as Array<string | number>;
+      if (Number(result[0]) !== 1) continue;
+      const parsed = this.parseFinalizationResult(result, true);
+      recovered.push({
+        ...parsed.subject,
+        subject: parsed.subject,
+        scopeId: parsed.scopeId,
+        reservationId,
+        amount: parsed.amount,
+        operation: parsed.operation,
+        balanceAfter: parsed.balanceAfter!,
+      });
     }
     return recovered;
   }
 
   async getReservation(reservationId: string): Promise<CreditReservation | null> {
     const result = await this.redis.eval(
-      "return redis.call('HGETALL', KEYS[1])", 1,
-      this.reservationKey(reservationId),
+      GET_RESERVATION_SCRIPT,
+      1,
+      this.keys.reservation(reservationId),
     ) as string[];
     if (!result.length) return null;
     const data: Record<string, string> = {};
     for (let index = 0; index < result.length; index += 2) {
       data[result[index]] = result[index + 1];
     }
-    return {
-      reservationId: data.reservationId,
+    const subject = this.keys.subject({
       accountId: data.accountId,
-      requestId: data.requestId || undefined,
+      tenantId: data.tenantId || undefined,
+      accountType: data.accountType || undefined,
       serviceId: data.serviceId || undefined,
+      creditType: data.creditType || undefined,
+    });
+    const expectedScopeId = this.keys.scopeId(subject);
+    if (data.scopeId !== expectedScopeId) {
+      throw new Error(
+        `Redis reservation scope mismatch: expected ${expectedScopeId}, received ${data.scopeId}`,
+      );
+    }
+    return {
+      ...subject,
+      subject,
+      reservationId: data.reservationId,
+      scopeId: data.scopeId,
+      requestId: data.requestId || undefined,
       amount: Number(data.amount),
       remainingBalance: Number(data.remainingBalance),
       status: data.status as CreditReservationStatus,
-      ownerId: data.ownerId,
       createdAt: Number(data.createdAt),
       expiresAt: Number(data.expiresAt),
+      autoRecover: data.autoRecover !== '0',
       finalizedAt: data.finalizedAt ? Number(data.finalizedAt) : undefined,
       finalizationReason: data.finalizationReason,
+      settlementMode: data.settlementMode as CreditReservation['settlementMode'],
+      operation: data.operation || undefined,
+      version: Number(data.version),
     };
   }
 
-  async getBalance(accountId: string): Promise<number> {
-    return Number(await this.redis.eval(
-      "return redis.call('GET', KEYS[1]) or '0'", 1,
-      this.balanceKey(accountId),
-    ));
+  /** Returns null when this scoped wallet has never been initialized. */
+  async getBalance(subjectInput: CreditSubject): Promise<number | null> {
+    const subject = this.keys.subject(subjectInput);
+    const raw = await this.redis.eval(GET_BALANCE_SCRIPT, 1, this.keys.balance(subject));
+    return raw === null || raw === false ? null : Number(raw);
   }
 
-  private async finalizeWithRefund(
+  private async refund(
     reservationId: string,
     status: 'ROLLED_BACK' | 'EXPIRED',
     reason: string,
+    now: number,
   ): Promise<boolean> {
-    const result = await this.redis.eval(ROLLBACK_SCRIPT, 2,
-      this.reservationKey(reservationId), EXPIRATION_KEY,
-      BALANCE_PREFIX, status, Date.now(), reason, reservationId,
+    const reservation = await this.getReservation(reservationId);
+    if (!reservation) return false;
+    const result = await this.redis.eval(
+      ROLLBACK_SCRIPT,
+      5,
+      this.keys.reservation(reservationId),
+      this.keys.expirations(),
+      this.keys.eventStream(),
+      this.keys.balance(reservation.subject),
+      this.keys.request(reservation.subject, reservation.requestId!),
+      status,
+      now,
+      reason,
+      reservationId,
       this.options.retentionMs,
-    );
-    return Number(result) === 1;
+      this.options.eventStreamMaxLength,
+    ) as Array<string | number>;
+    if (Number(result[0]) !== 1) return false;
+    const parsed = this.parseFinalizationResult(result, true);
+    this.dispatcher.dispatch({
+      ...this.eventBase(parsed.subject, parsed.scopeId, now),
+      type: 'ROLLED_BACK',
+      reservationId,
+      amount: parsed.amount,
+      reason,
+      operation: parsed.operation,
+      balanceAfter: parsed.balanceAfter!,
+    });
+    return true;
   }
 
-  private balanceKey(accountId: string) { return `${BALANCE_PREFIX}${accountId}`; }
-  private reservationKey(id: string) { return `${RESERVATION_PREFIX}${id}`; }
-  private requestKey(accountId: string, requestId: string) {
-    return `${REQUEST_PREFIX}${accountId}:${requestId}`;
+  private async initializeBalanceIfMissing(subject: CreditSubject): Promise<void> {
+    if (await this.getBalance(subject) !== null) return;
+    const provider = this.options.balanceProvider;
+    if (!provider) {
+      throw new Error(`Credit balance is not initialized for ${this.keys.scopeId(subject)}`);
+    }
+    const lockToken = randomUUID();
+    const acquired = Number(await this.redis.eval(
+      ACQUIRE_LOCK_SCRIPT,
+      1,
+      this.keys.initializationLock(subject),
+      lockToken,
+      this.options.initializationLockMs,
+    )) === 1;
+    if (!acquired) throw new CreditBalanceInitializationException();
+
+    try {
+      if (await this.getBalance(subject) !== null) return;
+      const snapshot = await provider.getBalance(subject);
+      if (!Number.isSafeInteger(snapshot.balance) || snapshot.balance < 0) {
+        throw new Error('Credit balance provider returned an invalid balance');
+      }
+      const initialized = Number(await this.redis.eval(
+        INITIALIZE_BALANCE_SCRIPT,
+        1,
+        this.keys.balance(subject),
+        snapshot.balance,
+      )) === 1;
+      if (initialized) {
+        const now = Date.now();
+        this.dispatcher.dispatch({
+          ...this.eventBase(subject, this.keys.scopeId(subject), now),
+          type: 'BALANCE_INITIALIZED',
+          balance: snapshot.balance,
+          source: snapshot.source,
+          revision: snapshot.revision,
+        });
+      }
+    } finally {
+      await this.redis.eval(
+        RELEASE_LOCK_SCRIPT,
+        1,
+        this.keys.initializationLock(subject),
+        lockToken,
+      );
+    }
+  }
+
+  private resolveThreshold(subject: CreditSubject): number {
+    const configured = this.options.criticalBalance;
+    const threshold = typeof configured === 'function' ? configured(subject) : configured;
+    if (!Number.isSafeInteger(threshold) || threshold < 0) {
+      throw new TypeError('criticalBalance must resolve to a non-negative safe integer');
+    }
+    return threshold;
+  }
+
+  private eventBase(subject: CreditSubject, scopeId: string, timestamp: number) {
+    return {
+      timestamp,
+      subject,
+      scopeId,
+      accountId: subject.accountId,
+      tenantId: subject.tenantId,
+      accountType: subject.accountType,
+      serviceId: subject.serviceId,
+      creditType: subject.creditType,
+    };
+  }
+
+  private parseFinalizationResult(
+    result: Array<string | number>,
+    includesBalanceAfter: boolean,
+  ) {
+    const expectedLength = includesBalanceAfter ? 10 : 9;
+    if (result.length !== expectedLength) {
+      throw new Error(
+        `Unexpected Redis finalization result: expected ${expectedLength} fields, ` +
+        `received ${result.length}`,
+      );
+    }
+    const subject = this.keys.subject({
+      accountId: String(result[2]),
+      tenantId: result[3] ? String(result[3]) : undefined,
+      accountType: result[4] ? String(result[4]) : undefined,
+      serviceId: result[5] ? String(result[5]) : undefined,
+      creditType: result[6] ? String(result[6]) : undefined,
+    });
+    const scopeId = String(result[1]);
+    const expectedScopeId = this.keys.scopeId(subject);
+    if (scopeId !== expectedScopeId) {
+      throw new Error(
+        `Redis finalization scope mismatch: expected ${expectedScopeId}, received ${scopeId}`,
+      );
+    }
+    const amount = Number(result[7]);
+    if (!Number.isSafeInteger(amount) || amount <= 0) {
+      throw new Error(`Redis finalization returned an invalid amount: ${String(result[7])}`);
+    }
+    const balanceAfter = includesBalanceAfter ? Number(result[9]) : undefined;
+    if (includesBalanceAfter &&
+        (!Number.isSafeInteger(balanceAfter) || balanceAfter! < 0)) {
+      throw new Error(
+        `Redis finalization returned an invalid balanceAfter: ${String(result[9])}`,
+      );
+    }
+    return {
+      scopeId,
+      subject,
+      amount,
+      operation: result[8] ? String(result[8]) : undefined,
+      balanceAfter,
+    };
   }
 }
 
 export {
+  ACQUIRE_LOCK_SCRIPT,
   COMMIT_SCRIPT,
   FIND_EXPIRED_SCRIPT,
+  GRANT_SCRIPT,
+  INITIALIZE_BALANCE_SCRIPT,
   RECOVER_SCRIPT,
+  REMOVE_EXPIRATION_SCRIPT,
+  RELEASE_LOCK_SCRIPT,
   RENEW_SCRIPT,
   RESERVE_SCRIPT,
   ROLLBACK_SCRIPT,
