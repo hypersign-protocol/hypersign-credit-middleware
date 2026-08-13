@@ -1,4 +1,4 @@
-# Hypersign Credit SDK v2
+# Hypersign Credit Middleware
 
 NestJS SDK for atomic, Redis-backed API credit reservations. Version 2 is a
 breaking, subject-scoped design: every balance belongs to one explicit wallet.
