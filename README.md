@@ -3,6 +3,11 @@
 NestJS Middleware SDK for atomic, Redis-backed API credit reservations. Version 2 is a
 breaking, subject-scoped design: every balance belongs to one explicit wallet.
 
+Internal and operational references:
+
+- [Redis keyspace, data types, TTLs, and inspection](docs/redis-keyspace.md)
+- [Lua scripts, keys, arguments, and return codes](docs/lua-scripts.md)
+
 ## Billing identity
 
 `CreditSubject` is the complete wallet identity:

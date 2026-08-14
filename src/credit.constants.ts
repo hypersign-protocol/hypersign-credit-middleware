@@ -1,4 +1,8 @@
 import { ResolvedCreditOptions } from './credit.types';
+export {
+  GET_BALANCE_SCRIPT,
+  GET_RESERVATION_SCRIPT,
+} from './credit.scripts';
 
 export const DEFAULT_KEY_PREFIX = 'credit';
 export const DEFAULT_REDIS_HASH_TAG = 'credit';
@@ -42,9 +46,3 @@ export const DEFAULT_CREDIT_OPTIONS: ResolvedCreditOptions = {
     };
   },
 };
-
-/** Fetches a single reservation hash as a flat key-value array. */
-export const GET_RESERVATION_SCRIPT = `return redis.call('HGETALL', KEYS[1])`;
-
-/** Returns false/nil for an uninitialized wallet instead of conflating it with zero. */
-export const GET_BALANCE_SCRIPT = `return redis.call('GET', KEYS[1])`;
