@@ -34,7 +34,7 @@ describe('CreditEventRelay', () => {
     await (relay as any).publishEntries([[
       '1234-0',
       ['event', 'COMMITTED', 'timestamp', '1234', 'serviceId', 'kyc',
-        'accountId', 'a1', 'creditType', 'API', 'amount', '4',
+        'appId', 'a1', 'creditType', 'API', 'amount', '4',
         'balanceAfter', '96', 'reservationId', 'r1'],
     ]]);
 
@@ -107,7 +107,7 @@ describe('CreditCommandWorker', () => {
       data: {
         commandId: 'command-1', schemaVersion: 1, serviceId: 'kyc',
         payload: {
-          subject: { accountId: 'account-1', creditType: 'API' },
+          subject: { appId: 'account-1', creditType: 'API' },
           amount: 50,
           referenceId: 'payment-1',
         },
@@ -116,8 +116,8 @@ describe('CreditCommandWorker', () => {
 
     expect(credits.grant).toHaveBeenCalledWith({
       subject: {
-        accountId: 'account-1', serviceId: 'kyc', creditType: 'API',
-        tenantId: undefined, accountType: undefined,
+        appId: 'account-1', serviceId: 'kyc', creditType: 'API',
+        tenantId: undefined, appType: undefined,
       },
       amount: 50,
       referenceId: 'payment-1',
@@ -139,7 +139,7 @@ describe('CreditCommandWorker', () => {
       name: 'credit.grant.requested',
       data: {
         commandId: 'bad-command', schemaVersion: 1, serviceId: 'kyc',
-        payload: { subject: { accountId: 'a', creditType: 'API' }, amount: -1 },
+        payload: { subject: { appId: 'a', creditType: 'API' }, amount: -1 },
       },
     })).rejects.toThrow('positive safe integer');
     expect(provider.add).toHaveBeenCalledTimes(2);

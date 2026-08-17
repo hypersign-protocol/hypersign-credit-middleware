@@ -36,8 +36,8 @@ interface ServiceRequest {
           return {
             subject: {
               tenantId: request.service?.tenantId,
-              accountType: 'BUSINESS',
-              accountId: request.service?.businessId ?? '',
+              appType: 'BUSINESS',
+              appId: request.service?.businessId ?? '',
               serviceId: 'kyc',
             },
             requestId: request.requestId,

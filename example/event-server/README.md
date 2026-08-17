@@ -34,8 +34,8 @@ curl -X POST http://localhost:3002/credit-commands/grant \
   -d '{
     "serviceId":"kyc",
     "tenantId":"tenant_1",
-    "accountType":"BUSINESS",
-    "accountId":"business_123",
+    "appType":"BUSINESS",
+    "appId":"business_123",
     "creditType":"API_CREDIT",
     "amount":25,
     "referenceId":"payment-001"

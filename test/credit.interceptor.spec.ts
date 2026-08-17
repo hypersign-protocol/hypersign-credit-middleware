@@ -35,7 +35,7 @@ const options = {
   },
 };
 
-const subject = { accountId: 'user_123', serviceId: 'test-service' };
+const subject = { appId: 'user_123', serviceId: 'test-service' };
 const reservation = (id: string, mode: 'IMMEDIATE' | 'DEFERRED' = 'IMMEDIATE') => ({
   charge: {
     id: id.includes('deferred') ? 'txn' : 'api',

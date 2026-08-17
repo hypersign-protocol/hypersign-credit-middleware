@@ -7,13 +7,13 @@ export class CreditKeyspace {
   subject(input: CreditSubject): CreditSubject {
     const clean = (value?: string) => value?.trim() || undefined;
     const subject: CreditSubject = {
-      accountId: clean(input.accountId) ?? '',
+      appId: clean(input.appId) ?? '',
       tenantId: clean(input.tenantId),
-      accountType: clean(input.accountType),
+      appType: clean(input.appType),
       serviceId: clean(input.serviceId),
       creditType: clean(input.creditType),
     };
-    if (!subject.accountId) throw new TypeError('subject.accountId is required');
+    if (!subject.appId) throw new TypeError('subject.appId is required');
     return subject;
   }
 
@@ -23,8 +23,8 @@ export class CreditKeyspace {
       value === undefined ? '0' : `1:${encodeURIComponent(value)}`;
     return [
       ['tenant', subject.tenantId],
-      ['accountType', subject.accountType],
-      ['account', subject.accountId],
+      ['appType', subject.appType],
+      ['app', subject.appId],
       ['service', subject.serviceId],
       ['creditType', subject.creditType],
     ].map(([name, value]) => `${name}=${dimension(value)}`).join('|');

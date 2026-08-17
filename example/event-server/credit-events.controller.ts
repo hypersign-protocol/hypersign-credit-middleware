@@ -1,13 +1,14 @@
 import { BadRequestException, Body, Controller, Get, Post, Query } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
+import { CREDIT_EVENT_NAMES } from '../../src';
 import { ExampleBullMqProvider } from '../bullmq.module';
 import { CreditEventStore } from './event-store.service';
 
 interface GrantCreditRequest {
   serviceId?: unknown;
   tenantId?: unknown;
-  accountId?: unknown;
-  accountType?: unknown;
+  appId?: unknown;
+  appType?: unknown;
   creditType?: unknown;
   amount?: unknown;
   referenceId?: unknown;
@@ -33,15 +34,15 @@ export class CreditEventsController {
   @Post('credit-commands/grant')
   async grant(@Body() body: GrantCreditRequest) {
     const serviceId = requiredString(body.serviceId, 'serviceId');
-    const accountId = requiredString(body.accountId, 'accountId');
+    const appId = requiredString(body.appId, 'appId');
     const creditType = requiredString(body.creditType, 'creditType');
     const referenceId = requiredString(body.referenceId, 'referenceId');
     const amount = positiveInteger(body.amount, 'amount');
     const tenantId = optionalString(body.tenantId);
-    const accountType = optionalString(body.accountType);
+    const appType = optionalString(body.appType);
     const commandId = randomUUID();
     const queue = `credit.commands.${serviceId}`;
-    await this.bullMq.add(queue, 'credit.grant.requested', {
+    await this.bullMq.add(queue, CREDIT_EVENT_NAMES.GRANT_REQUESTED, {
       schemaVersion: 1,
       commandId,
       serviceId,
@@ -49,10 +50,10 @@ export class CreditEventsController {
       requestedAt: new Date().toISOString(),
       payload: {
         subject: {
-          accountId,
+          appId,
           creditType,
           ...(tenantId ? { tenantId } : {}),
-          ...(accountType ? { accountType } : {}),
+          ...(appType ? { appType } : {}),
         },
         amount,
         referenceId,

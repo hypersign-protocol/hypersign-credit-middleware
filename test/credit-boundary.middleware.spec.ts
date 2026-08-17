@@ -19,7 +19,7 @@ describe('catalog-driven CreditBoundaryMiddleware', () => {
       ],
     },
     requestContextResolver: () => ({
-      subject: { accountId: 'user_123', serviceId: 'test' },
+      subject: { appId: 'user_123', serviceId: 'test' },
       requestId: 'req_1',
     }),
   };
@@ -28,7 +28,7 @@ describe('catalog-driven CreditBoundaryMiddleware', () => {
     charge: catalog.find('POST', '/paid/123')!.charges[0],
     reservation: {
       reservationId: 'res_1', remainingBalance: 90, leaseToken: 'lease_1',
-      scopeId: 'scope_1', subject: { accountId: 'user_123', serviceId: 'test' },
+      scopeId: 'scope_1', subject: { appId: 'user_123', serviceId: 'test' },
       expiresAt: Date.now() + 60_000, existing: false, autoRecover: true,
       settlementMode: 'IMMEDIATE' as const,
     },

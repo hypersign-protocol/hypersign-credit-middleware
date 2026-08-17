@@ -28,7 +28,7 @@ describe('CreditPolicyExecutor', () => {
     autoRecover: creditType === 'API',
     existing: false,
     settlementMode: creditType === 'API' ? 'IMMEDIATE' as const : 'DEFERRED' as const,
-    subject: { accountId: 'account', serviceId: 'kyc', creditType },
+    subject: { appId: 'account', serviceId: 'kyc', creditType },
   });
 
   it('creates independent catalog reservations with scoped request IDs', async () => {
@@ -39,14 +39,14 @@ describe('CreditPolicyExecutor', () => {
     const executor = new CreditPolicyExecutor(credits as any, catalog);
 
     const applied = await executor.reserve(route, {
-      subject: { accountId: 'account' }, requestId: 'request-1',
+      subject: { appId: 'account' }, requestId: 'request-1',
     });
 
     expect(applied.map((value) => value.reservation.reservationId))
       .toEqual(['api-res', 'txn-res']);
     expect(credits.reserve).toHaveBeenNthCalledWith(1, expect.objectContaining({
       requestId: 'request-1:api',
-      subject: { accountId: 'account', serviceId: 'kyc', creditType: 'API' },
+      subject: { appId: 'account', serviceId: 'kyc', creditType: 'API' },
     }));
     expect(credits.reserve).toHaveBeenNthCalledWith(2, expect.objectContaining({
       requestId: 'request-1:txn', settlementMode: 'DEFERRED', autoRecover: false,
@@ -61,7 +61,7 @@ describe('CreditPolicyExecutor', () => {
     const executor = new CreditPolicyExecutor(credits as any, catalog);
 
     await expect(executor.reserve(route, {
-      subject: { accountId: 'account' }, requestId: 'request-1',
+      subject: { appId: 'account' }, requestId: 'request-1',
     })).rejects.toThrow('insufficient TXN');
     expect(credits.rollback).toHaveBeenCalledWith(
       'api-res', 'catalog_reservation_failed',

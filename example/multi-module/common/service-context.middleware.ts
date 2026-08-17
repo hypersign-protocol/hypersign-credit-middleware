@@ -15,8 +15,8 @@ interface ServiceRequest {
 export class ServiceContextMiddleware implements NestMiddleware {
   use(request: ServiceRequest, _response: unknown, next: () => void): void {
     const accountHeader = request.headers['x-business-id'];
-    const accountId = Array.isArray(accountHeader) ? accountHeader[0] : accountHeader;
-    if (!accountId) {
+    const appId = Array.isArray(accountHeader) ? accountHeader[0] : accountHeader;
+    if (!appId) {
       throw new UnauthorizedException('x-business-id is required');
     }
 
@@ -24,7 +24,7 @@ export class ServiceContextMiddleware implements NestMiddleware {
     request.requestId =
       (Array.isArray(requestIdHeader) ? requestIdHeader[0] : requestIdHeader) ??
       randomUUID();
-    request.service = { businessId: accountId, tenantId: 'tenant_1' };
+    request.service = { businessId: appId, tenantId: 'tenant_1' };
     next();
   }
 }

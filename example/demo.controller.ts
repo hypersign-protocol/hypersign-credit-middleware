@@ -37,7 +37,7 @@ export class ExampleDemoController {
   @Get("balance")
   async balance() {
     return {
-      accountId: EXAMPLE_ACCOUNT_ID,
+      appId: EXAMPLE_ACCOUNT_ID,
       balances: {
         API_CREDIT: await this.credits.getBalance(EXAMPLE_SUBJECT),
         BLOCKCHAIN_TXN_CREDIT: await this.credits.getBalance(

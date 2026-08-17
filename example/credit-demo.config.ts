@@ -6,8 +6,8 @@ import {
 
 export const EXAMPLE_ACCOUNT_ID = 'user_123';
 export const EXAMPLE_SUBJECT = {
-  accountId: EXAMPLE_ACCOUNT_ID,
-  accountType: 'USER',
+  appId: EXAMPLE_ACCOUNT_ID,
+  appType: 'USER',
   serviceId: 'example-service',
   creditType: 'API_CREDIT',
 } as const;
@@ -70,8 +70,8 @@ export const EXAMPLE_CREDIT_CATALOG = defineCreditCatalog({
 const walletId = (subject: CreditSubject): string =>
   [
     subject.tenantId ?? '',
-    subject.accountType ?? '',
-    subject.accountId,
+    subject.appType ?? '',
+    subject.appId,
     subject.serviceId ?? '',
     subject.creditType ?? '',
   ].join(':');

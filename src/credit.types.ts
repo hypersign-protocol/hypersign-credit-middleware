@@ -83,13 +83,13 @@ export type CreditAccountType = 'USER' | 'BUSINESS' | 'SERVICE' | string;
 
 /**
  * Uniquely identifies the wallet from which credits are deducted.
- * `accountId` alone is sufficient for a global wallet. Add dimensions only
+ * `appId` alone is sufficient for a global wallet. Add dimensions only
  * when balances are genuinely independent across those dimensions.
  */
 export interface CreditSubject {
-  accountId: string;
+  appId: string;
   tenantId?: string;
-  accountType?: CreditAccountType;
+  appType?: CreditAccountType;
   serviceId?: string;
   creditType?: string;
 }

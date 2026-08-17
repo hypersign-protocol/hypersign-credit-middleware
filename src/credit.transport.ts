@@ -7,6 +7,7 @@ import {
 } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
 import { CreditCatalogService } from './credit.catalog';
+import { CREDIT_EVENT_NAMES, CreditEventName } from './credit.constants';
 import { CreditService } from './credit.service';
 import p1 from 'process';
 import {
@@ -29,14 +30,14 @@ export interface CreditLifecycleEventEnvelope {
   event: Record<string, unknown>;
 }
 
-const JOB_NAMES: Record<string, string> = {
-  RESERVED: 'credit.reserved',
-  COMMITTED: 'credit.committed',
-  ROLLED_BACK: 'credit.rolled-back',
-  EXPIRED: 'credit.expired',
-  CREDIT_GRANTED: 'credit.granted',
-  CRITICAL_BALANCE: 'credit.critical-balance',
-  BALANCE_INITIALIZED: 'credit.balance-initialized',
+const JOB_NAMES: Record<string, CreditEventName> = {
+  RESERVED: CREDIT_EVENT_NAMES.RESERVED,
+  COMMITTED: CREDIT_EVENT_NAMES.COMMITTED,
+  ROLLED_BACK: CREDIT_EVENT_NAMES.ROLLED_BACK,
+  EXPIRED: CREDIT_EVENT_NAMES.EXPIRED,
+  CREDIT_GRANTED: CREDIT_EVENT_NAMES.CREDIT_GRANTED,
+  CRITICAL_BALANCE: CREDIT_EVENT_NAMES.CRITICAL_BALANCE,
+  BALANCE_INITIALIZED: CREDIT_EVENT_NAMES.BALANCE_INITIALIZED,
 };
 
 /** Relays the transactional Redis Stream outbox to the supplied BullMQ queues. */
@@ -243,7 +244,7 @@ export class CreditCommandWorker implements OnApplicationBootstrap, OnApplicatio
     try {
       command = this.command(job);
       switch (job.name) {
-        case 'credit.grant.requested':
+        case CREDIT_EVENT_NAMES.GRANT_REQUESTED:
           return this.credits.grant({
             subject: this.subject(command.payload.subject),
             amount: positiveInteger(command.payload.amount, 'payload.amount'),
@@ -253,7 +254,7 @@ export class CreditCommandWorker implements OnApplicationBootstrap, OnApplicatio
             ),
             reason: optionalString(command.payload.reason),
           });
-        case 'credit.reserve.requested':
+        case CREDIT_EVENT_NAMES.RESERVE_REQUESTED:
           return this.credits.reserve({
             subject: this.subject(command.payload.subject),
             requestId: optionalString(command.payload.requestId) ?? command.commandId,
@@ -262,12 +263,12 @@ export class CreditCommandWorker implements OnApplicationBootstrap, OnApplicatio
             settlementMode: deferredSettlement(command.payload.settlementMode),
             autoRecover: command.payload.autoRecover !== false,
           });
-        case 'credit.commit.requested':
+        case CREDIT_EVENT_NAMES.COMMIT_REQUESTED:
           return this.settle(
             requiredString(command.payload.reservationId, 'payload.reservationId'),
             'COMMIT',
           );
-        case 'credit.rollback.requested':
+        case CREDIT_EVENT_NAMES.ROLLBACK_REQUESTED:
           return this.settle(
             requiredString(command.payload.reservationId, 'payload.reservationId'),
             'ROLLBACK',
@@ -308,9 +309,9 @@ export class CreditCommandWorker implements OnApplicationBootstrap, OnApplicatio
       throw new TypeError('Command subject serviceId does not match installed catalog');
     }
     return {
-      accountId: requiredString(subject.accountId, 'payload.subject.accountId'),
+      appId: requiredString(subject.appId, 'payload.subject.appId'),
       tenantId: optionalString(subject.tenantId),
-      accountType: optionalString(subject.accountType),
+      appType: optionalString(subject.appType),
       serviceId: this.catalog.serviceId,
       creditType: requiredString(subject.creditType, 'payload.subject.creditType'),
     };
@@ -340,7 +341,7 @@ export class CreditCommandWorker implements OnApplicationBootstrap, OnApplicatio
     const reason = error instanceof Error ? error.message : String(error);
     this.logger.error(`Rejected credit command ${command.commandId}: ${reason}`);
     for (const queueName of config.lifecycleQueueNames) {
-      await config.provider.add(queueName, 'credit.command-rejected', {
+      await config.provider.add(queueName, CREDIT_EVENT_NAMES.COMMAND_REJECTED, {
         schemaVersion: 1,
         serviceId: this.catalog.serviceId,
         commandId: command.commandId,
@@ -375,9 +376,9 @@ function normalizeEvent(fields: Record<string, string>): Record<string, unknown>
   result.type = fields.event;
   delete result.event;
   result.subject = {
-    accountId: fields.accountId,
+    appId: fields.appId,
     ...(fields.tenantId ? { tenantId: fields.tenantId } : {}),
-    ...(fields.accountType ? { accountType: fields.accountType } : {}),
+    ...(fields.appType ? { appType: fields.appType } : {}),
     ...(fields.serviceId ? { serviceId: fields.serviceId } : {}),
     ...(fields.creditType ? { creditType: fields.creditType } : {}),
   };

@@ -98,9 +98,9 @@ export class CreditService {
       input.amount,
       reservationId,
       scopeId,
-      subject.accountId,
+      subject.appId,
       subject.tenantId ?? '',
-      subject.accountType ?? '',
+      subject.appType ?? '',
       subject.serviceId ?? '',
       subject.creditType ?? '',
       requestId,
@@ -162,9 +162,9 @@ export class CreditService {
       input.amount,
       now,
       scopeId,
-      subject.accountId,
+      subject.appId,
       subject.tenantId ?? '',
-      subject.accountType ?? '',
+      subject.appType ?? '',
       subject.serviceId ?? '',
       subject.creditType ?? '',
       referenceId,
@@ -285,9 +285,9 @@ export class CreditService {
       data[result[index]] = result[index + 1];
     }
     const subject = this.keys.subject({
-      accountId: data.accountId,
+      appId: data.appId,
       tenantId: data.tenantId || undefined,
-      accountType: data.accountType || undefined,
+      appType: data.appType || undefined,
       serviceId: data.serviceId || undefined,
       creditType: data.creditType || undefined,
     });
@@ -383,9 +383,9 @@ export class CreditService {
         snapshot.balance,
         now,
         this.keys.scopeId(subject),
-        subject.accountId,
+        subject.appId,
         subject.tenantId ?? '',
-        subject.accountType ?? '',
+        subject.appType ?? '',
         subject.serviceId ?? '',
         subject.creditType ?? '',
         snapshot.source ?? '',
@@ -426,9 +426,9 @@ export class CreditService {
       );
     }
     const subject = this.keys.subject({
-      accountId: String(result[2]),
+      appId: String(result[2]),
       tenantId: result[3] ? String(result[3]) : undefined,
-      accountType: result[4] ? String(result[4]) : undefined,
+      appType: result[4] ? String(result[4]) : undefined,
       serviceId: result[5] ? String(result[5]) : undefined,
       creditType: result[6] ? String(result[6]) : undefined,
     });

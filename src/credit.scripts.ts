@@ -28,8 +28,8 @@ if balance < amount then return {-1} end
 local expiresAt = tonumber(ARGV[10]) + tonumber(ARGV[11])
 local remaining = redis.call('DECRBY', KEYS[1], amount)
 redis.call('HSET', KEYS[2],
-  'reservationId', ARGV[2], 'scopeId', ARGV[3], 'accountId', ARGV[4],
-  'tenantId', ARGV[5], 'accountType', ARGV[6], 'serviceId', ARGV[7],
+  'reservationId', ARGV[2], 'scopeId', ARGV[3], 'appId', ARGV[4],
+  'tenantId', ARGV[5], 'appType', ARGV[6], 'serviceId', ARGV[7],
   'creditType', ARGV[8], 'requestId', ARGV[9], 'amount', ARGV[1],
   'remainingBalance', remaining, 'status', 'RESERVED', 'leaseToken', ARGV[12],
   'createdAt', ARGV[10], 'expiresAt', expiresAt, 'version', 1,
@@ -42,7 +42,7 @@ redis.call('HSET', KEYS[3], 'reservationId', ARGV[2],
   'leaseToken', ARGV[12], 'autoRecover', ARGV[16])
 redis.call('XADD', KEYS[5], 'MAXLEN', '~', ARGV[18], '*',
   'event', 'RESERVED', 'timestamp', ARGV[10], 'scopeId', ARGV[3],
-  'accountId', ARGV[4], 'tenantId', ARGV[5], 'accountType', ARGV[6],
+  'appId', ARGV[4], 'tenantId', ARGV[5], 'appType', ARGV[6],
   'serviceId', ARGV[7], 'creditType', ARGV[8], 'requestId', ARGV[9],
   'operation', ARGV[15], 'amount', ARGV[1], 'reservationId', ARGV[2],
   'settlementMode', ARGV[14], 'autoRecover', ARGV[16],
@@ -51,7 +51,7 @@ redis.call('XADD', KEYS[5], 'MAXLEN', '~', ARGV[18], '*',
 if remaining <= tonumber(ARGV[17]) then
   redis.call('XADD', KEYS[5], 'MAXLEN', '~', ARGV[18], '*',
     'event', 'CRITICAL_BALANCE', 'timestamp', ARGV[10], 'scopeId', ARGV[3],
-    'accountId', ARGV[4], 'tenantId', ARGV[5], 'accountType', ARGV[6],
+    'appId', ARGV[4], 'tenantId', ARGV[5], 'appType', ARGV[6],
     'serviceId', ARGV[7], 'creditType', ARGV[8],
     'balance', remaining, 'threshold', ARGV[17])
 end
@@ -63,8 +63,8 @@ local status = redis.call('HGET', KEYS[1], 'status')
 if not status then return {-2} end
 if status == 'COMMITTED' then return {0} end
 if status ~= 'RESERVED' then return {-1} end
-local fields = redis.call('HMGET', KEYS[1], 'scopeId', 'accountId', 'tenantId',
-  'accountType', 'serviceId', 'creditType', 'amount', 'operation',
+local fields = redis.call('HMGET', KEYS[1], 'scopeId', 'appId', 'tenantId',
+  'appType', 'serviceId', 'creditType', 'amount', 'operation',
   'remainingBalance')
 redis.call('HSET', KEYS[1], 'status', 'COMMITTED', 'finalizedAt', ARGV[1],
   'finalizationReason', 'controller_succeeded')
@@ -73,8 +73,8 @@ redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[3]))
 redis.call('PEXPIRE', KEYS[4], tonumber(ARGV[3]))
 redis.call('XADD', KEYS[3], 'MAXLEN', '~', ARGV[4], '*',
   'event', 'COMMITTED', 'timestamp', ARGV[1], 'reservationId', ARGV[2],
-  'scopeId', fields[1], 'accountId', fields[2], 'tenantId', fields[3],
-  'accountType', fields[4], 'serviceId', fields[5], 'creditType', fields[6],
+  'scopeId', fields[1], 'appId', fields[2], 'tenantId', fields[3],
+  'appType', fields[4], 'serviceId', fields[5], 'creditType', fields[6],
   'amount', fields[7], 'operation', fields[8], 'balanceAfter', fields[9])
 return {1, fields[1], fields[2], fields[3], fields[4], fields[5], fields[6],
   fields[7], fields[8], fields[9]}
@@ -84,8 +84,8 @@ export const ROLLBACK_SCRIPT = `
 local status = redis.call('HGET', KEYS[1], 'status')
 if not status or status ~= 'RESERVED' then return {0} end
 if redis.call('HGET', KEYS[1], 'balanceKey') ~= KEYS[4] then return {-2} end
-local fields = redis.call('HMGET', KEYS[1], 'scopeId', 'accountId', 'tenantId',
-  'accountType', 'serviceId', 'creditType', 'amount', 'operation')
+local fields = redis.call('HMGET', KEYS[1], 'scopeId', 'appId', 'tenantId',
+  'appType', 'serviceId', 'creditType', 'amount', 'operation')
 local remaining = redis.call('INCRBY', KEYS[4], fields[7])
 redis.call('HSET', KEYS[1], 'status', ARGV[1], 'finalizedAt', ARGV[2],
   'finalizationReason', ARGV[3], 'remainingBalance', remaining)
@@ -94,8 +94,8 @@ redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[5]))
 redis.call('PEXPIRE', KEYS[5], tonumber(ARGV[5]))
 redis.call('XADD', KEYS[3], 'MAXLEN', '~', ARGV[6], '*',
   'event', ARGV[1], 'timestamp', ARGV[2], 'reservationId', ARGV[4],
-  'scopeId', fields[1], 'accountId', fields[2], 'tenantId', fields[3],
-  'accountType', fields[4], 'serviceId', fields[5], 'creditType', fields[6],
+  'scopeId', fields[1], 'appId', fields[2], 'tenantId', fields[3],
+  'appType', fields[4], 'serviceId', fields[5], 'creditType', fields[6],
   'amount', fields[7], 'operation', fields[8], 'reason', ARGV[3],
   'balanceAfter', remaining)
 return {1, fields[1], fields[2], fields[3], fields[4], fields[5], fields[6],
@@ -135,8 +135,8 @@ end
 local expiresAt = tonumber(redis.call('HGET', KEYS[1], 'expiresAt') or '0')
 if expiresAt > tonumber(ARGV[1]) then return {0} end
 if redis.call('HGET', KEYS[1], 'balanceKey') ~= KEYS[4] then return {-2} end
-local fields = redis.call('HMGET', KEYS[1], 'scopeId', 'accountId', 'tenantId',
-  'accountType', 'serviceId', 'creditType', 'amount', 'operation')
+local fields = redis.call('HMGET', KEYS[1], 'scopeId', 'appId', 'tenantId',
+  'appType', 'serviceId', 'creditType', 'amount', 'operation')
 local remaining = redis.call('INCRBY', KEYS[4], fields[7])
 redis.call('HSET', KEYS[1], 'status', 'EXPIRED', 'finalizedAt', ARGV[1],
   'finalizationReason', 'lease_expired', 'remainingBalance', remaining)
@@ -145,8 +145,8 @@ redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[3]))
 redis.call('PEXPIRE', KEYS[5], tonumber(ARGV[3]))
 redis.call('XADD', KEYS[3], 'MAXLEN', '~', ARGV[4], '*',
   'event', 'EXPIRED', 'timestamp', ARGV[1], 'reservationId', ARGV[2],
-  'scopeId', fields[1], 'accountId', fields[2], 'tenantId', fields[3],
-  'accountType', fields[4], 'serviceId', fields[5], 'creditType', fields[6],
+  'scopeId', fields[1], 'appId', fields[2], 'tenantId', fields[3],
+  'appType', fields[4], 'serviceId', fields[5], 'creditType', fields[6],
   'amount', fields[7], 'operation', fields[8], 'reason', 'lease_expired',
   'balanceAfter', remaining)
 return {1, fields[1], fields[2], fields[3], fields[4], fields[5], fields[6],
@@ -163,7 +163,7 @@ if redis.call('GET', KEYS[1]) then return 0 end
 redis.call('SET', KEYS[1], ARGV[1])
 redis.call('XADD', KEYS[2], 'MAXLEN', '~', ARGV[11], '*',
   'event', 'BALANCE_INITIALIZED', 'timestamp', ARGV[2], 'scopeId', ARGV[3],
-  'accountId', ARGV[4], 'tenantId', ARGV[5], 'accountType', ARGV[6],
+  'appId', ARGV[4], 'tenantId', ARGV[5], 'appType', ARGV[6],
   'serviceId', ARGV[7], 'creditType', ARGV[8], 'balance', ARGV[1],
   'source', ARGV[9], 'revision', ARGV[10])
 return 1
@@ -188,7 +188,7 @@ redis.call('HSET', KEYS[2], 'amount', ARGV[1], 'balance', balance)
 redis.call('PEXPIRE', KEYS[2], tonumber(ARGV[11]))
 redis.call('XADD', KEYS[3], 'MAXLEN', '~', ARGV[12], '*',
   'event', 'CREDIT_GRANTED', 'timestamp', ARGV[2], 'scopeId', ARGV[3],
-  'accountId', ARGV[4], 'tenantId', ARGV[5], 'accountType', ARGV[6],
+  'appId', ARGV[4], 'tenantId', ARGV[5], 'appType', ARGV[6],
   'serviceId', ARGV[7], 'creditType', ARGV[8], 'referenceId', ARGV[9],
   'reason', ARGV[10], 'amount', ARGV[1], 'balanceAfter', balance)
 return {balance, 0}

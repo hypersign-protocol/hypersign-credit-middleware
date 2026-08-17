@@ -34,7 +34,7 @@ export class CreditPolicyExecutor {
     route: ResolvedCreditCatalogRoute,
     context: CreditRequestContext,
   ): Promise<AppliedCreditReservation[]> {
-    if (!context.subject?.accountId) {
+    if (!context.subject?.appId) {
       throw new UnauthorizedException('A billing subject is required');
     }
     const requestId = context.requestId?.trim() || randomUUID();
@@ -116,9 +116,9 @@ export class CreditPolicyExecutor {
 
 function sameSubject(left: CreditSubject, right: CreditSubject): boolean {
   const value = (input?: string): string => input?.trim() ?? '';
-  return value(left.accountId) === value(right.accountId) &&
+  return value(left.appId) === value(right.appId) &&
     value(left.tenantId) === value(right.tenantId) &&
-    value(left.accountType) === value(right.accountType) &&
+    value(left.appType) === value(right.appType) &&
     value(left.serviceId) === value(right.serviceId) &&
     value(left.creditType) === value(right.creditType);
 }

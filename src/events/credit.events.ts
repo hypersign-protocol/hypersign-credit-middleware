@@ -19,9 +19,9 @@ export interface BaseCreditEvent {
   /** Complete wallet identity whose balance was affected. */
   subject: CreditSubject;
   /** Convenience fields for logs and stream consumers. */
-  accountId: string;
+  appId: string;
   tenantId?: string;
-  accountType?: string;
+  appType?: string;
   serviceId?: string;
   creditType?: string;
   scopeId: string;

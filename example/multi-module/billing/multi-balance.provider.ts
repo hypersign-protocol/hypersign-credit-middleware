@@ -2,14 +2,14 @@ import { CreditBalanceProvider, CreditSubject } from '../../../src';
 
 export const MULTI_MODULE_SUBJECT: CreditSubject = {
   tenantId: 'tenant_1',
-  accountType: 'BUSINESS',
-  accountId: 'business_123',
+  appType: 'BUSINESS',
+  appId: 'business_123',
   serviceId: 'kyc',
   creditType: 'API_CREDIT',
 };
 
 const subjectKey = (subject: CreditSubject) => JSON.stringify([
-  subject.tenantId ?? '', subject.accountType ?? '', subject.accountId,
+  subject.tenantId ?? '', subject.appType ?? '', subject.appId,
   subject.serviceId ?? '', subject.creditType ?? '',
 ]);
 

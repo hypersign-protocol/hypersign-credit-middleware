@@ -26,8 +26,8 @@ A wallet is identified by `CreditSubject`:
 ```ts
 {
   tenantId?: string;
-  accountType?: string;
-  accountId: string;
+  appType?: string;
+  appId: string;
   serviceId?: string;
   creditType?: string;
 }
@@ -36,7 +36,7 @@ A wallet is identified by `CreditSubject`:
 Example scope identifier:
 
 ```text
-tenant=1:acme|accountType=1:SERVICE|account=1:app-123|service=1:KYC|creditType=1:API_CREDIT
+tenant=1:acme|appType=1:SERVICE|app=1:app-123|service=1:KYC|creditType=1:API_CREDIT
 ```
 
 Values are URI-encoded. Missing dimensions use `0`; present dimensions use
@@ -77,7 +77,7 @@ provider reinitialization.
 An active reservation contains:
 
 ```text
-reservationId, scopeId, accountId, tenantId, accountType, serviceId,
+reservationId, scopeId, appId, tenantId, appType, serviceId,
 creditType, requestId, amount, remainingBalance, status, leaseToken,
 createdAt, expiresAt, version, settlementMode, operation, autoRecover,
 balanceKey

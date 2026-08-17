@@ -75,8 +75,8 @@ class InMemoryRedis implements CreditRedisClient {
       const expiresAt = Number(argv[9]) + Number(argv[10]);
       this.strings.set(keys[0], String(remaining));
       this.reservations.set(keys[1], {
-        reservationId: argv[1], scopeId: argv[2], accountId: argv[3],
-        tenantId: argv[4], accountType: argv[5], serviceId: argv[6],
+        reservationId: argv[1], scopeId: argv[2], appId: argv[3],
+        tenantId: argv[4], appType: argv[5], serviceId: argv[6],
         creditType: argv[7], requestId: argv[8], amount: argv[0],
         remainingBalance: String(remaining), status: 'RESERVED', leaseToken: argv[11],
         createdAt: argv[9], expiresAt: String(expiresAt), version: '1',
@@ -161,16 +161,16 @@ class InMemoryRedis implements CreditRedisClient {
   }
 
   private fields(value: Record<string, string>) {
-    return [value.scopeId, value.accountId, value.tenantId, value.accountType,
+    return [value.scopeId, value.appId, value.tenantId, value.appType,
       value.serviceId, value.creditType, value.amount, value.operation];
   }
 }
 
 const userA: CreditSubject = {
-  tenantId: 'tenant_1', accountType: 'USER', accountId: 'user_a',
+  tenantId: 'tenant_1', appType: 'USER', appId: 'user_a',
   serviceId: 'kyc', creditType: 'API_CREDIT',
 };
-const userB: CreditSubject = { ...userA, accountId: 'user_b' };
+const userB: CreditSubject = { ...userA, appId: 'user_b' };
 
 describe('CreditService production invariants', () => {
   let redis: InMemoryRedis;
@@ -213,12 +213,12 @@ describe('CreditService production invariants', () => {
   });
 
   it('does not collide omitted dimensions with sentinel-like real values', () => {
-    const omitted: CreditSubject = { accountId: 'same' };
+    const omitted: CreditSubject = { appId: 'same' };
     const underscore: CreditSubject = {
-      accountId: 'same', tenantId: '_', accountType: '_', serviceId: '_',
+      appId: 'same', tenantId: '_', appType: '_', serviceId: '_',
     };
     const defaultCredit: CreditSubject = {
-      accountId: 'same', creditType: 'default',
+      appId: 'same', creditType: 'default',
     };
 
     expect(keys.scopeId(omitted)).not.toBe(keys.scopeId(underscore));
@@ -379,7 +379,7 @@ describe('CreditService production invariants', () => {
     const reservation = await service.reserve({ subject: userA, amount: 20 });
     const recovered = await service.recoverExpired(reservation.expiresAt + 1);
     expect(recovered).toEqual([expect.objectContaining({
-      accountId: 'user_a', amount: 20, balanceAfter: 100,
+      appId: 'user_a', amount: 20, balanceAfter: 100,
     })]);
     expect(await service.recoverExpired(reservation.expiresAt + 1)).toHaveLength(0);
     expect(await service.getBalance(userA)).toBe(100);

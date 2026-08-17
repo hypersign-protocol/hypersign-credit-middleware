@@ -34,15 +34,15 @@ import { RequestContextMiddleware } from './request-context.middleware';
         requestContextResolver: (request: unknown) => {
           const value = request as {
             creditSubject?: {
-              accountId: string;
-              accountType: string;
+              appId: string;
+              appType: string;
               serviceId: string;
               creditType: string;
             };
             requestId?: string;
           };
           return {
-            subject: value.creditSubject ?? { accountId: '' },
+            subject: value.creditSubject ?? { appId: '' },
             requestId: value.requestId,
           };
         },

@@ -70,7 +70,7 @@ Arguments: current time, reservation ID, retention TTL, stream maximum length.
 Success returns:
 
 ```text
-[1, scopeId, accountId, tenantId, accountType, serviceId, creditType,
+[1, scopeId, appId, tenantId, appType, serviceId, creditType,
  amount, operation, balanceAfter]
 ```
 

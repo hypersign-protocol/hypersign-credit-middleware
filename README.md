@@ -57,14 +57,14 @@ Every wallet has an explicit subject:
 ```ts
 const subject: CreditSubject = {
   tenantId: 'tenant_1',
-  accountType: 'BUSINESS',
-  accountId: 'business_123',
+  appType: 'BUSINESS',
+  appId: 'business_123',
   serviceId: 'kyc',
   creditType: 'API_CREDIT',
 };
 ```
 
-Only `accountId` is intrinsically required. Catalog charges set `serviceId` to
+Only `appId` is intrinsically required. Catalog charges set `serviceId` to
 the selected catalog and set `creditType` per charge. The remaining identity
 must come from trusted authentication context, never request body/query data.
 
@@ -114,8 +114,8 @@ CreditModule.forRootAsync({
       return {
         subject: {
           tenantId: request.service.tenantId,
-          accountType: 'BUSINESS',
-          accountId: request.service.appId,
+          appType: 'BUSINESS',
+          appId: request.service.appId,
           serviceId: 'kyc',
         },
         requestId: request.requestId,
@@ -230,6 +230,16 @@ credit.balance-initialized
 credit.command-rejected
 ```
 
+All lifecycle and command job names are exported for consumers:
+
+```ts
+import { CREDIT_EVENT_NAMES } from '@hypersign-protocol/credit-middleware';
+
+if (job.name === CREDIT_EVENT_NAMES.RESERVED) {
+  // Handle the reservation event.
+}
+```
+
 BullMQ provides competing consumers, not RabbitMQ-style topic fan-out. Configure
 multiple `lifecycleQueueNames` when independent systems must each receive every
 event. Bull job IDs make relay retries idempotent. Database consumers must also
@@ -264,7 +274,10 @@ credit.rollback.requested
 Example grant command:
 
 ```ts
-await queueProvider.add('credit.commands.kyc', 'credit.grant.requested', {
+await queueProvider.add(
+  'credit.commands.kyc',
+  CREDIT_EVENT_NAMES.GRANT_REQUESTED,
+  {
   schemaVersion: 1,
   commandId: payment.eventId,
   serviceId: 'kyc',
@@ -272,14 +285,16 @@ await queueProvider.add('credit.commands.kyc', 'credit.grant.requested', {
   payload: {
     subject: {
       tenantId: 'tenant_1',
-      accountId: 'business_123',
+      appId: 'business_123',
       creditType: 'API_CREDIT',
     },
     amount: 100,
     referenceId: payment.transactionId,
     reason: 'credit_purchase',
   },
-}, { jobId: payment.eventId });
+  },
+  { jobId: payment.eventId },
+);
 ```
 
 Grant uses `referenceId` for Redis idempotency. Commit/rollback commands accept a
@@ -348,7 +363,7 @@ produce a grant from the event server:
 ```sh
 curl -X POST http://localhost:3002/credit-commands/grant \
   -H 'content-type: application/json' \
-  -d '{"serviceId":"kyc","tenantId":"tenant_1","accountType":"BUSINESS","accountId":"business_123","creditType":"API_CREDIT","amount":25,"referenceId":"payment-001"}'
+  -d '{"serviceId":"kyc","tenantId":"tenant_1","appType":"BUSINESS","appId":"business_123","creditType":"API_CREDIT","amount":25,"referenceId":"payment-001"}'
 ```
 
 Inspect lifecycle events received by the separate process:

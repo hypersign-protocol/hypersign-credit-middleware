@@ -7,6 +7,25 @@ export {
 export const DEFAULT_KEY_PREFIX = 'credit';
 export const DEFAULT_REDIS_HASH_TAG = 'credit';
 
+/** BullMQ job names published or consumed by the SDK. */
+export const CREDIT_EVENT_NAMES = {
+  RESERVED: 'credit.reserved',
+  COMMITTED: 'credit.committed',
+  ROLLED_BACK: 'credit.rolled-back',
+  EXPIRED: 'credit.expired',
+  CREDIT_GRANTED: 'credit.granted',
+  CRITICAL_BALANCE: 'credit.critical-balance',
+  BALANCE_INITIALIZED: 'credit.balance-initialized',
+  COMMAND_REJECTED: 'credit.command-rejected',
+  GRANT_REQUESTED: 'credit.grant.requested',
+  RESERVE_REQUESTED: 'credit.reserve.requested',
+  COMMIT_REQUESTED: 'credit.commit.requested',
+  ROLLBACK_REQUESTED: 'credit.rollback.requested',
+} as const;
+
+export type CreditEventName =
+  typeof CREDIT_EVENT_NAMES[keyof typeof CREDIT_EVENT_NAMES];
+
 export const DEFAULT_CREDIT_OPTIONS: ResolvedCreditOptions = {
   catalog: {
     serviceId: 'unconfigured',
@@ -27,7 +46,7 @@ export const DEFAULT_CREDIT_OPTIONS: ResolvedCreditOptions = {
       user?: { id?: string };
       service?: {
         businessId?: string;
-        accountId?: string;
+        appId?: string;
         id?: string;
         tenantId?: string;
         serviceId?: string;
@@ -36,10 +55,10 @@ export const DEFAULT_CREDIT_OPTIONS: ResolvedCreditOptions = {
     };
     return {
       subject: {
-        accountId:
+        appId:
           req.user?.id ??
           req.service?.businessId ??
-          req.service?.accountId ??
+          req.service?.appId ??
           req.service?.id ??
           '',
         tenantId: req.service?.tenantId,
