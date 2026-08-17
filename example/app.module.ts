@@ -1,47 +1,52 @@
 import { MiddlewareConsumer, Module, NestModule } from '@nestjs/common';
 import { CreditBoundaryMiddleware, CreditModule } from '../src';
 import {
-  CHEAP_CREDIT_POLICY,
-  ExampleCreditEventHandler,
+  EXAMPLE_CREDIT_CATALOG,
   exampleBalanceProvider,
 } from './credit-demo.config';
+import {
+  CREDIT_BULLMQ_PROVIDER,
+  ExampleBullMqModule,
+  ExampleBullMqProvider,
+} from './bullmq.module';
 import { ExampleDemoController } from './demo.controller';
 import { EarlyReturnMiddleware } from './early-return.middleware';
-import { RedisModule } from './redis.module';
+import { CREDIT_EVENT_STREAM_REDIS, RedisModule } from './redis.module';
+import Redis from 'ioredis';
 import { RequestContextMiddleware } from './request-context.middleware';
 
 @Module({
   imports: [
     RedisModule,
-    CreditModule.forRoot({
-      leaseMs: 10_000, // Short only so orphan recovery is easy to demonstrate
-      retentionMs: 60 * 60 * 1_000,
-      criticalBalance: 20,
-      balanceProvider: exampleBalanceProvider,
-      eventHandler: new ExampleCreditEventHandler(),
-      requestContextResolver: (request: unknown) => {
-        const value = request as {
-          creditSubject?: {
-            accountId: string;
-            accountType: string;
-            serviceId: string;
-            creditType: string;
+    ExampleBullMqModule,
+    CreditModule.forRootAsync({
+      imports: [RedisModule, ExampleBullMqModule],
+      inject: [CREDIT_BULLMQ_PROVIDER, CREDIT_EVENT_STREAM_REDIS],
+      useFactory: (bullMq: ExampleBullMqProvider, streamClient: Redis) => ({
+        catalog: EXAMPLE_CREDIT_CATALOG,
+        keyPrefix: 'credit-example',
+        redisHashTag: 'credit-example',
+        leaseMs: 10_000, // Short only so orphan recovery is easy to demonstrate
+        retentionMs: 60 * 60 * 1_000,
+        criticalBalance: 20,
+        balanceProvider: exampleBalanceProvider,
+        bullMq: { provider: bullMq, streamClient },
+        requestContextResolver: (request: unknown) => {
+          const value = request as {
+            creditSubject?: {
+              accountId: string;
+              accountType: string;
+              serviceId: string;
+              creditType: string;
+            };
+            requestId?: string;
           };
-          requestId?: string;
-        };
-        return {
-          subject: value.creditSubject ?? { accountId: '' },
-          requestId: value.requestId,
-        };
-      },
-
-      // Middleware cannot read controller decorator metadata. Reuse the same
-      // policy constant here so amount/mode/operation cannot drift.
-      earlyPolicies: [{
-        method: 'POST',
-        path: '/demo/cheap',
-        ...CHEAP_CREDIT_POLICY,
-      }],
+          return {
+            subject: value.creditSubject ?? { accountId: '' },
+            requestId: value.requestId,
+          };
+        },
+      }),
     }),
   ],
   controllers: [ExampleDemoController],
@@ -51,7 +56,7 @@ export class AppModule implements NestModule {
     consumer
       .apply(
         RequestContextMiddleware,    // 1. Authenticate/resolve account first
-        CreditBoundaryMiddleware,    // 2. Atomically reserve paid routes
+        CreditBoundaryMiddleware,    // 2. Reserve catalog routes with boundary=true
         EarlyReturnMiddleware,       // 3. May terminate; boundary refunds
       )
       .forRoutes('*');

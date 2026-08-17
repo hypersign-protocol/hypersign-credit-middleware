@@ -1,16 +1,58 @@
 # Hypersign Credit Middleware
 
-NestJS Middleware SDK for atomic, Redis-backed API credit reservations. Version 2 is a
-breaking, subject-scoped design: every balance belongs to one explicit wallet.
+Version 3 is a catalog-driven NestJS SDK for Redis-backed API credits. The SDK validates the
+installed service's routes, reserves credit before controllers execute, owns
+commit/rollback/recovery state transitions, writes a transactional Redis Stream
+outbox, relays lifecycle events to BullMQ, and consumes trusted BullMQ commands.
 
-Internal and operational references:
+Operational references:
 
-- [Redis keyspace, data types, TTLs, and inspection](docs/redis-keyspace.md)
+- [Redis keyspace, records, TTLs, and inspection](docs/redis-keyspace.md)
 - [Lua scripts, keys, arguments, and return codes](docs/lua-scripts.md)
+
+## Main model
+
+The authoritative HTTP price source is a versioned service catalog. Controllers
+do not use a credit decorator.
+
+```ts
+export const KYC_CREDIT_CATALOG = defineCreditCatalog({
+  serviceId: 'kyc',
+  version: '2026-08-14',
+  globalPrefix: 'api',
+  routes: [
+    {
+      method: 'POST',
+      path: '/api/v1/session',
+      charges: [
+        { id: 'api', creditType: 'API_CREDIT', amount: 4 },
+      ],
+    },
+    {
+      method: 'GET',
+      path: '/api/v1/session/:sessionId',
+      charges: [], // explicitly free
+    },
+  ],
+});
+```
+
+At application bootstrap the SDK compares every discovered Nest controller
+route with the catalog. Startup fails when either side contains a route absent
+from the other, or when a catalog contains duplicate/invalid routes or charges.
+An empty `charges` array distinguishes an intentionally free route from a route
+that was forgotten.
+
+Set `globalPrefix` to the prefix configured on the Nest application. Versioned
+controllers default to URI paths such as `v1`; use `versioning: 'NONE'` for
+header, media-type, or custom versioning where the version is not in the URL.
+The audit covers Nest controller metadata. Raw Express/Fastify routes, Swagger,
+health probes mounted directly on the adapter, and gateway-only endpoints are
+outside Nest discovery and must be governed separately.
 
 ## Billing identity
 
-`CreditSubject` is the complete wallet identity:
+Every wallet has an explicit subject:
 
 ```ts
 const subject: CreditSubject = {
@@ -22,223 +64,130 @@ const subject: CreditSubject = {
 };
 ```
 
-Only `accountId` is required. Optional dimensions create independent wallets.
-Do not put a dimension in the subject unless its balance must be independent.
-For example, omit `serviceId` if KYC and SSI intentionally share one wallet.
+Only `accountId` is intrinsically required. Catalog charges set `serviceId` to
+the selected catalog and set `creditType` per charge. The remaining identity
+must come from trusted authentication context, never request body/query data.
 
-The SDK encodes every dimension safely and generates keys such as:
+## Host providers
+
+The installing service supplies:
+
+1. `CREDIT_REDIS_CLIENT`: the Redis connection used for Lua credit operations.
+2. A second Redis connection for blocking Stream reads. It must not be the
+   operation connection.
+3. A `CreditBullMqProvider` implemented using the host's BullMQ connections.
+4. A `CreditBalanceProvider` for initialization of missing wallets.
+5. `requestContextResolver` for trusted account/tenant/request identity.
+
+The structural BullMQ contract is intentionally small:
+
+```ts
+interface CreditBullMqProvider {
+  add(queueName, jobName, data, { jobId }): Promise<unknown>;
+  createWorker(queueName, processor): Promise<{ close(): Promise<void> }>;
+}
+```
+
+The complete real BullMQ adapter is in
+[`example/bullmq.module.ts`](example/bullmq.module.ts).
+
+## Registration
+
+```ts
+CreditModule.forRootAsync({
+  imports: [RedisModule, CreditQueueModule],
+  inject: [LedgerBalanceProvider, CREDIT_BULLMQ_PROVIDER, STREAM_REDIS],
+  useFactory: (balanceProvider, bullMq, streamClient) => ({
+    catalog: KYC_CREDIT_CATALOG,
+    leaseMs: 60_000,
+    retentionMs: 7 * 24 * 60 * 60 * 1_000,
+    criticalBalance: 20,
+    balanceProvider,
+    bullMq: {
+      provider: bullMq,
+      streamClient,
+      lifecycleQueueNames: ['credit.lifecycle'],
+      commandQueueName: 'credit.commands.kyc',
+    },
+    requestContextResolver: (unknownRequest) => {
+      const request = unknownRequest as AuthenticatedRequest;
+      return {
+        subject: {
+          tenantId: request.service.tenantId,
+          accountType: 'BUSINESS',
+          accountId: request.service.appId,
+          serviceId: 'kyc',
+        },
+        requestId: request.requestId,
+      };
+    },
+  }),
+});
+```
+
+Register `CreditModule` once in the root billing/infrastructure module. It
+installs one global interceptor; feature controllers contain no pricing code.
+
+## Request lifecycle
+
+For each charge the SDK creates an independent reservation. A stable HTTP
+request ID is combined with the catalog charge ID, preventing collisions when
+one endpoint consumes multiple credit types.
 
 ```text
-credit:{credit}:balance:tenant=tenant_1|accountType=BUSINESS|account=business_123|service=kyc|creditType=API_CREDIT
+Catalog match
+  -> reserve every charge
+  -> execute controller
+  -> commit IMMEDIATE reservations after success
+  -> leave DEFERRED reservations active
+  -> rollback all still-active reservations after failure
 ```
 
-Every transactional key contains the same Redis Cluster hash tag, so reservation,
-rollback, recovery, idempotency, and stream writes remain valid in Redis Cluster.
-
-## Installation
-
-NestJS and RxJS are peer dependencies. A consuming application must provide one
-runtime copy of them. During local development, install a packed artifact instead
-of a live `file:` symlink, which can load the SDK's development Nest installation:
-
-```sh
-cd /home/pratap/nestjs-interceptor
-npm run build
-npm pack
-
-cd /home/pratap/hypersign-kyc-service
-npm install ../nestjs-interceptor/hypersign-protocol-credit-sdk-2.0.0.tgz
-```
-
-Import from:
+Example with two independent lifecycles:
 
 ```ts
-import { CreditModule, CreditCost } from '@hypersign-protocol/credit-sdk';
-```
-
-## Redis provider
-
-Expose one application-owned Redis client under `CREDIT_REDIS_CLIENT`:
-
-```ts
-@Global()
-@Module({
-  providers: [{
-    provide: CREDIT_REDIS_CLIENT,
-    useFactory: () => new Redis(process.env.REDIS_URL!),
-  }],
-  exports: [CREDIT_REDIS_CLIENT],
-})
-export class RedisModule {}
-```
-
-The client must implement the ioredis-compatible
-`eval(script, keyCount, ...keysAndArguments)` API.
-
-## Balance provider safety
-
-The provider receives the exact subject and initializes only a missing Redis
-wallet:
-
-```ts
-@Injectable()
-export class LedgerBalanceProvider implements CreditBalanceProvider {
-  constructor(private readonly ledger: BillingLedger) {}
-
-  async getBalance(subject: CreditSubject) {
-    const row = await this.ledger.findWallet(subject);
-    return {
-      balance: row.availableCredits,
-      source: 'billing-ledger',
-      revision: row.revision,
-    };
-  }
-}
-```
-
-An existing balance—including zero—is authoritative. The provider is never
-called because a balance is low or insufficient. Therefore a stale database
-snapshot cannot overwrite Redis and recreate spent credits. `criticalBalance`
-only emits a low-balance notification.
-
-Concurrent first requests use a scoped initialization lock. One initializes;
-another receives HTTP 503 and can retry with the same request ID. Provider
-failure fails closed.
-
-## Register once for the whole application
-
-Use async registration so application providers can be injected:
-
-```ts
-@Module({
-  imports: [
-    RedisModule,
-    CreditModule.forRootAsync({
-      imports: [BillingInfrastructureModule],
-      inject: [LedgerBalanceProvider, CreditEventsHandler],
-      useFactory: (
-        balanceProvider: LedgerBalanceProvider,
-        eventHandler: CreditEventsHandler,
-      ) => ({
-        leaseMs: 60_000,
-        retentionMs: 7 * 24 * 60 * 60 * 1000,
-        criticalBalance: 20,
-        balanceProvider,
-        eventHandler,
-        requestContextResolver: (unknownRequest) => {
-          const request = unknownRequest as AuthenticatedRequest;
-          return {
-            subject: {
-              tenantId: request.service.tenantId,
-              accountType: 'BUSINESS',
-              accountId: request.service.businessId,
-              serviceId: 'kyc',
-              creditType: 'API_CREDIT',
-            },
-            requestId: request.requestId,
-          };
-        },
-      }),
-    }),
+{
+  method: 'POST',
+  path: '/api/v1/blockchain/submit',
+  charges: [
+    { id: 'api', creditType: 'API_CREDIT', amount: 5 },
+    {
+      id: 'transaction',
+      creditType: 'BLOCKCHAIN_TXN_CREDIT',
+      amount: 25,
+      settlementMode: 'DEFERRED',
+      autoRecover: false,
+    },
   ],
-})
-export class BillingModule {}
-```
-
-Import this root billing module once. Feature modules do not register
-`CreditModule` again. The module installs one global credit interceptor.
-
-The resolver must use identity produced by verified authentication. Never use an
-unverified JWT field or user-controlled account header in production.
-
-## Decorator usage
-
-```ts
-@Controller('mobile-flows')
-export class MobileFlowController {
-  @Get(':flowId')
-  @CreditCost({
-    amount: 10,
-    settlementMode: 'IMMEDIATE',
-    operation: 'FETCH_MOBILE_FLOW',
-  })
-  findOne(@Param('flowId') flowId: string) {
-    return this.mobileFlowService.findOne(flowId);
-  }
 }
 ```
 
-The interceptor atomically reserves from the resolved subject, runs the
-controller, commits on success, and refunds once on failure. A stable
-`requestId` prevents duplicate deduction. Because the SDK does not store the
-original HTTP response, a duplicate decorated request is rejected with `409`
-instead of executing the controller side effect again.
+The API reservation commits after controller success. The transaction
+reservation remains active until a trusted command commits or rolls it back.
+`autoRecover: false` is valid only for deferred work and requires age monitoring
+because a lost downstream owner can otherwise hold credit indefinitely.
 
-## Deferred operations
+Multiple reservations are independent, not a transaction group. If a later
+reservation fails, the SDK compensates earlier new reservations with rollback.
 
-Register the module once; settlement mode is per operation:
+## Early middleware boundary
+
+Nest middleware runs before guards and interceptors. If trusted identity is
+already established by middleware and a later middleware can terminate a paid
+request, mark that route:
 
 ```ts
-const reservation = await credits.reserve({
-  subject,
-  requestId,
-  amount: 25,
-  operation: 'GENERATE_REPORT',
-  settlementMode: 'DEFERRED',
-});
-
-// A different worker may extend the lease with the returned capability token.
-await credits.renew(reservation.reservationId, reservation.leaseToken);
-
-await credits.commit(reservation.reservationId);
-// or
-await credits.rollback(reservation.reservationId, 'downstream_failed');
+{
+  method: 'POST',
+  path: '/api/v1/mobile-flow',
+  boundary: true,
+  charges: [{ id: 'api', creditType: 'API_CREDIT', amount: 10 }],
+}
 ```
 
-Keep `leaseToken` private. Set `leaseMs` above the normal operation duration and
-renew only genuinely long-running deferred work.
-
-## Credit grants/top-ups
-
-Apply a successful payment once with its stable business transaction ID:
+Then register:
 
 ```ts
-await credits.grant({
-  subject,
-  amount: 100,
-  referenceId: payment.transactionId,
-  reason: 'credit_purchase',
-});
-```
-
-Grant retries are idempotent while the Redis grant marker is retained. Reusing
-the reference with a different amount is rejected. Permanently deduplicate the
-`referenceId` in the authoritative recharge consumer because the Redis marker
-expires after `retentionMs`. Persist `CREDIT_GRANTED` from the durable event
-stream into the ledger; do not update Redis and the ledger independently in
-request code.
-
-## Middleware that can terminate early
-
-Normally use only `@CreditCost`. Add the early boundary only when application
-middleware can end a paid request before Nest interceptors run:
-
-```ts
-const FETCH_FLOW = {
-  amount: 10,
-  settlementMode: 'IMMEDIATE' as const,
-  operation: 'FETCH_MOBILE_FLOW',
-};
-
-CreditModule.forRoot({
-  // other options...
-  earlyPolicies: [{
-    method: 'GET',
-    path: '/api/v1/mobile-flows/:flowId',
-    ...FETCH_FLOW,
-  }],
-});
-
 consumer.apply(
   AuthenticationContextMiddleware,
   CreditBoundaryMiddleware,
@@ -246,114 +195,146 @@ consumer.apply(
 ).forRoutes('*');
 ```
 
-Keep `@CreditCost(FETCH_FLOW)` on the controller. The boundary reserves once;
-the interceptor claims that same reservation. If feature middleware ends the
-response, the boundary refunds it. A process crash is handled by recovery.
+The boundary and interceptor use the same catalog. There is no duplicated
+policy list. If identity is produced by a guard instead, do not use the early
+boundary; charging occurs after authentication and before the controller.
 
-Decorator metadata is not available to earlier Express middleware, which is why
-an early policy is required only for this exceptional path.
+## Durable BullMQ lifecycle events
+
+Every balance/state transition appends its event to the Redis Stream in the same
+Lua transaction. This includes `RESERVED`, `COMMITTED`, `ROLLED_BACK`, `EXPIRED`,
+`CREDIT_GRANTED`, `CRITICAL_BALANCE`, and `BALANCE_INITIALIZED`.
+
+The SDK-owned relay uses a Redis consumer group:
+
+```text
+Redis Stream
+  -> XAUTOCLAIM abandoned pending entries
+  -> XREADGROUP new entries
+  -> BullMQ add using serviceId + Stream ID as jobId
+  -> XACK only after every configured destination accepts the job
+```
+
+Default output queue: `credit.lifecycle`.
+
+Job names:
+
+```text
+credit.reserved
+credit.committed
+credit.rolled-back
+credit.expired
+credit.granted
+credit.critical-balance
+credit.balance-initialized
+credit.command-rejected
+```
+
+BullMQ provides competing consumers, not RabbitMQ-style topic fan-out. Configure
+multiple `lifecycleQueueNames` when independent systems must each receive every
+event. Bull job IDs make relay retries idempotent. Database consumers must also
+uniquely persist `eventId` because processing is at least once.
+
+Balance changes occur at these events:
+
+| Event | Available balance delta |
+| --- | ---: |
+| `RESERVED` | `-amount` |
+| `COMMITTED` | `0` |
+| `ROLLED_BACK` | `+amount` |
+| `EXPIRED` | `+amount` |
+| `CREDIT_GRANTED` | `+amount` |
+
+`COMMITTED.balanceAfter` is the snapshot captured when reservation deducted the
+credit; it is not necessarily the current wallet balance if other operations
+happened before commit.
+
+## Trusted inbound commands
+
+The SDK registers a worker on `credit.commands.<serviceId>` by default. Supported
+job names are:
+
+```text
+credit.grant.requested
+credit.reserve.requested
+credit.commit.requested
+credit.rollback.requested
+```
+
+Example grant command:
+
+```ts
+await queueProvider.add('credit.commands.kyc', 'credit.grant.requested', {
+  schemaVersion: 1,
+  commandId: payment.eventId,
+  serviceId: 'kyc',
+  source: 'payment-service',
+  payload: {
+    subject: {
+      tenantId: 'tenant_1',
+      accountId: 'business_123',
+      creditType: 'API_CREDIT',
+    },
+    amount: 100,
+    referenceId: payment.transactionId,
+    reason: 'credit_purchase',
+  },
+}, { jobId: payment.eventId });
+```
+
+Grant uses `referenceId` for Redis idempotency. Commit/rollback commands accept a
+reservation ID and always load the stored subject and amount; external callers
+cannot choose a refund amount. Rejected valid envelopes emit
+`credit.command-rejected` and the Bull job fails for its configured retry policy.
+Command-created reservations are always `DEFERRED`; an `IMMEDIATE` reservation
+only has meaning in the HTTP controller success/failure lifecycle.
+
+Redis grant markers expire after `retentionMs`. Financial systems must also keep
+a permanent unique payment/reference ID in the authoritative ledger.
+
+## Balance initialization
+
+`CreditBalanceProvider` runs only when the exact scoped balance key is absent.
+A stored zero is a real zero. Low or insufficient balance never refreshes from
+the provider, preventing a stale database snapshot from recreating spent credit.
+
+Concurrent initialization uses a per-wallet lock. Provider failure fails closed.
+Recharge after initialization arrives through `credit.grant.requested`.
 
 ## Crash recovery
 
-The SDK creates no interval or timeout. Run recovery from a separate scheduled
-worker so it survives API crashes:
+The SDK creates no `setInterval` or `setTimeout`. A dedicated scheduler or worker
+invokes:
 
 ```ts
 await creditRecoveryService.runOnce();
 ```
 
-Multiple workers are safe because finalization is atomic and idempotent. Run the
-worker more frequently than the acceptable refund delay.
-
-An explicitly deferred reservation may opt out with `autoRecover: false` when
-another durable system owns the outcome. `runOnce()` ignores that reservation;
-only an explicit `commit()` or `rollback()` settles it. Use this only with
-age monitoring and reconciliation, because a lost owner otherwise holds the
-credits indefinitely.
-
-## Durable events and ledger synchronization
-
-Reservation, commit, rollback, expiry, and grant state changes append to
-`credit:{credit}:events` inside the same Lua transaction. Use a consumer group:
-
-```redis
-XGROUP CREATE credit:{credit}:events billing-ledger $ MKSTREAM
-XREADGROUP GROUP billing-ledger writer-1 COUNT 100 BLOCK 5000 \
-  STREAMS credit:{credit}:events >
-```
-
-Use `reservationId` for settlement-event idempotency and `referenceId` for grant
-idempotency in the durable database. Acknowledge only after the database
-transaction commits. The optional in-process event handler is for logs and
-low-latency notifications; it is not a durable ledger writer.
-
-Lifecycle handler payloads use unambiguous fields:
-
-```ts
-onRolledBack(event) {
-  event.accountId;    // string wallet account ID
-  event.amount;       // numeric amount refunded
-  event.balanceAfter; // numeric scoped balance after refund
-  event.subject;      // complete tenant/account/service/credit identity
-}
-```
-
-Handler events are ordered through a bounded best-effort queue. Synchronous and
-asynchronous handler errors are logged and cannot fail the API. Idempotent
-request and grant retries do not emit duplicate handler callbacks. The Redis
-Stream remains the durable source for database synchronization.
-
-## Production Redis requirements
-
-- Enable AOF persistence and tested backups. Redis loss can lose both balances
-  and the colocated event stream.
-- Use `noeviction`; eviction of balances or reservation hashes breaks accounting.
-- Use TLS, authentication, least-privilege network access, and separate keyspace.
-- Monitor recovery backlog, stream consumer lag, provider failures, 402/503 rates,
-  memory, replication health, and persistence errors.
-- Use unique request IDs from a trusted gateway/service, with retention longer
-  than the maximum client retry window.
-- Treat amounts as positive safe integers in the smallest credit unit.
-- Reconcile Redis-derived events against the authoritative ledger continuously.
+The operation is atomic and safe with multiple workers. Expired, auto-recoverable
+reservations are refunded once and emit durable `EXPIRED`. BullMQ workers and the
+event relay use blocking Redis reads, not application polling timers.
 
 ## Examples
 
-Start local Redis on `localhost:6379` and run either server:
+The API examples use `redis://localhost:6379`, a dedicated Stream connection, a
+real BullMQ adapter, strict startup catalog auditing, and inbound command
+consumption. The separate event server consumes lifecycle events and produces
+trusted commands; the SDK-installed API server does neither in its controllers.
 
 ```sh
 npm run start:example
 npm run start:example:multi
+npm run start:example:events
 ```
 
-The single-server demo includes one endpoint with two independent charges for
-the same account and service:
-
-- `5 API_CREDIT` is charged immediately by `@CreditCost` after the handler
-  succeeds.
-- `25 BLOCKCHAIN_TXN_CREDIT` is reserved programmatically as `DEFERRED` and
-  emits a durable `RESERVED` event. It passes `autoRecover: false`, so
-  `runOnce()` leaves it reserved for its owner to settle explicitly. The demo
-  intentionally provides no worker.
+Single-server multi-credit request:
 
 ```sh
 curl -X POST http://localhost:3000/demo/blockchain-operation \
   -H 'x-request-id: blockchain-demo-001'
-
-curl http://localhost:3000/demo/balance
 ```
 
-On a fresh demo Redis instance, the balance provider initializes both wallets
-to `100`. After the call, the balances are `API_CREDIT=95` and
-`BLOCKCHAIN_TXN_CREDIT=75`. The API reservation is committed while the
-blockchain reservation remains deferred for a future external worker.
-
-Use `autoRecover: false` only when another durable system owns settlement.
-Because such a reservation can remain held forever if that owner disappears,
-monitor its age and provide an explicit reconciliation or administrative
-rollback path. The flag prevents an automatic refund; it does not solve an
-unknown downstream outcome.
-
-The multi-module mobile-flow URL is:
+Multi-module catalog route:
 
 ```sh
 curl http://localhost:3001/api/v1/mobile-flows/flow_1 \
@@ -361,26 +342,46 @@ curl http://localhost:3001/api/v1/mobile-flows/flow_1 \
   -H 'x-request-id: request-001'
 ```
 
-An idempotent demo top-up is available at:
+Run `start:example:multi` and `start:example:events` in separate terminals, then
+produce a grant from the event server:
 
 ```sh
-curl -X POST http://localhost:3001/api/v1/operations/grant \
+curl -X POST http://localhost:3002/credit-commands/grant \
   -H 'content-type: application/json' \
-  -H 'x-business-id: business_123' \
-  -d '{"amount":25,"referenceId":"payment-001"}'
+  -d '{"serviceId":"kyc","tenantId":"tenant_1","accountType":"BUSINESS","accountId":"business_123","creditType":"API_CREDIT","amount":25,"referenceId":"payment-001"}'
 ```
 
-The example header is intentionally simplified and must not replace verified
-authentication in a real service.
+Inspect lifecycle events received by the separate process:
 
-## Version 2 breaking changes
+```sh
+curl 'http://localhost:3002/credit-events?limit=25'
+```
 
-- Package name is `@hypersign-protocol/credit-sdk`.
-- `reserve()` requires `subject`; flat `accountId` input was removed.
-- `getBalance()` requires a `CreditSubject` and returns `null` if uninitialized.
-- `requestContextResolver` returns `{ subject, requestId }`.
-- Low/insufficient balances never trigger provider refresh.
-- Redis keys use a new scoped, cluster-safe format; migrate balances explicitly.
-- Missing subject dimensions use explicit key tags and cannot collide with real
-  values such as `_` or `default`.
-- `renew()` requires the per-reservation `leaseToken`.
+See [`example/event-server/README.md`](example/event-server/README.md) for the
+responsibility split and the TimescaleDB replacement point.
+
+The example headers simulate authenticated identity and must not be copied as a
+production authentication mechanism.
+
+## Production Redis requirements
+
+- Redis 6.2 or newer for `XAUTOCLAIM`.
+- AOF persistence, tested backups, replication, and `noeviction`.
+- TLS, authentication, least-privilege access, and isolated key prefixes.
+- Dedicated operation and blocking Stream connections.
+- Monitoring for pending Stream entries, consumer lag, recovery backlog, Bull
+  failures, provider failures, insufficient-credit responses, and Redis memory.
+- `eventStreamMaxLength` sized above the longest tolerated relay outage; approximate
+  trimming can remove an event that was never delivered if configured too small.
+
+## Package
+
+The package name is:
+
+```ts
+import {
+  CreditModule,
+  CreditService,
+  defineCreditCatalog,
+} from '@hypersign-protocol/credit-middleware';
+```

@@ -1,42 +1,40 @@
+import { Controller, Get, Param, Post, Req } from "@nestjs/common";
 import {
-  Controller, Get, Param, Post, Req,
-} from '@nestjs/common';
-import {
-  CreditCost,
   CreditRecoveryService,
   CreditService,
-} from '../src';
+  getCreditRequestState,
+} from "../src";
 import {
-  BLOCKCHAIN_API_CREDIT_POLICY,
-  BLOCKCHAIN_TRANSACTION_COST,
   BLOCKCHAIN_TRANSACTION_SUBJECT,
-  CHEAP_CREDIT_POLICY,
   EXAMPLE_ACCOUNT_ID,
+  EXAMPLE_COST,
   EXAMPLE_SUBJECT,
   exampleBalanceProvider,
-} from './credit-demo.config';
+} from "./credit-demo.config";
 
-interface DemoRequest { requestId: string }
+interface DemoRequest {
+  requestId: string;
+}
 
-@Controller('demo')
+@Controller("demo")
 export class ExampleDemoController {
   constructor(
     private readonly credits: CreditService,
     private readonly recovery: CreditRecoveryService,
   ) {}
 
-  /** No @CreditCost: useful for checking that undecorated routes remain free. */
-  @Get('free')
+  /** Explicitly declared as free in the service catalog. */
+  @Get("free")
   free() {
     return {
       success: true,
-      message: 'This endpoint does not reserve credits',
+      message: "This endpoint does not reserve credits",
       cost: 0,
     };
   }
 
   /** Read the current balance without spending credits. */
-  @Get('balance')
+  @Get("balance")
   async balance() {
     return {
       accountId: EXAMPLE_ACCOUNT_ID,
@@ -50,13 +48,15 @@ export class ExampleDemoController {
   }
 
   /** Inspect the durable state retained after commit, rollback, or expiry. */
-  @Get('reservations/:reservationId')
-  async reservation(@Param('reservationId') reservationId: string) {
-    return await this.credits.getReservation(reservationId) ?? { found: false };
+  @Get("reservations/:reservationId")
+  async reservation(@Param("reservationId") reservationId: string) {
+    return (
+      (await this.credits.getReservation(reservationId)) ?? { found: false }
+    );
   }
 
   /** Create an intentionally abandoned reservation for recovery experiments. */
-  @Post('orphan')
+  @Post("orphan")
   async orphan(@Req() request: DemoRequest) {
     return this.credits.reserve({
       subject: EXAMPLE_SUBJECT,
@@ -66,88 +66,79 @@ export class ExampleDemoController {
   }
 
   /** Programmatic/deferred: caller settles this reservation later. */
-  @Post('deferred')
+  @Post("deferred")
   async deferred(@Req() request: DemoRequest) {
     return this.credits.reserve({
       subject: EXAMPLE_SUBJECT,
       requestId: `${request.requestId}:deferred`,
-      operation: 'DEFERRED_DEMO',
+      operation: "DEFERRED_DEMO",
       amount: 25,
-      settlementMode: 'DEFERRED',
+      settlementMode: "DEFERRED",
     });
   }
 
   /**
    * One business operation with two independent credit lifecycles:
-   * - the decorator commits 5 API_CREDIT after this handler succeeds;
-   * - the manual reservation emits a RESERVED event and remains DEFERRED.
-   *
-   * This demo intentionally has no worker. The reservation opts out of
-   * scheduled recovery and must eventually be committed or rolled back by its
-   * owner. The configured event handler logs its RESERVED event.
+   * The catalog creates two independent reservations before this handler:
+   * 5 API_CREDIT is committed automatically and 25 BLOCKCHAIN_TXN_CREDIT
+   * remains deferred for an external command to settle.
    */
-  @Post('blockchain-operation')
-  @CreditCost(BLOCKCHAIN_API_CREDIT_POLICY)
-  async blockchainOperation(@Req() request: DemoRequest) {
-    await this.credits.reserve({
-      subject: BLOCKCHAIN_TRANSACTION_SUBJECT,
-      requestId: `${request.requestId}:blockchain-transaction`,
-      operation: 'EXECUTE_BLOCKCHAIN_TRANSACTION',
-      amount: BLOCKCHAIN_TRANSACTION_COST,
-      settlementMode: 'DEFERRED',
-      autoRecover: false,
-    });
+  @Post("blockchain-operation")
+  async blockchainOperation(@Req() req: any) {
+    const state = getCreditRequestState(req);
+    const reservationId = state?.reservations.find(
+      ({ charge }) => charge.settlementMode === "DEFERRED",
+    )?.reservation.reservationId;
 
-    return {};
+    return {
+      reservationId,
+    };
   }
 
-  @Post('deferred/:reservationId/commit')
-  commitDeferred(@Param('reservationId') id: string) {
+  @Post("deferred/:reservationId/commit")
+  commitDeferred(@Param("reservationId") id: string) {
     return this.credits.commit(id);
   }
 
-  @Post('deferred/:reservationId/rollback')
-  rollbackDeferred(@Param('reservationId') id: string) {
-    return this.credits.rollback(id, 'deferred_operation_failed');
+  @Post("deferred/:reservationId/rollback")
+  rollbackDeferred(@Param("reservationId") id: string) {
+    return this.credits.rollback(id, "deferred_operation_failed");
   }
 
-  @Get('provider-calls')
+  @Get("provider-calls")
   providerCalls() {
     return { calls: exampleBalanceProvider.calls };
   }
 
   /** Manually run one recovery pass (production should use an external worker). */
-  @Post('recover')
+  @Post("recover")
   async recover() {
     return { recovered: await this.recovery.runOnce() };
   }
 
   /** Successful low-cost request: 100 becomes 90. */
-  @Post('cheap')
-  @CreditCost(CHEAP_CREDIT_POLICY)
+  @Post("cheap")
   async cheap() {
     return {
       success: true,
-      cost: 10,
+      cost: EXAMPLE_COST.CHEAP,
       balanceDuringController: await this.credits.getBalance(EXAMPLE_SUBJECT),
     };
   }
 
   /** Successful high-cost request, useful for concurrency experiments. */
-  @Post('expensive')
-  @CreditCost(70)
+  @Post("expensive")
   async expensive() {
     return {
       success: true,
-      cost: 70,
+      cost: EXAMPLE_COST.EXPENSIVE,
       balanceDuringController: await this.credits.getBalance(EXAMPLE_SUBJECT),
     };
   }
 
   /** Reserves 20, throws, and should have all 20 rolled back. */
-  @Post('fail')
-  @CreditCost(20)
+  @Post("fail")
   fail(): never {
-    throw new Error('Intentional demo failure');
+    throw new Error("Intentional demo failure");
   }
 }

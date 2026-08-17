@@ -1,16 +1,12 @@
 import {
   CallHandler,
-  BadRequestException,
-  ConflictException,
   ExecutionContext,
+  Inject,
   Injectable,
   Logger,
   NestInterceptor,
   ServiceUnavailableException,
-  UnauthorizedException,
-  Inject,
 } from '@nestjs/common';
-import { Reflector } from '@nestjs/core';
 import {
   EMPTY,
   Observable,
@@ -21,179 +17,155 @@ import {
   mergeMap,
   throwError,
 } from 'rxjs';
-import { CREDIT_COST_METADATA, CreditCostOptions } from './credit.decorator';
+import {
+  CreditCatalogMismatchException,
+  CreditCatalogService,
+  ResolvedCreditCatalogRoute,
+} from './credit.catalog';
+import {
+  CREDIT_BOUNDARY_STATE,
+  CreditBoundaryState,
+} from './credit-boundary.middleware';
+import {
+  AppliedCreditReservation,
+  CreditPolicyExecutor,
+} from './credit-policy.executor';
 import { CreditService } from './credit.service';
-import { CREDIT_BOUNDARY_STATE, CreditBoundaryState } from './credit-boundary.middleware';
-import { CREDIT_OPTIONS, ResolvedCreditOptions } from './credit.types';
-import { CreditSubject } from './credit.types';
+import {
+  CREDIT_OPTIONS,
+  CreditRequestContext,
+  ResolvedCreditOptions,
+} from './credit.types';
 
-interface CreditRequest {
-  [CREDIT_BOUNDARY_STATE]?: CreditBoundaryState;
+export const CREDIT_REQUEST_STATE = Symbol('CREDIT_REQUEST_STATE');
+
+export interface CreditRequestState {
+  route: { method: string; path: string; operation: string };
+  reservations: AppliedCreditReservation[];
 }
 
+interface CreditRequest {
+  method?: string;
+  originalUrl?: string;
+  url?: string;
+  [CREDIT_BOUNDARY_STATE]?: CreditBoundaryState;
+  [CREDIT_REQUEST_STATE]?: CreditRequestState;
+}
+
+/** Applies the selected service catalog to every Nest HTTP route. */
 @Injectable()
 export class CreditInterceptor implements NestInterceptor {
   private readonly logger = new Logger(CreditInterceptor.name);
 
   constructor(
-    private readonly reflector: Reflector,
-    private readonly creditService: CreditService,
+    private readonly catalog: CreditCatalogService,
+    private readonly executor: CreditPolicyExecutor,
+    private readonly credits: CreditService,
     @Inject(CREDIT_OPTIONS) private readonly options: ResolvedCreditOptions,
   ) {}
 
   intercept(context: ExecutionContext, next: CallHandler): Observable<unknown> {
-    const options = this.reflector.getAllAndOverride<CreditCostOptions>(
-      CREDIT_COST_METADATA,
-      [context.getHandler(), context.getClass()],
-    );
-
-    if (options === undefined) {
-      return next.handle();
-    }
-    const amount = options.amount;
-
+    if (context.getType() !== 'http') return next.handle();
     const request = context.switchToHttp().getRequest<CreditRequest>();
-    const requestContext = this.options.requestContextResolver(request);
-    const subject = requestContext.subject;
-    if (!subject?.accountId) {
-      throw new UnauthorizedException('A billing subject is required');
+    const method = request.method ?? '';
+    const path = request.originalUrl ?? request.url ?? '';
+    const route = this.catalog.find(method, path);
+    if (!route) {
+      throw new CreditCatalogMismatchException(`${method} ${path} is not cataloged`);
     }
+    if (route.charges.length === 0) return next.handle();
 
+    const requestContext = this.options.requestContextResolver(request);
     const boundary = request[CREDIT_BOUNDARY_STATE];
-    const reservation = boundary
-      ? this.claimBoundaryReservation(
-          boundary,
-          options,
-          subject,
-          requestContext.requestId,
-        )
-      : this.creditService.reserve({
-          subject,
-          requestId: requestContext.requestId,
-          amount,
-          settlementMode: options.settlementMode,
-          operation: options.operation ?? context.getHandler().name,
-        });
+    const reservationPromise = boundary
+      ? this.claimBoundary(route, requestContext, boundary)
+      : this.executor.reserve(route, requestContext);
 
-    return from(reservation).pipe(
-      mergeMap(({ reservationId, settlementMode, existing }) => {
-        if (existing && !boundary) {
-          return throwError(() => new ConflictException(
-            'This credit requestId already has a reservation',
-          ));
-        }
-        // `defer` converts both a normal Observable and a synchronous throw
-        // from a downstream handler into the same rollback path.
+    return from(reservationPromise).pipe(
+      mergeMap((reservations) => {
+        request[CREDIT_REQUEST_STATE] = {
+          route: { method: route.method, path: route.path, operation: route.operation },
+          reservations,
+        };
         const controllerResult = defer(() => next.handle());
-        const resultWithSettlement = settlementMode === 'IMMEDIATE'
-          ? controllerResult.pipe(
-              concatWith(defer(() => this.commitOrThrow(
-                reservationId,
-                boundary,
-              ))),
-            )
-          : controllerResult;
-
-        return resultWithSettlement.pipe(
-          catchError((controllerError: unknown) => {
-            const reason = controllerError instanceof Error
-              ? controllerError.message
-              : String(controllerError);
-            this.logger.warn(
-              `Request execution or credit settlement failed; rolling back ` +
-              `reservation ${reservationId} ` +
-              `(account=${subject.accountId}, amount=${amount}, reason=${reason})`,
-            );
-
-            return from(this.creditService.rollback(reservationId, reason)).pipe(
-              catchError((rollbackError: unknown) => {
-                const message = rollbackError instanceof Error
-                  ? rollbackError.message
-                  : String(rollbackError);
-                this.logger.error(
-                  `Rollback failed for reservation ${reservationId}: ${message}`,
-                );
-                return [false];
-              }),
-              mergeMap((refunded) => {
-                if (boundary) boundary.finalized = true;
-                if (refunded) {
-                  this.logger.log(
-                    `Rolled back reservation ${reservationId}; refunded ${amount} ` +
-                    `credits to account ${subject.accountId}`,
-                  );
-                } else {
-                  this.logger.warn(
-                    `Reservation ${reservationId} was already finalized; no refund applied`,
-                  );
-                }
-                return throwError(() => controllerError);
-              }),
-            );
-          }),
+        return controllerResult.pipe(
+          concatWith(defer(() => this.commitImmediate(reservations, boundary))),
+          catchError((error: unknown) => this.rollbackAndRethrow(
+            reservations,
+            boundary,
+            error,
+          )),
         );
       }),
     );
   }
 
-  private commitOrThrow(
-    reservationId: string,
+  private async claimBoundary(
+    route: ResolvedCreditCatalogRoute,
+    requestContext: CreditRequestContext,
+    boundary: CreditBoundaryState,
+  ): Promise<AppliedCreditReservation[]> {
+    if (boundary.route.method !== route.method || boundary.route.path !== route.path) {
+      throw new CreditCatalogMismatchException('early boundary route changed before interceptor');
+    }
+    const reservations = await this.executor.claim(
+      route,
+      requestContext,
+      boundary.reservations,
+    );
+    boundary.claimedByInterceptor = true;
+    return reservations;
+  }
+
+  private commitImmediate(
+    reservations: AppliedCreditReservation[],
     boundary?: CreditBoundaryState,
   ): Observable<never> {
-    return from(this.creditService.commit(reservationId)).pipe(
-      mergeMap((committed) => {
-        if (!committed) {
-          return throwError(() => new ServiceUnavailableException(
-            `Credit reservation ${reservationId} could not be committed`,
-          ));
-        }
+    return from(this.commitSequentially(reservations)).pipe(
+      mergeMap(() => {
         if (boundary) boundary.finalized = true;
         return EMPTY;
       }),
     );
   }
 
-  private async claimBoundaryReservation(
-    boundary: CreditBoundaryState,
-    options: CreditCostOptions,
-    subject: CreditSubject,
-    requestId?: string,
-  ) {
-    const reservation = await this.creditService.getReservation(
-      boundary.reservationId,
-    );
-    const settlementMode = options.settlementMode ?? 'IMMEDIATE';
-    if (
-      !reservation ||
-      reservation.status !== 'RESERVED' ||
-      reservation.scopeId !== boundary.scopeId ||
-      !this.sameSubject(reservation.subject, subject) ||
-      reservation.amount !== options.amount ||
-      reservation.settlementMode !== settlementMode ||
-      (requestId && reservation.requestId !== requestId) ||
-      (options.operation && reservation.operation !== options.operation)
-    ) {
-      throw new BadRequestException(
-        'Early credit reservation does not match route credit metadata',
-      );
+  private async commitSequentially(reservations: AppliedCreditReservation[]): Promise<void> {
+    for (const { charge, reservation } of reservations) {
+      if (charge.settlementMode !== 'IMMEDIATE') continue;
+      if (!await this.credits.commit(reservation.reservationId)) {
+        throw new ServiceUnavailableException(
+          `Credit reservation ${reservation.reservationId} could not be committed`,
+        );
+      }
     }
-    boundary.claimedByInterceptor = true;
-    return {
-      reservationId: reservation.reservationId,
-      remainingBalance: reservation.remainingBalance,
-      expiresAt: reservation.expiresAt,
-      autoRecover: reservation.autoRecover,
-      existing: true,
-      settlementMode: reservation.settlementMode,
-    };
   }
 
-  private sameSubject(left: CreditSubject, right: CreditSubject): boolean {
-    const value = (input?: string): string => input?.trim() ?? '';
-    return value(left.accountId) === value(right.accountId) &&
-      value(left.tenantId) === value(right.tenantId) &&
-      value(left.accountType) === value(right.accountType) &&
-      value(left.serviceId) === value(right.serviceId) &&
-      value(left.creditType) === value(right.creditType);
+  private rollbackAndRethrow(
+    reservations: AppliedCreditReservation[],
+    boundary: CreditBoundaryState | undefined,
+    error: unknown,
+  ): Observable<never> {
+    const reason = error instanceof Error ? error.message : String(error);
+    this.logger.warn(
+      `Request execution or credit settlement failed; rolling back ` +
+      `${reservations.length} reservation(s) (reason=${reason})`,
+    );
+    return from(this.executor.rollbackAll(reservations, reason)).pipe(
+      catchError((rollbackError: unknown) => {
+        const message = rollbackError instanceof Error
+          ? rollbackError.message
+          : String(rollbackError);
+        this.logger.error(`One or more credit rollbacks failed: ${message}`);
+        return [undefined];
+      }),
+      mergeMap(() => {
+        if (boundary) boundary.finalized = true;
+        return throwError(() => error);
+      }),
+    );
   }
+}
+
+export function getCreditRequestState(request: unknown): CreditRequestState | undefined {
+  return (request as CreditRequest | undefined)?.[CREDIT_REQUEST_STATE];
 }

@@ -1,5 +1,4 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { CreditEventDispatcher } from './events/credit.event-dispatcher';
 import { CreditService } from './credit.service';
 
 /**
@@ -7,9 +6,8 @@ import { CreditService } from './credit.service';
  * this method; invoke it from a dedicated worker, cron job, or external
  * scheduler so recovery continues when API instances are unavailable.
  *
- * After each recovery pass, `EXPIRED` events are dispatched via the configured
- * `CreditModuleEventHandler` so that downstream reconciliation workers and analytics
- * pipelines are notified automatically.
+ * Each successful recovery writes its durable `EXPIRED` event atomically in Redis;
+ * the SDK event relay forwards it to BullMQ.
  */
 @Injectable()
 export class CreditRecoveryService {
@@ -18,7 +16,6 @@ export class CreditRecoveryService {
 
   constructor(
     private readonly credits: CreditService,
-    private readonly dispatcher: CreditEventDispatcher,
   ) {}
 
   async runOnce(): Promise<number> {
@@ -32,24 +29,6 @@ export class CreditRecoveryService {
         this.logger.warn(
           `Recovered ${recovered.length} expired credit reservation(s)`,
         );
-        const now = Date.now();
-        for (const res of recovered) {
-          this.dispatcher.dispatch({
-            type: 'EXPIRED',
-            timestamp: now,
-            subject: res.subject,
-            scopeId: res.scopeId,
-            accountId: res.accountId,
-            tenantId: res.tenantId,
-            accountType: res.accountType,
-            serviceId: res.serviceId,
-            creditType: res.creditType,
-            reservationId: res.reservationId,
-            amount: res.amount,
-            operation: res.operation,
-            balanceAfter: res.balanceAfter,
-          });
-        }
       }
       return recovered.length;
     } catch (error) {

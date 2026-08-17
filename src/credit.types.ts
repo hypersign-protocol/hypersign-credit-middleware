@@ -3,7 +3,6 @@ import {
   ModuleMetadata,
   OptionalFactoryDependency,
 } from '@nestjs/common';
-import { CreditModuleEventHandler } from './events/credit.event-handler';
 
 /** Injection token for the Redis client supplied by the host application. */
 export const CREDIT_REDIS_CLIENT = 'REDIS_CLIENT';
@@ -16,6 +15,67 @@ export interface CreditRedisClient {
     numberOfKeys: number,
     ...args: Array<string | number>
   ): Promise<unknown>;
+}
+
+/** Dedicated Redis connection used only for blocking Stream consumption. */
+export interface CreditEventStreamClient {
+  xgroup(...args: any[]): Promise<unknown>;
+  xreadgroup(...args: any[]): Promise<unknown>;
+  xautoclaim(...args: any[]): Promise<unknown>;
+  xack(...args: any[]): Promise<unknown>;
+}
+
+export interface CreditBullMqJob {
+  id?: string;
+  name: string;
+  data: unknown;
+}
+
+export interface CreditBullMqWorker {
+  close(): Promise<void>;
+}
+
+/** Structural adapter implemented by the host using its BullMQ connections. */
+export interface CreditBullMqProvider {
+  add(
+    queueName: string,
+    jobName: string,
+    data: unknown,
+    options: { jobId: string },
+  ): Promise<unknown>;
+  createWorker(
+    queueName: string,
+    processor: (job: CreditBullMqJob) => Promise<unknown>,
+  ): Promise<CreditBullMqWorker>;
+}
+
+export interface CreditCommandEnvelope {
+  commandId: string;
+  schemaVersion: 1;
+  serviceId: string;
+  requestedAt?: string;
+  source?: string;
+  payload: Record<string, unknown>;
+}
+
+export interface CreditBullMqOptions {
+  provider: CreditBullMqProvider;
+  /** Must not be the connection used by CreditService. */
+  streamClient: CreditEventStreamClient;
+  lifecycleQueueNames?: string[];
+  commandQueueName?: string;
+  consumerGroup?: string;
+  batchSize?: number;
+  blockMs?: number;
+  pendingIdleMs?: number;
+}
+
+export interface ResolvedCreditBullMqOptions extends CreditBullMqOptions {
+  lifecycleQueueNames: string[];
+  consumerGroup: string;
+  batchSize: number;
+  blockMs: number;
+  pendingIdleMs: number;
 }
 
 export type CreditSettlementMode = 'IMMEDIATE' | 'DEFERRED';
@@ -56,12 +116,36 @@ export interface CreditRequestContext {
   requestId?: string;
 }
 
-export interface EarlyCreditPolicy {
-  method: string;
-  path: string;
+export interface CreditCatalogCharge {
+  /** Unique within one route; also scopes request idempotency. */
+  id: string;
+  creditType: string;
   amount: number;
   settlementMode?: CreditSettlementMode;
+  autoRecover?: boolean;
+}
+
+export interface CreditCatalogRoute {
+  method: string;
+  path: string;
+  /** Defaults to the canonical "METHOD /full/path". */
   operation?: string;
+  /** Reserve before later application middleware; trusted identity must exist. */
+  boundary?: boolean;
+  /** An empty array explicitly declares a free endpoint. */
+  charges: CreditCatalogCharge[];
+}
+
+export interface CreditCatalog {
+  serviceId: string;
+  version: string;
+  globalPrefix?: string;
+  /** URI inserts v<version> into the route; NONE covers header/media/custom versioning. */
+  versioning?: 'URI' | 'NONE';
+  uriVersionPrefix?: string;
+  /** Version applied by Nest when a controller or handler has no @Version metadata. */
+  defaultVersion?: string;
+  routes: CreditCatalogRoute[];
 }
 
 export interface ReserveCreditInput {
@@ -131,6 +215,10 @@ export interface CreditReservation extends CreditSubject {
 }
 
 export interface CreditOptions {
+  /** Required, authoritative route and pricing catalog for this service. */
+  catalog?: CreditCatalog;
+  /** Optional durable BullMQ egress and trusted command ingress. */
+  bullMq?: CreditBullMqOptions;
   /** How long a request owns a reservation without renewal. Default: 60s. */
   leaseMs?: number;
   /** How long finalized audit records and request mappings remain. Default: 7d. */
@@ -152,15 +240,13 @@ export interface CreditOptions {
   redisHashTag?: string;
   /** Approximate maximum entries kept in the audit stream. Default: 100000. */
   eventStreamMaxLength?: number;
-  /** Maximum best-effort in-process handler events waiting to run. Default: 1000. */
-  eventHandlerQueueSize?: number;
-  eventHandler?: CreditModuleEventHandler;
-  earlyPolicies?: EarlyCreditPolicy[];
   /** Resolves a trusted, authenticated billing subject for every request. */
   requestContextResolver?: (request: unknown) => CreditRequestContext;
 }
 
 export interface ResolvedCreditOptions {
+  catalog: CreditCatalog;
+  bullMq?: ResolvedCreditBullMqOptions;
   leaseMs: number;
   retentionMs: number;
   recoveryBatchSize: number;
@@ -171,9 +257,6 @@ export interface ResolvedCreditOptions {
   redisHashTag: string;
   eventStreamKey: string;
   eventStreamMaxLength: number;
-  eventHandlerQueueSize: number;
-  eventHandler?: CreditModuleEventHandler;
-  earlyPolicies: EarlyCreditPolicy[];
   requestContextResolver: (request: unknown) => CreditRequestContext;
 }
 

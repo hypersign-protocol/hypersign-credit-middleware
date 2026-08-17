@@ -1,13 +1,4 @@
-import {
-  CreditBalanceProvider,
-  CreditCommittedEvent,
-  CreditExpiredEvent,
-  CreditGrantedEvent,
-  CreditModuleEventHandler,
-  CreditReservedEvent,
-  CreditRolledBackEvent,
-  CreditSubject,
-} from '../../../src';
+import { CreditBalanceProvider, CreditSubject } from '../../../src';
 
 export const MULTI_MODULE_SUBJECT: CreditSubject = {
   tenantId: 'tenant_1',
@@ -31,35 +22,6 @@ export class MultiBalanceProvider implements CreditBalanceProvider {
       source: 'multi-module-authoritative-store',
     };
   }
-
-  adjustBalance(subject: CreditSubject, delta: number): void {
-    const key = subjectKey(subject);
-    this.balances.set(key, (this.balances.get(key) ?? 0) + delta);
-  }
-
 }
 
 export const multiBalanceProvider = new MultiBalanceProvider();
-
-/** Demo mirror only. Production persistence consumes the durable Redis stream. */
-export class MultiCreditEventHandler implements CreditModuleEventHandler {
-  onReserved(_event: CreditReservedEvent): void {
-    // A reservation is a temporary Redis hold, not durable consumption.
-  }
-
-  onCommitted(event: CreditCommittedEvent): void {
-    multiBalanceProvider.adjustBalance(event.subject, -event.amount);
-  }
-
-  onRolledBack(_event: CreditRolledBackEvent): void {
-    // Nothing was durably consumed, so the ledger does not need a refund.
-  }
-
-  onExpired(_event: CreditExpiredEvent): void {
-    // Nothing was durably consumed, so the ledger does not need a refund.
-  }
-
-  onCreditGranted(event: CreditGrantedEvent): void {
-    multiBalanceProvider.adjustBalance(event.subject, event.amount);
-  }
-}

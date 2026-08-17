@@ -110,9 +110,31 @@ the same amount returns the existing result; a different amount is rejected.
 
 ### Event stream
 
-The stream contains `RESERVED`, `COMMITTED`, `ROLLED_BACK`, `EXPIRED`, and
-`CREDIT_GRANTED`. `MAXLEN ~` trimming is approximate. Balance initialization
-and critical-balance notifications are currently in-process events only.
+The stream contains `RESERVED`, `COMMITTED`, `ROLLED_BACK`, `EXPIRED`,
+`CREDIT_GRANTED`, `CRITICAL_BALANCE`, and `BALANCE_INITIALIZED`. Each balance or
+reservation state transition and its event are written by the same Lua script.
+`MAXLEN ~` trimming is approximate.
+
+When BullMQ transport is enabled the SDK creates a consumer group on this
+stream. Pending entries are reclaimed with `XAUTOCLAIM`; an entry is acknowledged
+only after every configured BullMQ lifecycle queue accepts its idempotent job.
+
+## BullMQ-managed keys
+
+BullMQ creates its own Redis keys, normally under `bull:<queue-name>:*`. These
+lists, hashes, sorted sets, streams, and marker keys are owned by BullMQ rather
+than `CreditKeyspace`. Their exact internal layout is a BullMQ implementation
+detail and must not be mutated by SDK Lua scripts or application code.
+
+Typical queue namespaces in the examples are:
+
+```text
+bull:credit.lifecycle:*
+bull:credit.commands.<serviceId>:*
+```
+
+Repeated `BZPOPMIN`, `EVALSHA`, and marker operations visible in `MONITOR` are
+normal blocking-worker activity, not an application `setInterval`.
 
 ## Inspection with redis-cli
 

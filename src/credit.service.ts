@@ -35,7 +35,6 @@ import {
   ReserveCreditResult,
   ResolvedCreditOptions,
 } from './credit.types';
-import { CreditEventDispatcher } from './events/credit.event-dispatcher';
 
 export class InsufficientCreditsException extends HttpException {
   constructor() { super('Insufficient credits', HttpStatus.PAYMENT_REQUIRED); }
@@ -63,7 +62,6 @@ export class CreditService {
   constructor(
     @Inject(CREDIT_REDIS_CLIENT) private readonly redis: CreditRedisClient,
     @Inject(CREDIT_OPTIONS) private readonly options: ResolvedCreditOptions,
-    private readonly dispatcher: CreditEventDispatcher,
   ) {
     this.keys = new CreditKeyspace(options);
   }
@@ -113,6 +111,7 @@ export class CreditService {
       settlementMode,
       operation,
       autoRecover ? '1' : '0',
+      threshold,
       this.options.eventStreamMaxLength,
     ) as Array<string | number>;
 
@@ -130,30 +129,6 @@ export class CreditService {
     const expiresAt = Number(result[2]);
     const existing = Number(result[3]) === 1;
     const storedAutoRecover = String(result[5]) !== '0';
-    if (!existing) {
-      this.dispatcher.dispatch({
-        ...this.eventBase(subject, scopeId, now),
-        type: 'RESERVED',
-        reservationId: String(result[0]),
-        requestId,
-        amount: input.amount,
-        balanceAfter: remainingBalance,
-        expiresAt,
-        settlementMode,
-        operation: input.operation,
-        autoRecover: storedAutoRecover,
-      });
-    }
-
-    if (!existing && remainingBalance <= threshold) {
-      this.dispatcher.dispatch({
-        ...this.eventBase(subject, scopeId, now),
-        type: 'CRITICAL_BALANCE',
-        balance: remainingBalance,
-        threshold,
-      });
-    }
-
     return {
       reservationId: String(result[0]),
       leaseToken: String(result[4]),
@@ -203,16 +178,6 @@ export class CreditService {
     if (Number(result[0]) === -2) throw new Error('Scoped balance disappeared during grant');
     const balance = Number(result[0]);
     const existing = Number(result[1]) === 1;
-    if (!existing) {
-      this.dispatcher.dispatch({
-        ...this.eventBase(subject, scopeId, now),
-        type: 'CREDIT_GRANTED',
-        referenceId,
-        amount: input.amount,
-        balanceAfter: balance,
-        reason: input.reason,
-      });
-    }
     return { balance, existing, subject };
   }
 
@@ -233,15 +198,7 @@ export class CreditService {
       this.options.eventStreamMaxLength,
     ) as Array<string | number>;
     if (Number(result[0]) !== 1) return false;
-    const parsed = this.parseFinalizationResult(result, true);
-    this.dispatcher.dispatch({
-      ...this.eventBase(parsed.subject, parsed.scopeId, now),
-      type: 'COMMITTED',
-      reservationId,
-      amount: parsed.amount,
-      balanceAfter: parsed.balanceAfter!,
-      operation: parsed.operation,
-    });
+    this.parseFinalizationResult(result, true);
     return true;
   }
 
@@ -391,16 +348,7 @@ export class CreditService {
       this.options.eventStreamMaxLength,
     ) as Array<string | number>;
     if (Number(result[0]) !== 1) return false;
-    const parsed = this.parseFinalizationResult(result, true);
-    this.dispatcher.dispatch({
-      ...this.eventBase(parsed.subject, parsed.scopeId, now),
-      type: 'ROLLED_BACK',
-      reservationId,
-      amount: parsed.amount,
-      reason,
-      operation: parsed.operation,
-      balanceAfter: parsed.balanceAfter!,
-    });
+    this.parseFinalizationResult(result, true);
     return true;
   }
 
@@ -426,21 +374,26 @@ export class CreditService {
       if (!Number.isSafeInteger(snapshot.balance) || snapshot.balance < 0) {
         throw new Error('Credit balance provider returned an invalid balance');
       }
+      const now = Date.now();
       const initialized = Number(await this.redis.eval(
         INITIALIZE_BALANCE_SCRIPT,
-        1,
+        2,
         this.keys.balance(subject),
+        this.keys.eventStream(),
         snapshot.balance,
-      )) === 1;
-      if (initialized) {
-        const now = Date.now();
-        this.dispatcher.dispatch({
-          ...this.eventBase(subject, this.keys.scopeId(subject), now),
-          type: 'BALANCE_INITIALIZED',
-          balance: snapshot.balance,
-          source: snapshot.source,
-          revision: snapshot.revision,
-        });
+        now,
+        this.keys.scopeId(subject),
+        subject.accountId,
+        subject.tenantId ?? '',
+        subject.accountType ?? '',
+        subject.serviceId ?? '',
+        subject.creditType ?? '',
+        snapshot.source ?? '',
+        snapshot.revision ?? '',
+        this.options.eventStreamMaxLength,
+      ));
+      if (initialized !== 0 && initialized !== 1) {
+        throw new Error(`Unexpected Redis balance initialization result: ${initialized}`);
       }
     } finally {
       await this.redis.eval(
@@ -459,19 +412,6 @@ export class CreditService {
       throw new TypeError('criticalBalance must resolve to a non-negative safe integer');
     }
     return threshold;
-  }
-
-  private eventBase(subject: CreditSubject, scopeId: string, timestamp: number) {
-    return {
-      timestamp,
-      subject,
-      scopeId,
-      accountId: subject.accountId,
-      tenantId: subject.tenantId,
-      accountType: subject.accountType,
-      serviceId: subject.serviceId,
-      creditType: subject.creditType,
-    };
   }
 
   private parseFinalizationResult(

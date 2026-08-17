@@ -1,44 +1,49 @@
 import { Global, Module } from '@nestjs/common';
+import Redis from 'ioredis';
 import { CreditModule } from '../../../src';
-import { RedisModule } from '../../redis.module';
-import { EARLY_CREDIT_POLICIES } from './credit-policies';
 import {
-  MultiCreditEventHandler,
-  multiBalanceProvider,
-} from './multi-balance.provider';
+  CREDIT_BULLMQ_PROVIDER,
+  ExampleBullMqModule,
+  ExampleBullMqProvider,
+} from '../../bullmq.module';
+import { CREDIT_EVENT_STREAM_REDIS, RedisModule } from '../../redis.module';
+import { KYC_CREDIT_CATALOG } from './credit-catalog';
+import { multiBalanceProvider } from './multi-balance.provider';
 
 interface ServiceRequest {
   service?: { businessId?: string; tenantId?: string };
   requestId?: string;
 }
 
-/**
- * Infrastructure module imported exactly once by the root application module.
- * Feature modules do not call CreditModule.forRoot() again.
- */
 @Global()
 @Module({
   imports: [
     RedisModule,
-    CreditModule.forRoot({
-      leaseMs: 30_000,
-      criticalBalance: 20,
-      balanceProvider: multiBalanceProvider,
-      eventHandler: new MultiCreditEventHandler(),
-      earlyPolicies: EARLY_CREDIT_POLICIES,
-      requestContextResolver: (unknownRequest: unknown) => {
-        const request = unknownRequest as ServiceRequest;
-        return {
-          subject: {
-            tenantId: request.service?.tenantId,
-            accountType: 'BUSINESS',
-            accountId: request.service?.businessId ?? '',
-            serviceId: 'kyc',
-            creditType: 'API_CREDIT',
-          },
-          requestId: request.requestId,
-        };
-      },
+    ExampleBullMqModule,
+    CreditModule.forRootAsync({
+      imports: [RedisModule, ExampleBullMqModule],
+      inject: [CREDIT_BULLMQ_PROVIDER, CREDIT_EVENT_STREAM_REDIS],
+      useFactory: (bullMq: ExampleBullMqProvider, streamClient: Redis) => ({
+        catalog: KYC_CREDIT_CATALOG,
+        keyPrefix: 'credit-multi',
+        redisHashTag: 'credit-multi',
+        leaseMs: 30_000,
+        criticalBalance: 20,
+        balanceProvider: multiBalanceProvider,
+        bullMq: { provider: bullMq, streamClient },
+        requestContextResolver: (unknownRequest: unknown) => {
+          const request = unknownRequest as ServiceRequest;
+          return {
+            subject: {
+              tenantId: request.service?.tenantId,
+              accountType: 'BUSINESS',
+              accountId: request.service?.businessId ?? '',
+              serviceId: 'kyc',
+            },
+            requestId: request.requestId,
+          };
+        },
+      }),
     }),
   ],
   exports: [CreditModule],

@@ -40,7 +40,7 @@ redis.call('HSET', KEYS[3], 'reservationId', ARGV[2],
   'remainingBalance', remaining, 'expiresAt', expiresAt,
   'amount', ARGV[1], 'settlementMode', ARGV[14], 'operation', ARGV[15],
   'leaseToken', ARGV[12], 'autoRecover', ARGV[16])
-redis.call('XADD', KEYS[5], 'MAXLEN', '~', ARGV[17], '*',
+redis.call('XADD', KEYS[5], 'MAXLEN', '~', ARGV[18], '*',
   'event', 'RESERVED', 'timestamp', ARGV[10], 'scopeId', ARGV[3],
   'accountId', ARGV[4], 'tenantId', ARGV[5], 'accountType', ARGV[6],
   'serviceId', ARGV[7], 'creditType', ARGV[8], 'requestId', ARGV[9],
@@ -48,6 +48,13 @@ redis.call('XADD', KEYS[5], 'MAXLEN', '~', ARGV[17], '*',
   'settlementMode', ARGV[14], 'autoRecover', ARGV[16],
   'expiresAt', expiresAt,
   'balanceAfter', remaining)
+if remaining <= tonumber(ARGV[17]) then
+  redis.call('XADD', KEYS[5], 'MAXLEN', '~', ARGV[18], '*',
+    'event', 'CRITICAL_BALANCE', 'timestamp', ARGV[10], 'scopeId', ARGV[3],
+    'accountId', ARGV[4], 'tenantId', ARGV[5], 'accountType', ARGV[6],
+    'serviceId', ARGV[7], 'creditType', ARGV[8],
+    'balance', remaining, 'threshold', ARGV[17])
+end
 return {ARGV[2], remaining, expiresAt, 0, ARGV[12], ARGV[16]}
 `;
 
@@ -154,6 +161,11 @@ then return 1 else return 0 end
 export const INITIALIZE_BALANCE_SCRIPT = `
 if redis.call('GET', KEYS[1]) then return 0 end
 redis.call('SET', KEYS[1], ARGV[1])
+redis.call('XADD', KEYS[2], 'MAXLEN', '~', ARGV[11], '*',
+  'event', 'BALANCE_INITIALIZED', 'timestamp', ARGV[2], 'scopeId', ARGV[3],
+  'accountId', ARGV[4], 'tenantId', ARGV[5], 'accountType', ARGV[6],
+  'serviceId', ARGV[7], 'creditType', ARGV[8], 'balance', ARGV[1],
+  'source', ARGV[9], 'revision', ARGV[10])
 return 1
 `;
 

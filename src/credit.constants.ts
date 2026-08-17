@@ -8,6 +8,11 @@ export const DEFAULT_KEY_PREFIX = 'credit';
 export const DEFAULT_REDIS_HASH_TAG = 'credit';
 
 export const DEFAULT_CREDIT_OPTIONS: ResolvedCreditOptions = {
+  catalog: {
+    serviceId: 'unconfigured',
+    version: '0',
+    routes: [],
+  },
   leaseMs: 60_000,
   retentionMs: 7 * 24 * 60 * 60 * 1_000,
   recoveryBatchSize: 100,
@@ -17,8 +22,6 @@ export const DEFAULT_CREDIT_OPTIONS: ResolvedCreditOptions = {
   redisHashTag: DEFAULT_REDIS_HASH_TAG,
   eventStreamKey: `${DEFAULT_KEY_PREFIX}:{${DEFAULT_REDIS_HASH_TAG}}:events`,
   eventStreamMaxLength: 100_000,
-  eventHandlerQueueSize: 1_000,
-  earlyPolicies: [],
   requestContextResolver: (request: unknown) => {
     const req = request as {
       user?: { id?: string };

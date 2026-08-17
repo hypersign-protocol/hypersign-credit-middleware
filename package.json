@@ -1,7 +1,7 @@
 {
   "name": "@hypersign-protocol/credit-middleware",
-  "version": "2.0.0",
-  "description": "NestJS Redis-backed credit reservation SDK for metered API services",
+  "version": "3.0.0",
+  "description": "Catalog-driven NestJS credit lifecycle SDK with Redis and BullMQ",
   "license": "ISC",
   "author": "",
   "repository": {
@@ -16,7 +16,9 @@
     "redis",
     "reservation",
     "interceptor",
-    "billing"
+    "billing",
+    "bullmq",
+    "catalog"
   ],
   "engines": {
     "node": ">=18"
@@ -33,6 +35,7 @@
     "build:example": "tsc -p example/tsconfig.json",
     "start:example": "npm run build:example && node dist-example/example/main.js",
     "start:example:multi": "npm run build:example && node dist-example/example/multi-module/main.js",
+    "start:example:events": "npm run build:example && node dist-example/example/event-server/main.js",
     "test": "jest --runInBand",
     "lint": "tsc --noEmit -p tsconfig.json"
   },
@@ -47,6 +50,8 @@
     "@nestjs/platform-express": "^11.1.6",
     "@nestjs/schedule": "6.1.3",
     "@types/jest": "^30.0.0",
+    "@types/node": "26.2.0",
+    "bullmq": "5.81.3",
     "ioredis": "^5.7.0",
     "jest": "^30.0.5",
     "reflect-metadata": "^0.2.2",

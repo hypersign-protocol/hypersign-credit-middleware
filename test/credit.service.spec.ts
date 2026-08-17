@@ -16,7 +16,6 @@ import {
   ROLLBACK_SCRIPT,
 } from '../src/credit.service';
 import { CreditRedisClient, CreditSubject } from '../src/credit.types';
-import { CreditEventDispatcher } from '../src/events/credit.event-dispatcher';
 
 class InMemoryRedis implements CreditRedisClient {
   readonly strings = new Map<string, string>();
@@ -167,7 +166,6 @@ class InMemoryRedis implements CreditRedisClient {
   }
 }
 
-const noopDispatcher = { dispatch: () => undefined } as unknown as CreditEventDispatcher;
 const userA: CreditSubject = {
   tenantId: 'tenant_1', accountType: 'USER', accountId: 'user_a',
   serviceId: 'kyc', creditType: 'API_CREDIT',
@@ -183,17 +181,14 @@ describe('CreditService production invariants', () => {
     redis = new InMemoryRedis();
     const options = { ...DEFAULT_CREDIT_OPTIONS, leaseMs: 1_000 };
     keys = new CreditKeyspace(options);
-    service = new CreditService(redis, options, noopDispatcher);
+    service = new CreditService(redis, options);
   });
 
   const seed = (subject: CreditSubject, amount: number) =>
     redis.strings.set(keys.balance(subject), String(amount));
 
   it('deducts and commits only the selected account wallet', async () => {
-    const dispatch = jest.fn();
-    service = new CreditService(redis, { ...DEFAULT_CREDIT_OPTIONS, leaseMs: 1_000 }, {
-      dispatch,
-    } as any);
+    service = new CreditService(redis, { ...DEFAULT_CREDIT_OPTIONS, leaseMs: 1_000 });
     seed(userA, 100);
     seed(userB, 55);
     const reservation = await service.reserve({
@@ -203,12 +198,6 @@ describe('CreditService production invariants', () => {
     expect(await service.commit(reservation.reservationId)).toBe(true);
     expect(await service.getBalance(userA)).toBe(80);
     expect(await service.getBalance(userB)).toBe(55);
-    expect(dispatch).toHaveBeenCalledWith(expect.objectContaining({
-      type: 'COMMITTED',
-      reservationId: reservation.reservationId,
-      amount: 20,
-      balanceAfter: 80,
-    }));
   });
 
   it('isolates the same account across tenant, service, and credit type', async () => {
@@ -245,37 +234,17 @@ describe('CreditService production invariants', () => {
     expect((await service.getReservation(reservationId))?.status).toBe('ROLLED_BACK');
   });
 
-  it('dispatches exact rollback fields without positional corruption', async () => {
-    const dispatch = jest.fn();
-    service = new CreditService(
-      redis,
-      { ...DEFAULT_CREDIT_OPTIONS, leaseMs: 1_000 },
-      { dispatch } as unknown as CreditEventDispatcher,
-    );
+  it('records exact rollback fields without positional corruption', async () => {
     seed(userA, 100);
     const { reservationId } = await service.reserve({
       subject: userA, amount: 20, operation: 'VERIFY_KYC',
     });
-    dispatch.mockClear();
-
     await service.rollback(reservationId, 'verification_failed');
-
-    expect(dispatch).toHaveBeenCalledWith({
-      type: 'ROLLED_BACK',
-      timestamp: expect.any(Number),
+    expect(await service.getReservation(reservationId)).toEqual(expect.objectContaining({
+      status: 'ROLLED_BACK', amount: 20, operation: 'VERIFY_KYC',
+      finalizationReason: 'verification_failed', remainingBalance: 100,
       subject: userA,
-      scopeId: keys.scopeId(userA),
-      accountId: 'user_a',
-      tenantId: 'tenant_1',
-      accountType: 'USER',
-      serviceId: 'kyc',
-      creditType: 'API_CREDIT',
-      reservationId,
-      amount: 20,
-      operation: 'VERIFY_KYC',
-      reason: 'verification_failed',
-      balanceAfter: 100,
-    });
+    }));
   });
 
   it('never calls the provider to replenish an existing insufficient balance', async () => {
@@ -283,7 +252,6 @@ describe('CreditService production invariants', () => {
     const provider = { getBalance: jest.fn().mockResolvedValue({ balance: 100 }) };
     service = new CreditService(
       redis, { ...DEFAULT_CREDIT_OPTIONS, criticalBalance: 20, balanceProvider: provider },
-      noopDispatcher,
     );
     await expect(service.reserve({ subject: userA, amount: 10 }))
       .rejects.toBeInstanceOf(InsufficientCreditsException);
@@ -296,7 +264,6 @@ describe('CreditService production invariants', () => {
     service = new CreditService(
       redis,
       { ...DEFAULT_CREDIT_OPTIONS, criticalBalance: () => -1 },
-      noopDispatcher,
     );
 
     await expect(service.reserve({ subject: userA, amount: 20 }))
@@ -308,7 +275,7 @@ describe('CreditService production invariants', () => {
   it('initializes a missing wallet from the exact subject once', async () => {
     const provider = { getBalance: jest.fn().mockResolvedValue({ balance: 40, source: 'ledger' }) };
     service = new CreditService(
-      redis, { ...DEFAULT_CREDIT_OPTIONS, balanceProvider: provider }, noopDispatcher,
+      redis, { ...DEFAULT_CREDIT_OPTIONS, balanceProvider: provider },
     );
     await service.reserve({ subject: userA, requestId: 'first', amount: 10 });
     await service.reserve({ subject: userA, requestId: 'second', amount: 10 });
@@ -327,27 +294,25 @@ describe('CreditService production invariants', () => {
     expect(await service.getBalance(userA)).toBe(80);
   });
 
-  it('does not dispatch duplicate callbacks for idempotent retries', async () => {
-    const dispatch = jest.fn();
-    service = new CreditService(
-      redis,
-      { ...DEFAULT_CREDIT_OPTIONS, leaseMs: 1_000 },
-      { dispatch } as unknown as CreditEventDispatcher,
-    );
+  it('does not apply duplicate mutations for idempotent retries', async () => {
     seed(userA, 100);
     const reservationInput = {
       subject: userA, requestId: 'retry-request', amount: 20,
     };
-    await service.reserve(reservationInput);
-    await service.reserve(reservationInput);
+    const firstReservation = await service.reserve(reservationInput);
+    const retryReservation = await service.reserve(reservationInput);
     const grantInput = {
       subject: userA, amount: 10, referenceId: 'retry-payment',
     };
-    await service.grant(grantInput);
-    await service.grant(grantInput);
+    const firstGrant = await service.grant(grantInput);
+    const retryGrant = await service.grant(grantInput);
 
-    expect(dispatch.mock.calls.map(([event]) => event.type))
-      .toEqual(['RESERVED', 'CREDIT_GRANTED']);
+    expect(retryReservation).toMatchObject({
+      reservationId: firstReservation.reservationId, existing: true,
+    });
+    expect(firstGrant.existing).toBe(false);
+    expect(retryGrant.existing).toBe(true);
+    expect(await service.getBalance(userA)).toBe(90);
   });
 
   it('grants credits once for an idempotent business reference', async () => {

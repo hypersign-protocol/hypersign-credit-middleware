@@ -18,7 +18,9 @@ JavaScript is emitted as `dist/credit.scripts.js`.
 ## RESERVE_SCRIPT
 
 Validates request idempotency, checks balance, deducts credit, creates the
-reservation/request hashes, optionally indexes expiry, and appends `RESERVED`.
+reservation/request hashes, optionally indexes expiry, appends `RESERVED`, and
+also appends `CRITICAL_BALANCE` when the resulting balance reaches the configured
+threshold.
 
 Keys:
 
@@ -42,7 +44,8 @@ Arguments:
 14. settlement mode
 15. operation
 16. `1`/`0` auto-recovery
-17. stream maximum length
+17. critical-balance threshold
+18. stream maximum length
 
 Success returns:
 
@@ -129,7 +132,12 @@ acquired, otherwise `0`.
 ## INITIALIZE_BALANCE_SCRIPT
 
 Sets a provider balance only if the wallet is still absent after lock
-acquisition. Key: balance. Argument: initial balance. Returns `1` when written,
+acquisition and appends `BALANCE_INITIALIZED` in the same atomic operation.
+
+Keys: balance and event stream.
+
+Arguments: initial balance, time, scope ID, five subject dimensions, provider
+source, provider revision, and stream maximum length. Returns `1` when written,
 otherwise `0`.
 
 ## RELEASE_LOCK_SCRIPT
