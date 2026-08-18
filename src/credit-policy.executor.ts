@@ -104,13 +104,7 @@ export class CreditPolicyExecutor {
   }
 
   private subject(base: CreditSubject, creditType: string): CreditSubject {
-    if (base.serviceId && base.serviceId !== this.catalog.serviceId) {
-      throw new BadRequestException(
-        `Billing subject serviceId ${base.serviceId} does not match catalog ` +
-        this.catalog.serviceId,
-      );
-    }
-    return { ...base, serviceId: this.catalog.serviceId, creditType };
+    return { ...base, creditType };
   }
 }
 
@@ -119,6 +113,5 @@ function sameSubject(left: CreditSubject, right: CreditSubject): boolean {
   return value(left.appId) === value(right.appId) &&
     value(left.tenantId) === value(right.tenantId) &&
     value(left.appType) === value(right.appType) &&
-    value(left.serviceId) === value(right.serviceId) &&
     value(left.creditType) === value(right.creditType);
 }

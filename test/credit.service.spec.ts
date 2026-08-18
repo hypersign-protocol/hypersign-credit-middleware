@@ -1,445 +1,444 @@
-import { DEFAULT_CREDIT_OPTIONS, GET_BALANCE_SCRIPT, GET_RESERVATION_SCRIPT } from '../src/credit.constants';
-import { CreditKeyspace } from '../src/credit-keyspace';
+import { BadRequestException } from '@nestjs/common';
+import { DEFAULT_CREDIT_OPTIONS } from '../src/credit.constants';
 import {
-  ACQUIRE_LOCK_SCRIPT,
-  COMMIT_SCRIPT,
   CreditService,
-  FIND_EXPIRED_SCRIPT,
-  GRANT_SCRIPT,
-  INITIALIZE_BALANCE_SCRIPT,
   InsufficientCreditsException,
+} from '../src/credit.service';
+import {
+  COMMIT_SCRIPT,
+  EXPIRE_PLAN_SCRIPT,
+  FIND_EXPIRED_PLANS_SCRIPT,
+  FIND_EXPIRED_SCRIPT,
+  GET_BALANCE_SCRIPT,
+  GET_PLANS_SCRIPT,
+  GET_RESERVATION_SCRIPT,
+  GRANT_SCRIPT,
   RECOVER_SCRIPT,
   REMOVE_EXPIRATION_SCRIPT,
-  RELEASE_LOCK_SCRIPT,
   RENEW_SCRIPT,
   RESERVE_SCRIPT,
   ROLLBACK_SCRIPT,
-} from '../src/credit.service';
-import { CreditRedisClient, CreditSubject } from '../src/credit.types';
+} from '../src/credit.scripts';
+import { CreditSubject } from '../src/credit.types';
 
-class InMemoryRedis implements CreditRedisClient {
-  readonly strings = new Map<string, string>();
-  readonly reservations = new Map<string, Record<string, string>>();
-  readonly requests = new Map<string, Record<string, string>>();
-  readonly expirations = new Map<string, number>();
+type Hash = Map<string, string>;
 
-  async eval(script: string, keyCount: number, ...args: Array<string | number>) {
-    const keys = args.slice(0, keyCount).map(String);
-    const argv = args.slice(keyCount).map(String);
-    if (script === GET_BALANCE_SCRIPT) return this.strings.get(keys[0]) ?? null;
-    if (script === GET_RESERVATION_SCRIPT) {
-      const value = this.reservations.get(keys[0]);
-      return value ? Object.entries(value).flat() : [];
-    }
-    if (script === ACQUIRE_LOCK_SCRIPT) {
-      if (this.strings.has(keys[0])) return 0;
-      this.strings.set(keys[0], argv[0]);
-      return 1;
-    }
-    if (script === RELEASE_LOCK_SCRIPT) {
-      if (this.strings.get(keys[0]) !== argv[0]) return 0;
-      this.strings.delete(keys[0]);
-      return 1;
-    }
-    if (script === INITIALIZE_BALANCE_SCRIPT) {
-      if (this.strings.has(keys[0])) return 0;
-      this.strings.set(keys[0], argv[0]);
-      return 1;
-    }
-    if (script === GRANT_SCRIPT) {
-      const existing = this.requests.get(keys[1]);
-      if (existing) {
-        if (existing.amount !== argv[0]) return [-1];
-        if (!this.strings.has(keys[0])) return [-2];
-        return [this.strings.get(keys[0])!, 1];
-      }
-      if (!this.strings.has(keys[0])) return [-2];
-      const balance = Number(this.strings.get(keys[0])) + Number(argv[0]);
-      this.strings.set(keys[0], String(balance));
-      this.requests.set(keys[1], { amount: argv[0], balance: String(balance) });
-      return [balance, 0];
-    }
-    if (script === RESERVE_SCRIPT) {
-      const existing = this.requests.get(keys[2]);
-      if (existing) {
-        if (existing.amount !== argv[0] || existing.settlementMode !== argv[13] ||
-            existing.operation !== argv[14] || existing.autoRecover !== argv[15]) return [-2];
-        return [existing.reservationId, existing.remainingBalance, existing.expiresAt, 1,
-          existing.leaseToken, existing.autoRecover];
-      }
-      if (!this.strings.has(keys[0])) return [-3];
-      const balance = Number(this.strings.get(keys[0]));
-      const amount = Number(argv[0]);
-      if (balance < amount) return [-1];
-      const remaining = balance - amount;
-      const expiresAt = Number(argv[9]) + Number(argv[10]);
-      this.strings.set(keys[0], String(remaining));
-      this.reservations.set(keys[1], {
-        reservationId: argv[1], scopeId: argv[2], appId: argv[3],
-        tenantId: argv[4], appType: argv[5], serviceId: argv[6],
-        creditType: argv[7], requestId: argv[8], amount: argv[0],
-        remainingBalance: String(remaining), status: 'RESERVED', leaseToken: argv[11],
-        createdAt: argv[9], expiresAt: String(expiresAt), version: '1',
-        settlementMode: argv[13], operation: argv[14], autoRecover: argv[15],
-        balanceKey: keys[0],
-      });
-      this.requests.set(keys[2], {
-        reservationId: argv[1], remainingBalance: String(remaining),
-        expiresAt: String(expiresAt), amount: argv[0],
-        settlementMode: argv[13], operation: argv[14], leaseToken: argv[11],
-        autoRecover: argv[15],
-      });
-      if (argv[15] === '1') this.expirations.set(argv[1], expiresAt);
-      return [argv[1], remaining, expiresAt, 0, argv[11], argv[15]];
-    }
-    if (script === COMMIT_SCRIPT) {
-      const reservation = this.reservations.get(keys[0]);
-      if (!reservation) return [-2];
-      if (reservation.status === 'COMMITTED') return [0];
-      if (reservation.status !== 'RESERVED') return [-1];
-      reservation.status = 'COMMITTED';
-      reservation.finalizedAt = argv[0];
-      reservation.finalizationReason = 'controller_succeeded';
-      this.expirations.delete(argv[1]);
-      return [1, ...this.fields(reservation), reservation.remainingBalance];
-    }
-    if (script === ROLLBACK_SCRIPT) {
-      const reservation = this.reservations.get(keys[0]);
-      if (!reservation || reservation.status !== 'RESERVED') return [0];
-      if (reservation.balanceKey !== keys[3]) return [-2];
-      const remaining = Number(this.strings.get(keys[3])) + Number(reservation.amount);
-      this.strings.set(keys[3], String(remaining));
-      reservation.status = argv[0];
-      reservation.finalizedAt = argv[1];
-      reservation.finalizationReason = argv[2];
-      reservation.remainingBalance = String(remaining);
-      this.expirations.delete(argv[3]);
-      return [1, ...this.fields(reservation), remaining];
-    }
-    if (script === RENEW_SCRIPT) {
-      const reservation = this.reservations.get(keys[0]);
-      if (!reservation || reservation.status !== 'RESERVED') return -1;
-      if (reservation.leaseToken !== argv[0]) return -2;
-      const expiresAt = Number(argv[1]) + Number(argv[2]);
-      reservation.expiresAt = String(expiresAt);
-      reservation.version = String(Number(reservation.version) + 1);
-      if (reservation.autoRecover !== '0') {
-        this.expirations.set(argv[3], expiresAt);
-      }
-      return expiresAt;
-    }
-    if (script === FIND_EXPIRED_SCRIPT) {
-      return [...this.expirations.entries()]
-        .filter(([, expiresAt]) => expiresAt <= Number(argv[0]))
-        .slice(0, Number(argv[1])).map(([id]) => id);
-    }
-    if (script === REMOVE_EXPIRATION_SCRIPT) {
-      return this.expirations.delete(argv[0]) ? 1 : 0;
-    }
-    if (script === RECOVER_SCRIPT) {
-      const reservation = this.reservations.get(keys[0]);
-      if (!reservation || reservation.status !== 'RESERVED') {
-        this.expirations.delete(argv[1]);
-        return [0];
-      }
-      if (Number(reservation.expiresAt) > Number(argv[0])) return [0];
-      if (reservation.autoRecover === '0') {
-        this.expirations.delete(argv[1]);
-        return [0];
-      }
-      if (reservation.balanceKey !== keys[3]) return [-2];
-      const remaining = Number(this.strings.get(keys[3])) + Number(reservation.amount);
-      this.strings.set(keys[3], String(remaining));
-      reservation.status = 'EXPIRED';
-      reservation.finalizedAt = argv[0];
-      reservation.finalizationReason = 'lease_expired';
-      reservation.remainingBalance = String(remaining);
-      this.expirations.delete(argv[1]);
-      return [1, ...this.fields(reservation), remaining];
-    }
-    throw new Error('Unsupported script in test Redis');
+class PlanRedis {
+  strings = new Map<string, number>();
+  hashes = new Map<string, Hash>();
+  zsets = new Map<string, Map<string, number>>();
+  events: Array<Record<string, unknown>> = [];
+
+  private hash(key: string): Hash {
+    let value = this.hashes.get(key);
+    if (!value) { value = new Map(); this.hashes.set(key, value); }
+    return value;
   }
 
-  private fields(value: Record<string, string>) {
-    return [value.scopeId, value.appId, value.tenantId, value.appType,
-      value.serviceId, value.creditType, value.amount, value.operation];
+  private zset(key: string): Map<string, number> {
+    let value = this.zsets.get(key);
+    if (!value) { value = new Map(); this.zsets.set(key, value); }
+    return value;
+  }
+
+  private ordered(key: string): string[] {
+    return [...this.zset(key)].sort((a, b) => a[1] - b[1] || a[0].localeCompare(b[0]))
+      .map(([member]) => member);
+  }
+
+  async eval(script: string, numberOfKeys: number, ...args: Array<string | number>) {
+    const keys = args.slice(0, numberOfKeys).map(String);
+    const argv = args.slice(numberOfKeys).map(String);
+
+    if (script === GRANT_SCRIPT) return this.grant(keys, argv);
+    if (script === RESERVE_SCRIPT) return this.reserve(keys, argv);
+    if (script === COMMIT_SCRIPT) return this.commit(keys, argv);
+    if (script === ROLLBACK_SCRIPT) return this.refund(keys, argv, false);
+    if (script === RECOVER_SCRIPT) return this.refund(keys, argv, true);
+    if (script === RENEW_SCRIPT) return this.renew(keys, argv);
+    if (script === FIND_EXPIRED_SCRIPT || script === FIND_EXPIRED_PLANS_SCRIPT) {
+      return this.ordered(keys[0]).filter((member) =>
+        this.zset(keys[0]).get(member)! <= Number(argv[0])).slice(0, Number(argv[1]));
+    }
+    if (script === REMOVE_EXPIRATION_SCRIPT) return this.zset(keys[0]).delete(argv[0]) ? 1 : 0;
+    if (script === EXPIRE_PLAN_SCRIPT) return this.expirePlan(keys, argv);
+    if (script === GET_RESERVATION_SCRIPT) {
+      return [...(this.hashes.get(keys[0]) ?? new Map())].flat();
+    }
+    if (script === GET_BALANCE_SCRIPT) {
+      if ((this.hashes.get(keys[0])?.size ?? 0) === 0) return null;
+      return this.ordered(keys[1]).reduce((sum, planId) =>
+        Number(this.hash(keys[3]).get(planId)) > Number(argv[0])
+          ? sum + Number(this.hash(keys[2]).get(planId) ?? 0)
+          : sum, 0);
+    }
+    if (script === GET_PLANS_SCRIPT) {
+      return JSON.stringify([...this.hash(keys[0]).keys()].map((planId) => ({
+        planId,
+        grantedAmount: Number(this.hash(keys[0]).get(planId)),
+        availableAmount: Number(this.hash(keys[1]).get(planId) ?? 0),
+        expiresAt: Number(this.hash(keys[2]).get(planId)),
+        grantedAt: Number(this.hash(keys[3]).get(planId)),
+        referenceId: this.hash(keys[4]).get(planId),
+        status: this.hash(keys[5]).get(planId),
+      })));
+    }
+    throw new Error('Unexpected script');
+  }
+
+  private grant(keys: string[], argv: string[]) {
+    const [planId, amount, grantedAt, expiresAt] = argv;
+    let wallet = this.strings.get(keys[0]) ?? 0;
+    for (const activePlanId of this.ordered(keys[1])) {
+      if (Number(this.hash(keys[4]).get(activePlanId)) <= Number(argv[4])) {
+        const unused = Number(this.hash(keys[3]).get(activePlanId) ?? 0);
+        wallet -= unused;
+        this.hash(keys[3]).set(activePlanId, '0');
+        this.hash(keys[7]).set(activePlanId, 'EXPIRED');
+        this.zset(keys[1]).delete(activePlanId);
+        const member = this.hash(keys[8]).get(activePlanId);
+        if (member) this.zset(keys[11]).delete(member);
+        this.events.push({ type: 'PLAN_EXPIRED', planId: activePlanId, expiredAmount: unused });
+      }
+    }
+    this.strings.set(keys[0], wallet);
+    const existing = this.hash(keys[2]).get(planId);
+    if (existing) {
+      if (existing !== amount || this.hash(keys[4]).get(planId) !== expiresAt ||
+          this.hash(keys[5]).get(planId) !== grantedAt ||
+          this.hash(keys[6]).get(planId) !== argv[10]) return [-1];
+      return [this.strings.get(keys[0]) ?? 0,
+        Number(this.hash(keys[3]).get(planId) ?? 0), 1];
+    }
+    const ownerScope = this.hash(keys[9]).get('scopeId');
+    if (ownerScope && ownerScope !== argv[5]) return [-6];
+    const referencePlan = this.hash(keys[10]).get('planId');
+    const referenceScope = this.hash(keys[10]).get('scopeId');
+    if (referencePlan && (referencePlan !== planId || referenceScope !== argv[5])) return [-2];
+    if (referencePlan) return [-7];
+    if (Number(expiresAt) <= Number(argv[4])) return [-5];
+    if (this.zset(keys[1]).size >= Number(argv[14])) return [-3];
+    const balance = (this.strings.get(keys[0]) ?? 0) + Number(amount);
+    if (!Number.isSafeInteger(balance)) return [-4];
+    this.strings.set(keys[0], balance);
+    this.zset(keys[1]).set(planId, Number(grantedAt));
+    this.hash(keys[2]).set(planId, amount);
+    this.hash(keys[3]).set(planId, amount);
+    this.hash(keys[4]).set(planId, expiresAt);
+    this.hash(keys[5]).set(planId, grantedAt);
+    this.hash(keys[6]).set(planId, argv[10]);
+    this.hash(keys[7]).set(planId, 'ACTIVE');
+    this.hash(keys[8]).set(planId, argv[16]);
+    this.hash(keys[9]).set('scopeId', argv[5]);
+    this.hash(keys[10]).set('planId', planId);
+    this.hash(keys[10]).set('scopeId', argv[5]);
+    this.zset(keys[11]).set(argv[16], Number(expiresAt));
+    this.events.push({ type: 'CREDIT_GRANTED', planId, amount: Number(amount), balanceAfter: balance });
+    return [balance, Number(amount), 0];
+  }
+
+  private reserve(keys: string[], argv: string[]) {
+    const request = this.hashes.get(keys[8]);
+    if (request?.has('reservationId')) {
+      if (request.get('amount') !== argv[0] || request.get('settlementMode') !== argv[12] ||
+          request.get('operation') !== argv[13] || request.get('autoRecover') !== argv[14]) return [-2];
+      return [request.get('reservationId')!, request.get('remainingBalance')!,
+        request.get('expiresAt')!, 1, request.get('leaseToken')!,
+        request.get('autoRecover')!, request.get('allocations')!];
+    }
+    let wallet = this.strings.get(keys[0]) ?? 0;
+    for (const planId of this.ordered(keys[1])) {
+      if (Number(this.hash(keys[3]).get(planId)) <= Number(argv[8])) {
+        const unused = Number(this.hash(keys[2]).get(planId) ?? 0);
+        wallet -= unused;
+        this.hash(keys[2]).set(planId, '0');
+        this.hash(keys[4]).set(planId, 'EXPIRED');
+        this.zset(keys[1]).delete(planId);
+        const member = this.hash(keys[6]).get(planId);
+        if (member) this.zset(keys[10]).delete(member);
+        this.events.push({ type: 'PLAN_EXPIRED', planId, expiredAmount: unused });
+      }
+    }
+    this.strings.set(keys[0], wallet);
+    let needed = Number(argv[0]);
+    const allocations: Array<{ planId: string; amount: number; planBalanceAfter?: number }> = [];
+    for (const planId of this.ordered(keys[1])) {
+      if (needed <= 0) break;
+      const available = Number(this.hash(keys[2]).get(planId) ?? 0);
+      if (available <= 0) continue;
+      if (allocations.length >= Number(argv[17])) return [-4];
+      const amount = Math.min(available, needed);
+      allocations.push({ planId, amount });
+      needed -= amount;
+    }
+    if (needed > 0) return [-1];
+    wallet -= Number(argv[0]);
+    this.strings.set(keys[0], wallet);
+    for (const allocation of allocations) {
+      const after = Number(this.hash(keys[2]).get(allocation.planId)) - allocation.amount;
+      allocation.planBalanceAfter = after;
+      this.hash(keys[2]).set(allocation.planId, String(after));
+      if (after === 0) {
+        this.hash(keys[4]).set(allocation.planId, 'DEPLETED');
+        this.zset(keys[1]).delete(allocation.planId);
+        const member = this.hash(keys[6]).get(allocation.planId);
+        if (member) this.zset(keys[10]).delete(member);
+      }
+    }
+    const expiresAt = Number(argv[8]) + Number(argv[9]);
+    const json = JSON.stringify(allocations);
+    const values: Record<string, string> = {
+      reservationId: argv[1], scopeId: argv[2], appId: argv[3], tenantId: argv[4],
+      appType: argv[5], creditType: argv[6], requestId: argv[7], amount: argv[0],
+      remainingBalance: String(wallet), status: 'RESERVED', leaseToken: argv[10],
+      createdAt: argv[8], expiresAt: String(expiresAt), version: '1',
+      settlementMode: argv[12], operation: argv[13], autoRecover: argv[14], allocations: json,
+    };
+    this.hashes.set(keys[7], new Map(Object.entries(values)));
+    this.hashes.set(keys[8], new Map(Object.entries(values)));
+    if (argv[14] === '1') this.zset(keys[9]).set(argv[1], expiresAt);
+    allocations.forEach((allocation, index) => this.events.push({
+      type: 'RESERVED', reservationId: argv[1], planId: allocation.planId,
+      amount: allocation.amount, allocationIndex: index, allocationCount: allocations.length,
+    }));
+    return [argv[1], wallet, expiresAt, 0, argv[10], argv[14], json];
+  }
+
+  private commit(keys: string[], argv: string[]) {
+    const reservation = this.hashes.get(keys[0]);
+    if (!reservation) return [-2];
+    if (reservation.get('status') === 'COMMITTED') return [0];
+    if (reservation.get('status') !== 'RESERVED') return [-1];
+    reservation.set('status', 'COMMITTED');
+    reservation.set('finalizedAt', argv[0]);
+    this.zset(keys[1]).delete(argv[1]);
+    const allocations = JSON.parse(reservation.get('allocations')!);
+    allocations.forEach((allocation: any, index: number) => this.events.push({
+      type: 'COMMITTED', reservationId: argv[1], planId: allocation.planId,
+      amount: allocation.amount, allocationIndex: index, allocationCount: allocations.length,
+    }));
+    return [1];
+  }
+
+  private refund(keys: string[], argv: string[], recovering: boolean) {
+    const reservation = this.hashes.get(keys[0]);
+    if (!reservation || reservation.get('status') !== 'RESERVED') {
+      if (recovering) this.zset(keys[1]).delete(argv[3]);
+      return [0];
+    }
+    if (recovering && (reservation.get('autoRecover') === '0' ||
+        Number(reservation.get('expiresAt')) > Number(argv[1]))) return [0];
+    let wallet = this.strings.get(keys[3]) ?? 0;
+    const allocations = JSON.parse(reservation.get('allocations')!);
+    const outcomes = allocations.map((allocation: any) => {
+      const planId = allocation.planId;
+      const current = Number(this.hash(keys[4]).get(planId) ?? 0);
+      const planExpiresAt = Number(this.hash(keys[5]).get(planId) ?? 0);
+      const status = this.hash(keys[6]).get(planId);
+      if (planExpiresAt > Number(argv[1]) && status !== 'EXPIRED' && status !== 'REVOKED') {
+        const after = current + Number(allocation.amount);
+        this.hash(keys[4]).set(planId, String(after));
+        this.hash(keys[6]).set(planId, 'ACTIVE');
+        this.zset(keys[7]).set(planId, Number(this.hash(keys[8]).get(planId)));
+        const member = this.hash(keys[10]).get(planId);
+        if (member) this.zset(keys[9]).set(member, planExpiresAt);
+        wallet += Number(allocation.amount);
+        return { ...allocation, restoredAmount: allocation.amount, expiredAmount: 0,
+          planBalanceAfter: after };
+      }
+      wallet -= current;
+      this.hash(keys[4]).set(planId, '0');
+      this.hash(keys[6]).set(planId, 'EXPIRED');
+      this.zset(keys[7]).delete(planId);
+      return { ...allocation, restoredAmount: 0, expiredAmount: allocation.amount,
+        planBalanceAfter: 0 };
+    });
+    this.strings.set(keys[3], wallet);
+    reservation.set('status', argv[0]);
+    reservation.set('remainingBalance', String(wallet));
+    this.zset(keys[1]).delete(argv[3]);
+    outcomes.forEach((outcome: any) => this.events.push({
+      type: argv[0], reservationId: argv[3], planId: outcome.planId,
+      restoredAmount: outcome.restoredAmount, expiredAmount: outcome.expiredAmount,
+    }));
+    return [1, reservation.get('scopeId')!, reservation.get('appId')!,
+      reservation.get('tenantId')!, reservation.get('appType')!,
+      reservation.get('creditType')!, reservation.get('amount')!,
+      reservation.get('operation')!, wallet, JSON.stringify(outcomes)];
+  }
+
+  private renew(keys: string[], argv: string[]) {
+    const reservation = this.hashes.get(keys[0]);
+    if (reservation?.get('status') !== 'RESERVED') return -1;
+    if (reservation.get('leaseToken') !== argv[0]) return -2;
+    const expiresAt = Number(argv[1]) + Number(argv[2]);
+    reservation.set('expiresAt', String(expiresAt));
+    reservation.set('version', String(Number(reservation.get('version')) + 1));
+    if (reservation.get('autoRecover') !== '0') this.zset(keys[1]).set(argv[3], expiresAt);
+    return expiresAt;
+  }
+
+  private expirePlan(keys: string[], argv: string[]) {
+    const expiresAt = Number(this.hash(keys[3]).get(argv[1]) ?? 0);
+    if (!expiresAt || expiresAt > Number(argv[0])) return [0];
+    const status = this.hash(keys[4]).get(argv[1]);
+    if (status === 'EXPIRED' || status === 'REVOKED') {
+      this.zset(keys[5]).delete(argv[2]); return [0];
+    }
+    const unused = Number(this.hash(keys[2]).get(argv[1]) ?? 0);
+    const balance = (this.strings.get(keys[0]) ?? 0) - unused;
+    this.strings.set(keys[0], balance);
+    this.hash(keys[2]).set(argv[1], '0');
+    this.hash(keys[4]).set(argv[1], 'EXPIRED');
+    this.zset(keys[1]).delete(argv[1]);
+    this.zset(keys[5]).delete(argv[2]);
+    this.events.push({ type: 'PLAN_EXPIRED', planId: argv[1], expiredAmount: unused });
+    return [1, unused, balance];
   }
 }
 
-const userA: CreditSubject = {
-  tenantId: 'tenant_1', appType: 'USER', appId: 'user_a',
-  serviceId: 'kyc', creditType: 'API_CREDIT',
+const subject: CreditSubject = {
+  appId: 'app-1', tenantId: 'tenant-1', appType: 'KYC', creditType: 'API_CREDIT',
 };
-const userB: CreditSubject = { ...userA, appId: 'user_b' };
 
-describe('CreditService production invariants', () => {
-  let redis: InMemoryRedis;
+describe('CreditService FIFO recharge plans', () => {
+  let clock = 1_800_000_000_000;
+  let redis: PlanRedis;
   let service: CreditService;
-  let keys: CreditKeyspace;
 
   beforeEach(() => {
-    redis = new InMemoryRedis();
-    const options = { ...DEFAULT_CREDIT_OPTIONS, leaseMs: 1_000 };
-    keys = new CreditKeyspace(options);
-    service = new CreditService(redis, options);
+    jest.spyOn(Date, 'now').mockImplementation(() => clock);
+    redis = new PlanRedis();
+    service = new CreditService(redis, {
+      ...DEFAULT_CREDIT_OPTIONS,
+      catalog: { catalogId: 'kyc', version: '1', routes: [] },
+    });
   });
 
-  const seed = (subject: CreditSubject, amount: number) =>
-    redis.strings.set(keys.balance(subject), String(amount));
+  afterEach(() => jest.restoreAllMocks());
 
-  it('deducts and commits only the selected account wallet', async () => {
-    service = new CreditService(redis, { ...DEFAULT_CREDIT_OPTIONS, leaseMs: 1_000 });
-    seed(userA, 100);
-    seed(userB, 55);
-    const reservation = await service.reserve({
-      subject: userA, requestId: 'req_1', amount: 20,
+  const grant = (planId: string, amount: number, grantedAt: number, expiresAt: number) =>
+    service.grant({
+      subject, planId, amount, grantedAt, expiresAt,
+      referenceId: `reference-${planId}`,
     });
-    expect(reservation.remainingBalance).toBe(80);
+
+  it('starts uninitialized and the first grant creates a plan without a provider', async () => {
+    expect(await service.getBalance(subject)).toBeNull();
+    expect(await service.getPlans(subject)).toEqual([]);
+    await expect(grant('plan-1', 100, clock - 100, clock + 10_000))
+      .resolves.toMatchObject({ planId: 'plan-1', planBalance: 100, balance: 100 });
+    expect(await service.getBalance(subject)).toBe(100);
+  });
+
+  it('deduplicates an exact plan retry and rejects changed semantics', async () => {
+    const input = {
+      subject, planId: 'plan-1', amount: 100, grantedAt: clock - 100,
+      expiresAt: clock + 10_000, referenceId: 'reference-plan-1',
+    };
+    expect((await service.grant(input)).existing).toBe(false);
+    expect((await service.grant(input)).existing).toBe(true);
+    await expect(service.grant({ ...input, amount: 101 }))
+      .rejects.toBeInstanceOf(BadRequestException);
+    expect(await service.getBalance(subject)).toBe(100);
+  });
+
+  it('rejects plan IDs and payment references reused by another wallet or plan', async () => {
+    await grant('plan-1', 100, clock - 100, clock + 10_000);
+    await expect(service.grant({
+      subject: { ...subject, appId: 'app-2' }, planId: 'plan-1', amount: 100,
+      grantedAt: clock - 100, expiresAt: clock + 10_000,
+      referenceId: 'another-reference',
+    })).rejects.toThrow('planId is already owned by another wallet');
+    await expect(service.grant({
+      subject, planId: 'plan-2', amount: 100, grantedAt: clock - 100,
+      expiresAt: clock + 10_000, referenceId: 'reference-plan-1',
+    })).rejects.toThrow('referenceId is already assigned to another plan');
+  });
+
+  it('allocates FIFO across plans and emits a separate commit event per plan', async () => {
+    await grant('old-plan', 10, clock - 200, clock + 10_000);
+    await grant('new-plan', 50, clock - 100, clock + 20_000);
+    const reservation = await service.reserve({ subject, amount: 25, requestId: 'request-1' });
+    expect(reservation.allocations).toEqual([
+      { planId: 'old-plan', amount: 10, planBalanceAfter: 0 },
+      { planId: 'new-plan', amount: 15, planBalanceAfter: 35 },
+    ]);
     expect(await service.commit(reservation.reservationId)).toBe(true);
-    expect(await service.getBalance(userA)).toBe(80);
-    expect(await service.getBalance(userB)).toBe(55);
+    expect(redis.events.filter((event) => event.type === 'COMMITTED')).toEqual([
+      expect.objectContaining({ planId: 'old-plan', amount: 10, allocationIndex: 0 }),
+      expect.objectContaining({ planId: 'new-plan', amount: 15, allocationIndex: 1 }),
+    ]);
+    expect(await service.getBalance(subject)).toBe(35);
   });
 
-  it('isolates the same account across tenant, service, and credit type', async () => {
-    const otherTenant = { ...userA, tenantId: 'tenant_2' };
-    const otherService = { ...userA, serviceId: 'ssi' };
-    const otherCreditType = { ...userA, creditType: 'STORAGE_CREDIT' };
-    for (const subject of [userA, otherTenant, otherService, otherCreditType]) seed(subject, 100);
-    await service.reserve({ subject: otherService, amount: 10 });
-    expect(await service.getBalance(userA)).toBe(100);
-    expect(await service.getBalance(otherTenant)).toBe(100);
-    expect(await service.getBalance(otherService)).toBe(90);
-    expect(await service.getBalance(otherCreditType)).toBe(100);
+  it('does not partially deduct when combined plans are insufficient', async () => {
+    await grant('plan-1', 10, clock - 200, clock + 10_000);
+    await grant('plan-2', 5, clock - 100, clock + 10_000);
+    await expect(service.reserve({ subject, amount: 16 }))
+      .rejects.toBeInstanceOf(InsufficientCreditsException);
+    expect(await service.getBalance(subject)).toBe(15);
+    expect((await service.getPlans(subject)).map((plan) => plan.availableAmount)).toEqual([10, 5]);
   });
 
-  it('does not collide omitted dimensions with sentinel-like real values', () => {
-    const omitted: CreditSubject = { appId: 'same' };
-    const underscore: CreditSubject = {
-      appId: 'same', tenantId: '_', appType: '_', serviceId: '_',
-    };
-    const defaultCredit: CreditSubject = {
-      appId: 'same', creditType: 'default',
-    };
-
-    expect(keys.scopeId(omitted)).not.toBe(keys.scopeId(underscore));
-    expect(keys.scopeId(omitted)).not.toBe(keys.scopeId(defaultCredit));
+  it('restores every allocation to its original active plan on rollback', async () => {
+    await grant('plan-1', 10, clock - 200, clock + 100_000);
+    await grant('plan-2', 20, clock - 100, clock + 100_000);
+    const reservation = await service.reserve({ subject, amount: 15 });
+    expect(await service.rollback(reservation.reservationId, 'failed')).toBe(true);
+    expect(await service.getBalance(subject)).toBe(30);
+    expect((await service.getPlans(subject)).map((plan) => plan.availableAmount)).toEqual([10, 20]);
   });
 
-  it('rolls back exactly once to the original scoped wallet', async () => {
-    seed(userA, 100);
-    const { reservationId } = await service.reserve({ subject: userA, amount: 20 });
-    expect(await service.rollback(reservationId)).toBe(true);
-    expect(await service.rollback(reservationId)).toBe(false);
-    expect(await service.getBalance(userA)).toBe(100);
-    expect((await service.getReservation(reservationId))?.status).toBe('ROLLED_BACK');
-  });
-
-  it('records exact rollback fields without positional corruption', async () => {
-    seed(userA, 100);
-    const { reservationId } = await service.reserve({
-      subject: userA, amount: 20, operation: 'VERIFY_KYC',
-    });
-    await service.rollback(reservationId, 'verification_failed');
-    expect(await service.getReservation(reservationId)).toEqual(expect.objectContaining({
-      status: 'ROLLED_BACK', amount: 20, operation: 'VERIFY_KYC',
-      finalizationReason: 'verification_failed', remainingBalance: 100,
-      subject: userA,
+  it('does not resurrect a plan that expires while its credits are reserved', async () => {
+    await grant('short-plan', 20, clock - 100, clock + 100);
+    const reservation = await service.reserve({ subject, amount: 10 });
+    clock += 101;
+    expect(await service.rollback(reservation.reservationId, 'failed')).toBe(true);
+    expect(await service.getBalance(subject)).toBe(0);
+    expect(redis.events).toContainEqual(expect.objectContaining({
+      type: 'ROLLED_BACK', planId: 'short-plan', restoredAmount: 0, expiredAmount: 10,
     }));
   });
 
-  it('never calls the provider to replenish an existing insufficient balance', async () => {
-    seed(userA, 5);
-    const provider = { getBalance: jest.fn().mockResolvedValue({ balance: 100 }) };
-    service = new CreditService(
-      redis, { ...DEFAULT_CREDIT_OPTIONS, criticalBalance: 20, balanceProvider: provider },
-    );
-    await expect(service.reserve({ subject: userA, amount: 10 }))
-      .rejects.toBeInstanceOf(InsufficientCreditsException);
-    expect(provider.getBalance).not.toHaveBeenCalled();
-    expect(await service.getBalance(userA)).toBe(5);
+  it('allows commit after the funding plan expires', async () => {
+    await grant('short-plan', 20, clock - 100, clock + 100);
+    const reservation = await service.reserve({ subject, amount: 10 });
+    clock += 101;
+    expect(await service.commit(reservation.reservationId)).toBe(true);
+    expect(redis.events).toContainEqual(expect.objectContaining({
+      type: 'COMMITTED', planId: 'short-plan', amount: 10,
+    }));
   });
 
-  it('does not mutate Redis when a dynamic critical threshold is invalid', async () => {
-    seed(userA, 100);
-    service = new CreditService(
-      redis,
-      { ...DEFAULT_CREDIT_OPTIONS, criticalBalance: () => -1 },
-    );
-
-    await expect(service.reserve({ subject: userA, amount: 20 }))
-      .rejects.toThrow('criticalBalance');
-    expect(await service.getBalance(userA)).toBe(100);
-    expect(redis.reservations.size).toBe(0);
-  });
-
-  it('initializes a missing wallet from the exact subject once', async () => {
-    const provider = { getBalance: jest.fn().mockResolvedValue({ balance: 40, source: 'ledger' }) };
-    service = new CreditService(
-      redis, { ...DEFAULT_CREDIT_OPTIONS, balanceProvider: provider },
-    );
-    await service.reserve({ subject: userA, requestId: 'first', amount: 10 });
-    await service.reserve({ subject: userA, requestId: 'second', amount: 10 });
-    expect(provider.getBalance).toHaveBeenCalledTimes(1);
-    expect(provider.getBalance).toHaveBeenCalledWith(userA);
-    expect(await service.getBalance(userA)).toBe(20);
-  });
-
-  it('returns the same reservation for the same scoped request ID', async () => {
-    seed(userA, 100);
-    const input = { subject: userA, requestId: 'same-request', amount: 20 };
-    const first = await service.reserve(input);
-    const second = await service.reserve(input);
-    expect(second.reservationId).toBe(first.reservationId);
-    expect(second.existing).toBe(true);
-    expect(await service.getBalance(userA)).toBe(80);
-  });
-
-  it('does not apply duplicate mutations for idempotent retries', async () => {
-    seed(userA, 100);
-    const reservationInput = {
-      subject: userA, requestId: 'retry-request', amount: 20,
-    };
-    const firstReservation = await service.reserve(reservationInput);
-    const retryReservation = await service.reserve(reservationInput);
-    const grantInput = {
-      subject: userA, amount: 10, referenceId: 'retry-payment',
-    };
-    const firstGrant = await service.grant(grantInput);
-    const retryGrant = await service.grant(grantInput);
-
-    expect(retryReservation).toMatchObject({
-      reservationId: firstReservation.reservationId, existing: true,
-    });
-    expect(firstGrant.existing).toBe(false);
-    expect(retryGrant.existing).toBe(true);
-    expect(await service.getBalance(userA)).toBe(90);
-  });
-
-  it('grants credits once for an idempotent business reference', async () => {
-    seed(userA, 10);
-    const first = await service.grant({
-      subject: userA, amount: 25, referenceId: 'payment_123', reason: 'purchase',
-    });
-    const retry = await service.grant({
-      subject: userA, amount: 25, referenceId: 'payment_123', reason: 'purchase',
-    });
-    expect(first).toMatchObject({ balance: 35, existing: false });
-    expect(retry).toMatchObject({ balance: 35, existing: true });
-    expect(await service.getBalance(userA)).toBe(35);
-  });
-
-  it('adds a grant to available balance while a reservation is active', async () => {
-    seed(userA, 100);
-    const reservation = await service.reserve({ subject: userA, amount: 20 });
-
-    await expect(service.grant({
-      subject: userA,
-      amount: 50,
-      referenceId: 'recharge_during_reservation',
-    })).resolves.toMatchObject({ balance: 130, existing: false });
-
-    await expect(service.commit(reservation.reservationId)).resolves.toBe(true);
-    expect(await service.getBalance(userA)).toBe(130);
-  });
-
-  it('preserves a grant when an active reservation is rolled back', async () => {
-    seed(userA, 100);
-    const reservation = await service.reserve({ subject: userA, amount: 20 });
-
-    await service.grant({
-      subject: userA,
-      amount: 50,
-      referenceId: 'recharge_before_rollback',
-    });
-    await expect(service.rollback(reservation.reservationId, 'failed'))
-      .resolves.toBe(true);
-
-    expect(await service.getBalance(userA)).toBe(150);
-  });
-
-  it('returns the current balance when a grant is retried after spending', async () => {
-    seed(userA, 100);
-    await service.grant({
-      subject: userA,
-      amount: 50,
-      referenceId: 'recharge_then_spend',
-    });
-    await service.reserve({ subject: userA, amount: 20 });
-
-    await expect(service.grant({
-      subject: userA,
-      amount: 50,
-      referenceId: 'recharge_then_spend',
-    })).resolves.toMatchObject({ balance: 130, existing: true });
-    expect(await service.getBalance(userA)).toBe(130);
-  });
-
-  it('recovers an expired reservation exactly once', async () => {
-    seed(userA, 100);
-    const reservation = await service.reserve({ subject: userA, amount: 20 });
+  it('recovers an expired split reservation exactly once', async () => {
+    await grant('plan-1', 10, clock - 200, clock + 100_000);
+    await grant('plan-2', 20, clock - 100, clock + 100_000);
+    const reservation = await service.reserve({ subject, amount: 15 });
     const recovered = await service.recoverExpired(reservation.expiresAt + 1);
-    expect(recovered).toEqual([expect.objectContaining({
-      appId: 'user_a', amount: 20, balanceAfter: 100,
+    expect(recovered).toHaveLength(1);
+    expect(recovered[0].allocations).toHaveLength(2);
+    expect(await service.recoverExpired(reservation.expiresAt + 1)).toHaveLength(0);
+    expect(await service.getBalance(subject)).toBe(30);
+  });
+
+  it('expires unused plan credit through the stateless recovery pass', async () => {
+    await grant('short-plan', 20, clock - 100, clock + 100);
+    const expired = await service.recoverExpiredPlans(clock + 101);
+    expect(expired).toEqual([expect.objectContaining({
+      planId: 'short-plan', expiredAmount: 20, balanceAfter: 0,
     })]);
-    expect(await service.recoverExpired(reservation.expiresAt + 1)).toHaveLength(0);
-    expect(await service.getBalance(userA)).toBe(100);
-    expect((await service.getReservation(reservation.reservationId))?.status).toBe('EXPIRED');
+    expect(await service.recoverExpiredPlans(clock + 101)).toHaveLength(0);
   });
 
-  it('removes a dangling expiration entry so it cannot starve recovery', async () => {
-    redis.expirations.set('missing-reservation', 1);
-
-    await expect(service.recoverExpired(2)).resolves.toEqual([]);
-    expect(redis.expirations.has('missing-reservation')).toBe(false);
-  });
-
-  it('does not automatically recover a manually settled reservation', async () => {
-    seed(userA, 100);
-    const reservation = await service.reserve({
-      subject: userA,
-      amount: 20,
-      settlementMode: 'DEFERRED',
-      autoRecover: false,
-    });
-
-    expect(reservation.autoRecover).toBe(false);
-    expect(await service.recoverExpired(reservation.expiresAt + 1)).toHaveLength(0);
-    expect(await service.getBalance(userA)).toBe(80);
-    expect((await service.getReservation(reservation.reservationId))?.status)
-      .toBe('RESERVED');
-
-    await expect(service.rollback(reservation.reservationId, 'downstream_failed'))
-      .resolves.toBe(true);
-    expect(await service.getBalance(userA)).toBe(100);
-  });
-
-  it('allows disabling recovery only for deferred reservations', async () => {
-    seed(userA, 100);
-    await expect(service.reserve({
-      subject: userA,
-      amount: 20,
-      settlementMode: 'IMMEDIATE',
-      autoRecover: false,
-    })).rejects.toThrow('only for DEFERRED reservations');
-    expect(await service.getBalance(userA)).toBe(100);
-  });
-
-  it('renews a deferred lease only with its capability token', async () => {
-    seed(userA, 100);
-    const reservation = await service.reserve({
-      subject: userA, amount: 20, settlementMode: 'DEFERRED',
-    });
-    await expect(service.renew(reservation.reservationId, 'wrong-token'))
-      .rejects.toThrow('cannot be renewed');
-    const renewedExpiry = await service.renew(
-      reservation.reservationId, reservation.leaseToken,
-    );
-    expect(renewedExpiry).toBeGreaterThanOrEqual(reservation.expiresAt);
-  });
-
-  it('uses one Redis Cluster hash tag for every transactional key', () => {
-    const allKeys = [keys.balance(userA), keys.request(userA, 'req'),
-      keys.reservation('res'), keys.expirations(), keys.eventStream()];
-    expect(allKeys.every((key) => key.includes('{credit}'))).toBe(true);
+  it('expires stale availability before a later grant calculates balanceAfter', async () => {
+    await grant('expired-plan', 20, clock - 200, clock + 100);
+    clock += 101;
+    const result = await grant('new-plan', 50, clock - 1, clock + 10_000);
+    expect(result.balance).toBe(50);
+    expect(await service.getBalance(subject)).toBe(50);
+    expect(redis.events).toContainEqual(expect.objectContaining({
+      type: 'PLAN_EXPIRED', planId: 'expired-plan', expiredAmount: 20,
+    }));
   });
 });

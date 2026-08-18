@@ -1,46 +1,48 @@
-# Credit event server demo
+# Independent lifecycle and command server
 
-This is a second NestJS process with no `CreditModule`. It represents the
-trusted billing/reconciliation side of the architecture:
+This process represents trusted billing infrastructure outside the SDK-installed
+API server. It:
 
-- consumes every job from the `credit.lifecycle` BullMQ queue;
-- keeps the newest 1,000 jobs in memory so they can be inspected over HTTP;
-- publishes idempotent `credit.grant.requested` jobs to
-  `credit.commands.<serviceId>`.
+- consumes plan-level lifecycle jobs from `credit.lifecycle`;
+- publishes schema-v2 commands to `credit.commands.<catalogId>`;
+- keeps a small in-memory event list only for demonstration.
 
-The in-memory event store is intentionally only a demo persistence boundary.
-A production consumer would insert `eventId` into TimescaleDB (or another
-ledger) under a unique constraint and complete the Bull job only after that
-database transaction commits.
-
-Run the credit-enabled service and this server in separate terminals:
+Start it beside one API example:
 
 ```sh
-npm run start:example:multi
 npm run start:example:events
+npm run start:example
 ```
 
-Inspect lifecycle events:
-
-```sh
-curl 'http://localhost:3002/credit-events?limit=25'
-```
-
-Produce a grant command:
+Create an API-credit recharge plan:
 
 ```sh
 curl -X POST http://localhost:3002/credit-commands/grant \
   -H 'content-type: application/json' \
   -d '{
-    "serviceId":"kyc",
-    "tenantId":"tenant_1",
-    "appType":"BUSINESS",
-    "appId":"business_123",
+    "catalogId":"example-service",
+    "appId":"user_123",
+    "appType":"USER",
     "creditType":"API_CREDIT",
-    "amount":25,
-    "referenceId":"payment-001"
+    "planId":"api-plan-001",
+    "amount":100,
+    "grantedAt":1780000000000,
+    "expiresAt":1900000000000,
+    "referenceId":"payment-001",
+    "reason":"demo-credit-purchase"
   }'
 ```
 
-The KYC demo consumes the command, applies the grant atomically, and emits a
-`credit.granted` lifecycle event back to this server.
+Inspect events received from the SDK:
+
+```sh
+curl 'http://localhost:3002/credit-events?limit=25'
+```
+
+A split reservation produces separate `credit.reserved` and
+`credit.committed` jobs for every funding `planId`. Replace the in-memory store
+with an idempotent TimescaleDB consumer keyed by the envelope `eventId`.
+
+This service and the API server must use the same Redis/BullMQ configuration.
+Do not run a lifecycle worker inside the API server: workers on one BullMQ queue
+compete instead of receiving independent copies.

@@ -6,9 +6,9 @@ export type CreditEventType =
   | 'COMMITTED'
   | 'ROLLED_BACK'
   | 'EXPIRED'
+  | 'PLAN_EXPIRED'
   | 'CREDIT_GRANTED'
-  | 'CRITICAL_BALANCE'
-  | 'BALANCE_INITIALIZED';
+  | 'CRITICAL_BALANCE';
 
 /** Fields present on every credit event. */
 export interface BaseCreditEvent {
@@ -22,20 +22,24 @@ export interface BaseCreditEvent {
   appId: string;
   tenantId?: string;
   appType?: string;
-  serviceId?: string;
   creditType?: string;
   scopeId: string;
+  /** Present on every plan-affecting event. */
+  planId?: string;
 }
 
 /** Emitted after a credit reservation is successfully created in Redis. */
 export interface CreditReservedEvent extends BaseCreditEvent {
   type: 'RESERVED';
+  planId: string;
   reservationId: string;
   requestId?: string;
-  /** Number of credits reserved. */
+  /** Number reserved from this event's plan. */
   amount: number;
+  totalAmount: number;
   /** Scoped wallet balance after this reservation. */
   balanceAfter: number;
+  planBalanceAfter: number;
   /** Unix epoch milliseconds when the lease expires if never settled. */
   expiresAt: number;
   /** Whether scheduled recovery may refund this reservation after expiry. */
@@ -50,11 +54,16 @@ export interface CreditReservedEvent extends BaseCreditEvent {
  */
 export interface CreditCommittedEvent extends BaseCreditEvent {
   type: 'COMMITTED';
+  planId: string;
   reservationId: string;
   /** Number of credits that were permanently deducted. */
   amount: number;
+  totalAmount: number;
+  allocationIndex: number;
+  allocationCount: number;
   /** Scoped wallet balance after the original reservation deduction. */
   balanceAfter: number;
+  planBalanceAfter: number;
   operation?: string;
 }
 
@@ -64,13 +73,17 @@ export interface CreditCommittedEvent extends BaseCreditEvent {
  */
 export interface CreditRolledBackEvent extends BaseCreditEvent {
   type: 'ROLLED_BACK';
+  planId: string;
   reservationId: string;
   /** Number of credits refunded. */
   amount: number;
+  restoredAmount: number;
+  expiredAmount: number;
   /** Human-readable reason supplied by the caller or the interceptor. */
   reason: string;
   /** Scoped wallet balance after the refund. */
   balanceAfter: number;
+  planBalanceAfter: number;
   operation?: string;
 }
 
@@ -80,21 +93,38 @@ export interface CreditRolledBackEvent extends BaseCreditEvent {
  */
 export interface CreditExpiredEvent extends BaseCreditEvent {
   type: 'EXPIRED';
+  planId: string;
   reservationId: string;
   /** Number of credits refunded by the recovery pass. */
   amount: number;
+  restoredAmount: number;
+  expiredAmount: number;
   /** Scoped wallet balance after recovery refunded the reservation. */
   balanceAfter: number;
+  planBalanceAfter: number;
   operation?: string;
 }
 
 /** Emitted after an idempotent credit top-up changes a scoped wallet. */
 export interface CreditGrantedEvent extends BaseCreditEvent {
   type: 'CREDIT_GRANTED';
+  planId: string;
   referenceId: string;
   amount: number;
   balanceAfter: number;
+  planBalanceAfter: number;
+  grantedAt: number;
+  expiresAt: number;
   reason?: string;
+}
+
+export interface CreditPlanExpiredEvent extends BaseCreditEvent {
+  type: 'PLAN_EXPIRED';
+  planId: string;
+  expiredAmount: number;
+  expiresAt: number;
+  balanceAfter: number;
+  planBalanceAfter: 0;
 }
 
 /**
@@ -104,23 +134,11 @@ export interface CreditGrantedEvent extends BaseCreditEvent {
  */
 export interface CreditCriticalBalanceEvent extends BaseCreditEvent {
   type: 'CRITICAL_BALANCE';
+  planId: string;
   /** Current balance after the operation that triggered this alert. */
   balance: number;
   /** The configured threshold that was breached. */
   threshold: number;
-}
-
-/**
- * Emitted when the SDK consults the authoritative `balanceProvider` and
- * writes a fresh balance into Redis.
- */
-export interface CreditBalanceInitializedEvent extends BaseCreditEvent {
-  type: 'BALANCE_INITIALIZED';
-  /** The balance value written to Redis from the provider. */
-  balance: number;
-  /** Opaque tag from the provider snapshot, e.g. "timescaledb". */
-  source?: string;
-  revision?: string;
 }
 
 /** Discriminated union of all events the SDK can emit. */
@@ -129,6 +147,6 @@ export type AnyCreditEvent =
   | CreditCommittedEvent
   | CreditRolledBackEvent
   | CreditExpiredEvent
+  | CreditPlanExpiredEvent
   | CreditGrantedEvent
-  | CreditCriticalBalanceEvent
-  | CreditBalanceInitializedEvent;
+  | CreditCriticalBalanceEvent;

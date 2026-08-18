@@ -9,7 +9,7 @@ const createTransport = () => {
   };
   const options = {
     ...DEFAULT_CREDIT_OPTIONS,
-    catalog: { serviceId: 'kyc', version: '7', routes: [] },
+    catalog: { catalogId: 'kyc', version: '7', routes: [] },
     bullMq: {
       provider,
       streamClient,
@@ -33,7 +33,7 @@ describe('CreditEventRelay', () => {
 
     await (relay as any).publishEntries([[
       '1234-0',
-      ['event', 'COMMITTED', 'timestamp', '1234', 'serviceId', 'kyc',
+      ['event', 'COMMITTED', 'timestamp', '1234', 'catalogId', 'kyc',
         'appId', 'a1', 'creditType', 'API', 'amount', '4',
         'balanceAfter', '96', 'reservationId', 'r1'],
     ]]);
@@ -43,7 +43,7 @@ describe('CreditEventRelay', () => {
       'credit.lifecycle',
       'credit.committed',
       expect.objectContaining({
-        eventId: '1234-0', schemaVersion: 1, catalogVersion: '7',
+        eventId: '1234-0', schemaVersion: 2, catalogVersion: '7',
         event: expect.objectContaining({ amount: 4, balanceAfter: 96 }),
       }),
       { jobId: 'kyc-1234-0' },
@@ -62,7 +62,7 @@ describe('CreditEventRelay', () => {
       { eval: jest.fn() }, options, new CreditCatalogService(options),
     );
     await expect((relay as any).publishEntries([[
-      '1234-0', ['event', 'RESERVED', 'serviceId', 'kyc'],
+      '1234-0', ['event', 'RESERVED', 'catalogId', 'kyc'],
     ]])).rejects.toThrow('queue unavailable');
     expect(streamClient.xack).not.toHaveBeenCalled();
   });
@@ -105,10 +105,13 @@ describe('CreditCommandWorker', () => {
       id: 'command-1',
       name: 'credit.grant.requested',
       data: {
-        commandId: 'command-1', schemaVersion: 1, serviceId: 'kyc',
+        commandId: 'command-1', schemaVersion: 2, catalogId: 'kyc',
         payload: {
           subject: { appId: 'account-1', creditType: 'API' },
           amount: 50,
+          planId: 'plan-1',
+          grantedAt: 1_000,
+          expiresAt: 2_000,
           referenceId: 'payment-1',
         },
       },
@@ -116,10 +119,13 @@ describe('CreditCommandWorker', () => {
 
     expect(credits.grant).toHaveBeenCalledWith({
       subject: {
-        appId: 'account-1', serviceId: 'kyc', creditType: 'API',
+        appId: 'account-1', creditType: 'API',
         tenantId: undefined, appType: undefined,
       },
       amount: 50,
+      planId: 'plan-1',
+      grantedAt: 1_000,
+      expiresAt: 2_000,
       referenceId: 'payment-1',
       reason: undefined,
     });
@@ -138,8 +144,11 @@ describe('CreditCommandWorker', () => {
       id: 'bad-command',
       name: 'credit.grant.requested',
       data: {
-        commandId: 'bad-command', schemaVersion: 1, serviceId: 'kyc',
-        payload: { subject: { appId: 'a', creditType: 'API' }, amount: -1 },
+        commandId: 'bad-command', schemaVersion: 2, catalogId: 'kyc',
+        payload: {
+          subject: { appId: 'a', creditType: 'API' }, amount: -1,
+          planId: 'plan-bad', grantedAt: 1_000, expiresAt: 2_000,
+        },
       },
     })).rejects.toThrow('positive safe integer');
     expect(provider.add).toHaveBeenCalledTimes(2);

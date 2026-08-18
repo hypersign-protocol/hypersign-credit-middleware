@@ -35,14 +35,14 @@ implements OnApplicationBootstrap, OnApplicationShutdown {
         case CREDIT_EVENT_NAMES.EXPIRED:
           this.logger.log(`Credit expired: ${JSON.stringify(job.data)}`);
           break;
+        case CREDIT_EVENT_NAMES.PLAN_EXPIRED:
+          this.logger.log(`Recharge plan expired: ${JSON.stringify(job.data)}`);
+          break;
         case CREDIT_EVENT_NAMES.CREDIT_GRANTED:
           this.logger.log(`Credit granted: ${JSON.stringify(job.data)}`);
           break;
         case CREDIT_EVENT_NAMES.CRITICAL_BALANCE:
           this.logger.log(`Critical balance reached: ${JSON.stringify(job.data)}`);
-          break;
-        case CREDIT_EVENT_NAMES.BALANCE_INITIALIZED:
-          this.logger.log(`Balance initialized: ${JSON.stringify(job.data)}`);
           break;
       }
     });

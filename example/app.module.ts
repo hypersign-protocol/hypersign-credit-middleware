@@ -1,10 +1,6 @@
 import { MiddlewareConsumer, Module, NestModule } from '@nestjs/common';
 import { CreditBoundaryMiddleware, CreditModule } from '../src';
 import {
-  EXAMPLE_CREDIT_CATALOG,
-  exampleBalanceProvider,
-} from './credit-demo.config';
-import {
   CREDIT_BULLMQ_PROVIDER,
   ExampleBullMqModule,
   ExampleBullMqProvider,
@@ -23,20 +19,17 @@ import { RequestContextMiddleware } from './request-context.middleware';
       imports: [RedisModule, ExampleBullMqModule],
       inject: [CREDIT_BULLMQ_PROVIDER, CREDIT_EVENT_STREAM_REDIS],
       useFactory: (bullMq: ExampleBullMqProvider, streamClient: Redis) => ({
-        catalog: EXAMPLE_CREDIT_CATALOG,
         keyPrefix: 'credit-example',
         redisHashTag: 'credit-example',
         leaseMs: 10_000, // Short only so orphan recovery is easy to demonstrate
         retentionMs: 60 * 60 * 1_000,
         criticalBalance: 20,
-        balanceProvider: exampleBalanceProvider,
         bullMq: { provider: bullMq, streamClient },
         requestContextResolver: (request: unknown) => {
           const value = request as {
             creditSubject?: {
               appId: string;
               appType: string;
-              serviceId: string;
               creditType: string;
             };
             requestId?: string;

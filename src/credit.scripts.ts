@@ -1,61 +1,106 @@
-/**
- * Redis Lua programs used by CreditService.
- *
- * Keep these scripts free of application policy. Their job is to make each
- * multi-key state transition atomic. See docs/lua-scripts.md for the complete
- * KEYS/ARGV/return-code contract.
- */
+/** Atomic Redis programs for FIFO recharge-plan credit lifecycle state. */
 
 export const RESERVE_SCRIPT = `
-local existingId = redis.call('HGET', KEYS[3], 'reservationId')
+local existingId = redis.call('HGET', KEYS[9], 'reservationId')
 if existingId then
-  if redis.call('HGET', KEYS[3], 'amount') ~= ARGV[1]
-    or redis.call('HGET', KEYS[3], 'settlementMode') ~= ARGV[14]
-    or redis.call('HGET', KEYS[3], 'operation') ~= ARGV[15]
-    or redis.call('HGET', KEYS[3], 'autoRecover') ~= ARGV[16] then
+  if redis.call('HGET', KEYS[9], 'amount') ~= ARGV[1]
+    or redis.call('HGET', KEYS[9], 'settlementMode') ~= ARGV[13]
+    or redis.call('HGET', KEYS[9], 'operation') ~= ARGV[14]
+    or redis.call('HGET', KEYS[9], 'autoRecover') ~= ARGV[15] then
     return {-2}
   end
-  return {existingId, redis.call('HGET', KEYS[3], 'remainingBalance'),
-    redis.call('HGET', KEYS[3], 'expiresAt'), 1,
-    redis.call('HGET', KEYS[3], 'leaseToken'),
-    redis.call('HGET', KEYS[3], 'autoRecover')}
+  return {existingId, redis.call('HGET', KEYS[9], 'remainingBalance'),
+    redis.call('HGET', KEYS[9], 'expiresAt'), 1,
+    redis.call('HGET', KEYS[9], 'leaseToken'),
+    redis.call('HGET', KEYS[9], 'autoRecover'),
+    redis.call('HGET', KEYS[9], 'allocations')}
 end
-local rawBalance = redis.call('GET', KEYS[1])
-if not rawBalance then return {-3} end
-local balance = tonumber(rawBalance)
-local amount = tonumber(ARGV[1])
-if balance < amount then return {-1} end
-local expiresAt = tonumber(ARGV[10]) + tonumber(ARGV[11])
-local remaining = redis.call('DECRBY', KEYS[1], amount)
-redis.call('HSET', KEYS[2],
+
+local walletBalance = tonumber(redis.call('GET', KEYS[1]) or '0')
+local planIds = redis.call('ZRANGE', KEYS[2], 0, -1)
+local now = tonumber(ARGV[9])
+for _, planId in ipairs(planIds) do
+  local planExpiresAt = tonumber(redis.call('HGET', KEYS[4], planId) or '0')
+  if planExpiresAt <= now then
+    local unused = tonumber(redis.call('HGET', KEYS[3], planId) or '0')
+    walletBalance = walletBalance - unused
+    redis.call('HSET', KEYS[3], planId, 0)
+    redis.call('HSET', KEYS[5], planId, 'EXPIRED')
+    redis.call('ZREM', KEYS[2], planId)
+    local expirationMember = redis.call('HGET', KEYS[7], planId)
+    if expirationMember then redis.call('ZREM', KEYS[11], expirationMember) end
+    redis.call('XADD', KEYS[12], 'MAXLEN', '~', ARGV[17], '*',
+      'event', 'PLAN_EXPIRED', 'timestamp', ARGV[9], 'catalogId', ARGV[19],
+      'scopeId', ARGV[3], 'appId', ARGV[4], 'tenantId', ARGV[5],
+      'appType', ARGV[6], 'creditType', ARGV[7], 'planId', planId,
+      'expiredAmount', unused, 'expiresAt', planExpiresAt,
+      'planBalanceAfter', 0, 'balanceAfter', walletBalance)
+  end
+end
+redis.call('SET', KEYS[1], walletBalance)
+
+planIds = redis.call('ZRANGE', KEYS[2], 0, -1)
+local needed = tonumber(ARGV[1])
+local allocations = {}
+for _, planId in ipairs(planIds) do
+  if needed > 0 then
+    local available = tonumber(redis.call('HGET', KEYS[3], planId) or '0')
+    if available > 0 then
+      if #allocations >= tonumber(ARGV[18]) then return {-4} end
+      local take = math.min(available, needed)
+      table.insert(allocations, {planId = planId, amount = take})
+      needed = needed - take
+    end
+  end
+end
+if needed > 0 then return {-1} end
+
+local finalBalance = redis.call('DECRBY', KEYS[1], tonumber(ARGV[1]))
+for _, allocation in ipairs(allocations) do
+  local after = redis.call('HINCRBY', KEYS[3], allocation.planId, -allocation.amount)
+  allocation.planBalanceAfter = after
+  if after == 0 then
+    redis.call('HSET', KEYS[5], allocation.planId, 'DEPLETED')
+    redis.call('ZREM', KEYS[2], allocation.planId)
+    local expirationMember = redis.call('HGET', KEYS[7], allocation.planId)
+    if expirationMember then redis.call('ZREM', KEYS[11], expirationMember) end
+  end
+end
+
+local expiresAt = now + tonumber(ARGV[10])
+local allocationsJson = cjson.encode(allocations)
+redis.call('HSET', KEYS[8],
   'reservationId', ARGV[2], 'scopeId', ARGV[3], 'appId', ARGV[4],
-  'tenantId', ARGV[5], 'appType', ARGV[6], 'serviceId', ARGV[7],
-  'creditType', ARGV[8], 'requestId', ARGV[9], 'amount', ARGV[1],
-  'remainingBalance', remaining, 'status', 'RESERVED', 'leaseToken', ARGV[12],
-  'createdAt', ARGV[10], 'expiresAt', expiresAt, 'version', 1,
-  'settlementMode', ARGV[14], 'operation', ARGV[15],
-  'autoRecover', ARGV[16], 'balanceKey', KEYS[1])
-if ARGV[16] == '1' then redis.call('ZADD', KEYS[4], expiresAt, ARGV[2]) end
-redis.call('HSET', KEYS[3], 'reservationId', ARGV[2],
-  'remainingBalance', remaining, 'expiresAt', expiresAt,
-  'amount', ARGV[1], 'settlementMode', ARGV[14], 'operation', ARGV[15],
-  'leaseToken', ARGV[12], 'autoRecover', ARGV[16])
-redis.call('XADD', KEYS[5], 'MAXLEN', '~', ARGV[18], '*',
-  'event', 'RESERVED', 'timestamp', ARGV[10], 'scopeId', ARGV[3],
-  'appId', ARGV[4], 'tenantId', ARGV[5], 'appType', ARGV[6],
-  'serviceId', ARGV[7], 'creditType', ARGV[8], 'requestId', ARGV[9],
-  'operation', ARGV[15], 'amount', ARGV[1], 'reservationId', ARGV[2],
-  'settlementMode', ARGV[14], 'autoRecover', ARGV[16],
-  'expiresAt', expiresAt,
-  'balanceAfter', remaining)
-if remaining <= tonumber(ARGV[17]) then
-  redis.call('XADD', KEYS[5], 'MAXLEN', '~', ARGV[18], '*',
-    'event', 'CRITICAL_BALANCE', 'timestamp', ARGV[10], 'scopeId', ARGV[3],
-    'appId', ARGV[4], 'tenantId', ARGV[5], 'appType', ARGV[6],
-    'serviceId', ARGV[7], 'creditType', ARGV[8],
-    'balance', remaining, 'threshold', ARGV[17])
+  'tenantId', ARGV[5], 'appType', ARGV[6], 'creditType', ARGV[7],
+  'requestId', ARGV[8], 'amount', ARGV[1], 'remainingBalance', finalBalance,
+  'status', 'RESERVED', 'leaseToken', ARGV[11], 'createdAt', ARGV[9],
+  'expiresAt', expiresAt, 'version', 1, 'settlementMode', ARGV[13],
+  'operation', ARGV[14], 'autoRecover', ARGV[15], 'allocations', allocationsJson)
+if ARGV[15] == '1' then redis.call('ZADD', KEYS[10], expiresAt, ARGV[2]) end
+redis.call('HSET', KEYS[9], 'reservationId', ARGV[2],
+  'remainingBalance', finalBalance, 'expiresAt', expiresAt, 'amount', ARGV[1],
+  'settlementMode', ARGV[13], 'operation', ARGV[14], 'leaseToken', ARGV[11],
+  'autoRecover', ARGV[15], 'allocations', allocationsJson)
+for index, allocation in ipairs(allocations) do
+  redis.call('XADD', KEYS[12], 'MAXLEN', '~', ARGV[17], '*',
+    'event', 'RESERVED', 'timestamp', ARGV[9], 'catalogId', ARGV[19],
+    'scopeId', ARGV[3], 'appId', ARGV[4], 'tenantId', ARGV[5],
+    'appType', ARGV[6], 'creditType', ARGV[7], 'requestId', ARGV[8],
+    'operation', ARGV[14], 'amount', allocation.amount, 'totalAmount', ARGV[1],
+    'planId', allocation.planId, 'planBalanceAfter', allocation.planBalanceAfter,
+    'allocationIndex', index - 1, 'allocationCount', #allocations,
+    'reservationId', ARGV[2], 'settlementMode', ARGV[13],
+    'autoRecover', ARGV[15], 'expiresAt', expiresAt, 'balanceAfter', finalBalance)
 end
-return {ARGV[2], remaining, expiresAt, 0, ARGV[12], ARGV[16]}
+if finalBalance <= tonumber(ARGV[16]) then
+  local lastPlanId = allocations[#allocations].planId
+  redis.call('XADD', KEYS[12], 'MAXLEN', '~', ARGV[17], '*',
+    'event', 'CRITICAL_BALANCE', 'timestamp', ARGV[9], 'catalogId', ARGV[19],
+    'scopeId', ARGV[3], 'appId', ARGV[4], 'tenantId', ARGV[5],
+    'appType', ARGV[6], 'creditType', ARGV[7], 'planId', lastPlanId,
+    'balance', finalBalance, 'threshold', ARGV[16])
+end
+return {ARGV[2], finalBalance, expiresAt, 0, ARGV[11], ARGV[15], allocationsJson}
 `;
 
 export const COMMIT_SCRIPT = `
@@ -64,42 +109,99 @@ if not status then return {-2} end
 if status == 'COMMITTED' then return {0} end
 if status ~= 'RESERVED' then return {-1} end
 local fields = redis.call('HMGET', KEYS[1], 'scopeId', 'appId', 'tenantId',
-  'appType', 'serviceId', 'creditType', 'amount', 'operation',
-  'remainingBalance')
+  'appType', 'creditType', 'amount', 'operation', 'remainingBalance', 'allocations')
+local allocations = cjson.decode(fields[9])
 redis.call('HSET', KEYS[1], 'status', 'COMMITTED', 'finalizedAt', ARGV[1],
   'finalizationReason', 'controller_succeeded')
 redis.call('ZREM', KEYS[2], ARGV[2])
 redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[3]))
 redis.call('PEXPIRE', KEYS[4], tonumber(ARGV[3]))
-redis.call('XADD', KEYS[3], 'MAXLEN', '~', ARGV[4], '*',
-  'event', 'COMMITTED', 'timestamp', ARGV[1], 'reservationId', ARGV[2],
-  'scopeId', fields[1], 'appId', fields[2], 'tenantId', fields[3],
-  'appType', fields[4], 'serviceId', fields[5], 'creditType', fields[6],
-  'amount', fields[7], 'operation', fields[8], 'balanceAfter', fields[9])
-return {1, fields[1], fields[2], fields[3], fields[4], fields[5], fields[6],
-  fields[7], fields[8], fields[9]}
+for index, allocation in ipairs(allocations) do
+  redis.call('XADD', KEYS[3], 'MAXLEN', '~', ARGV[4], '*',
+    'event', 'COMMITTED', 'timestamp', ARGV[1], 'catalogId', ARGV[5],
+    'reservationId', ARGV[2], 'scopeId', fields[1], 'appId', fields[2],
+    'tenantId', fields[3], 'appType', fields[4], 'creditType', fields[5],
+    'planId', allocation.planId, 'amount', allocation.amount,
+    'totalAmount', fields[6], 'allocationIndex', index - 1,
+    'allocationCount', #allocations, 'operation', fields[7],
+    'planBalanceAfter', allocation.planBalanceAfter, 'balanceAfter', fields[8])
+end
+return {1}
+`;
+
+const REFUND_TRANSITION = `
+local fields = redis.call('HMGET', KEYS[1], 'scopeId', 'appId', 'tenantId',
+  'appType', 'creditType', 'amount', 'operation', 'allocations')
+local allocations = cjson.decode(fields[8])
+local walletBalance = tonumber(redis.call('GET', KEYS[4]) or '0')
+local outcomes = {}
+local expiredPlans = {}
+for _, allocation in ipairs(allocations) do
+  local planId = allocation.planId
+  local current = tonumber(redis.call('HGET', KEYS[5], planId) or '0')
+  local planExpiresAt = tonumber(redis.call('HGET', KEYS[6], planId) or '0')
+  local planStatus = redis.call('HGET', KEYS[7], planId) or 'EXPIRED'
+  if planExpiresAt > tonumber(ARGV[2]) and planStatus ~= 'EXPIRED'
+      and planStatus ~= 'REVOKED' then
+    local after = current + tonumber(allocation.amount)
+    redis.call('HSET', KEYS[5], planId, after)
+    redis.call('HSET', KEYS[7], planId, 'ACTIVE')
+    redis.call('ZADD', KEYS[8], tonumber(redis.call('HGET', KEYS[9], planId)), planId)
+    local expirationMember = redis.call('HGET', KEYS[11], planId)
+    if expirationMember then redis.call('ZADD', KEYS[10], planExpiresAt, expirationMember) end
+    walletBalance = walletBalance + tonumber(allocation.amount)
+    table.insert(outcomes, {planId = planId, amount = tonumber(allocation.amount),
+      restoredAmount = tonumber(allocation.amount), expiredAmount = 0,
+      planBalanceAfter = after})
+  else
+    if current > 0 then
+      walletBalance = walletBalance - current
+      redis.call('HSET', KEYS[5], planId, 0)
+      table.insert(expiredPlans, {planId = planId, expiredAmount = current,
+        expiresAt = planExpiresAt})
+    end
+    redis.call('HSET', KEYS[7], planId, 'EXPIRED')
+    redis.call('ZREM', KEYS[8], planId)
+    local expirationMember = redis.call('HGET', KEYS[11], planId)
+    if expirationMember then redis.call('ZREM', KEYS[10], expirationMember) end
+    table.insert(outcomes, {planId = planId, amount = tonumber(allocation.amount),
+      restoredAmount = 0, expiredAmount = tonumber(allocation.amount),
+      planBalanceAfter = 0})
+  end
+end
+redis.call('SET', KEYS[4], walletBalance)
+redis.call('HSET', KEYS[1], 'status', ARGV[1], 'finalizedAt', ARGV[2],
+  'finalizationReason', ARGV[3], 'remainingBalance', walletBalance)
+redis.call('ZREM', KEYS[2], ARGV[4])
+redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[5]))
+redis.call('PEXPIRE', KEYS[12], tonumber(ARGV[5]))
+for _, expiredPlan in ipairs(expiredPlans) do
+  redis.call('XADD', KEYS[3], 'MAXLEN', '~', ARGV[6], '*',
+    'event', 'PLAN_EXPIRED', 'timestamp', ARGV[2], 'catalogId', ARGV[7],
+    'scopeId', fields[1], 'appId', fields[2], 'tenantId', fields[3],
+    'appType', fields[4], 'creditType', fields[5], 'planId', expiredPlan.planId,
+    'expiredAmount', expiredPlan.expiredAmount, 'expiresAt', expiredPlan.expiresAt,
+    'planBalanceAfter', 0, 'balanceAfter', walletBalance)
+end
+for index, outcome in ipairs(outcomes) do
+  redis.call('XADD', KEYS[3], 'MAXLEN', '~', ARGV[6], '*',
+    'event', ARGV[1], 'timestamp', ARGV[2], 'catalogId', ARGV[7],
+    'reservationId', ARGV[4], 'scopeId', fields[1], 'appId', fields[2],
+    'tenantId', fields[3], 'appType', fields[4], 'creditType', fields[5],
+    'planId', outcome.planId, 'amount', outcome.amount, 'totalAmount', fields[6],
+    'allocationIndex', index - 1, 'allocationCount', #outcomes,
+    'restoredAmount', outcome.restoredAmount, 'expiredAmount', outcome.expiredAmount,
+    'operation', fields[7], 'reason', ARGV[3],
+    'planBalanceAfter', outcome.planBalanceAfter, 'balanceAfter', walletBalance)
+end
+return {1, fields[1], fields[2], fields[3], fields[4], fields[5],
+  fields[6], fields[7], walletBalance, cjson.encode(outcomes)}
 `;
 
 export const ROLLBACK_SCRIPT = `
 local status = redis.call('HGET', KEYS[1], 'status')
 if not status or status ~= 'RESERVED' then return {0} end
-if redis.call('HGET', KEYS[1], 'balanceKey') ~= KEYS[4] then return {-2} end
-local fields = redis.call('HMGET', KEYS[1], 'scopeId', 'appId', 'tenantId',
-  'appType', 'serviceId', 'creditType', 'amount', 'operation')
-local remaining = redis.call('INCRBY', KEYS[4], fields[7])
-redis.call('HSET', KEYS[1], 'status', ARGV[1], 'finalizedAt', ARGV[2],
-  'finalizationReason', ARGV[3], 'remainingBalance', remaining)
-redis.call('ZREM', KEYS[2], ARGV[4])
-redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[5]))
-redis.call('PEXPIRE', KEYS[5], tonumber(ARGV[5]))
-redis.call('XADD', KEYS[3], 'MAXLEN', '~', ARGV[6], '*',
-  'event', ARGV[1], 'timestamp', ARGV[2], 'reservationId', ARGV[4],
-  'scopeId', fields[1], 'appId', fields[2], 'tenantId', fields[3],
-  'appType', fields[4], 'serviceId', fields[5], 'creditType', fields[6],
-  'amount', fields[7], 'operation', fields[8], 'reason', ARGV[3],
-  'balanceAfter', remaining)
-return {1, fields[1], fields[2], fields[3], fields[4], fields[5], fields[6],
-  fields[7], fields[8], remaining}
+${REFUND_TRANSITION}
 `;
 
 export const RENEW_SCRIPT = `
@@ -114,88 +216,139 @@ end
 return expiresAt
 `;
 
-export const FIND_EXPIRED_SCRIPT = `
-return redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1],
-  'LIMIT', 0, tonumber(ARGV[2]))
-`;
-
-export const REMOVE_EXPIRATION_SCRIPT = `
-return redis.call('ZREM', KEYS[1], ARGV[1])
-`;
+export const FIND_EXPIRED_SCRIPT = `return redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, tonumber(ARGV[2]))`;
+export const REMOVE_EXPIRATION_SCRIPT = `return redis.call('ZREM', KEYS[1], ARGV[1])`;
 
 export const RECOVER_SCRIPT = `
 if redis.call('HGET', KEYS[1], 'status') ~= 'RESERVED' then
-  redis.call('ZREM', KEYS[2], ARGV[2])
+  redis.call('ZREM', KEYS[2], ARGV[4])
   return {0}
 end
 if redis.call('HGET', KEYS[1], 'autoRecover') == '0' then
-  redis.call('ZREM', KEYS[2], ARGV[2])
+  redis.call('ZREM', KEYS[2], ARGV[4])
   return {0}
 end
 local expiresAt = tonumber(redis.call('HGET', KEYS[1], 'expiresAt') or '0')
-if expiresAt > tonumber(ARGV[1]) then return {0} end
-if redis.call('HGET', KEYS[1], 'balanceKey') ~= KEYS[4] then return {-2} end
-local fields = redis.call('HMGET', KEYS[1], 'scopeId', 'appId', 'tenantId',
-  'appType', 'serviceId', 'creditType', 'amount', 'operation')
-local remaining = redis.call('INCRBY', KEYS[4], fields[7])
-redis.call('HSET', KEYS[1], 'status', 'EXPIRED', 'finalizedAt', ARGV[1],
-  'finalizationReason', 'lease_expired', 'remainingBalance', remaining)
-redis.call('ZREM', KEYS[2], ARGV[2])
-redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[3]))
-redis.call('PEXPIRE', KEYS[5], tonumber(ARGV[3]))
-redis.call('XADD', KEYS[3], 'MAXLEN', '~', ARGV[4], '*',
-  'event', 'EXPIRED', 'timestamp', ARGV[1], 'reservationId', ARGV[2],
-  'scopeId', fields[1], 'appId', fields[2], 'tenantId', fields[3],
-  'appType', fields[4], 'serviceId', fields[5], 'creditType', fields[6],
-  'amount', fields[7], 'operation', fields[8], 'reason', 'lease_expired',
-  'balanceAfter', remaining)
-return {1, fields[1], fields[2], fields[3], fields[4], fields[5], fields[6],
-  fields[7], fields[8], remaining}
-`;
-
-export const ACQUIRE_LOCK_SCRIPT = `
-if redis.call('SET', KEYS[1], ARGV[1], 'NX', 'PX', ARGV[2])
-then return 1 else return 0 end
-`;
-
-export const INITIALIZE_BALANCE_SCRIPT = `
-if redis.call('GET', KEYS[1]) then return 0 end
-redis.call('SET', KEYS[1], ARGV[1])
-redis.call('XADD', KEYS[2], 'MAXLEN', '~', ARGV[11], '*',
-  'event', 'BALANCE_INITIALIZED', 'timestamp', ARGV[2], 'scopeId', ARGV[3],
-  'appId', ARGV[4], 'tenantId', ARGV[5], 'appType', ARGV[6],
-  'serviceId', ARGV[7], 'creditType', ARGV[8], 'balance', ARGV[1],
-  'source', ARGV[9], 'revision', ARGV[10])
-return 1
-`;
-
-export const RELEASE_LOCK_SCRIPT = `
-if redis.call('GET', KEYS[1]) == ARGV[1]
-then return redis.call('DEL', KEYS[1]) else return 0 end
+if expiresAt > tonumber(ARGV[2]) then return {0} end
+${REFUND_TRANSITION}
 `;
 
 export const GRANT_SCRIPT = `
-local existingAmount = redis.call('HGET', KEYS[2], 'amount')
-if existingAmount then
-  if existingAmount ~= ARGV[1] then return {-1} end
-  local currentBalance = redis.call('GET', KEYS[1])
-  if not currentBalance then return {-2} end
-  return {currentBalance, 1}
+local walletBalance = tonumber(redis.call('GET', KEYS[1]) or '0')
+local activePlanIds = redis.call('ZRANGE', KEYS[2], 0, -1)
+for _, activePlanId in ipairs(activePlanIds) do
+  local activeExpiresAt = tonumber(redis.call('HGET', KEYS[5], activePlanId) or '0')
+  if activeExpiresAt <= tonumber(ARGV[5]) then
+    local unused = tonumber(redis.call('HGET', KEYS[4], activePlanId) or '0')
+    walletBalance = walletBalance - unused
+    redis.call('HSET', KEYS[4], activePlanId, 0)
+    redis.call('HSET', KEYS[8], activePlanId, 'EXPIRED')
+    redis.call('ZREM', KEYS[2], activePlanId)
+    local activeMember = redis.call('HGET', KEYS[9], activePlanId)
+    if activeMember then redis.call('ZREM', KEYS[12], activeMember) end
+    redis.call('XADD', KEYS[13], 'MAXLEN', '~', ARGV[14], '*',
+      'event', 'PLAN_EXPIRED', 'timestamp', ARGV[5], 'catalogId', ARGV[16],
+      'scopeId', ARGV[6], 'appId', ARGV[7], 'tenantId', ARGV[8],
+      'appType', ARGV[9], 'creditType', ARGV[10], 'planId', activePlanId,
+      'expiredAmount', unused, 'expiresAt', activeExpiresAt,
+      'planBalanceAfter', 0, 'balanceAfter', walletBalance)
+  end
 end
-if not redis.call('GET', KEYS[1]) then return {-2} end
-local balance = redis.call('INCRBY', KEYS[1], ARGV[1])
-redis.call('HSET', KEYS[2], 'amount', ARGV[1], 'balance', balance)
-redis.call('PEXPIRE', KEYS[2], tonumber(ARGV[11]))
-redis.call('XADD', KEYS[3], 'MAXLEN', '~', ARGV[12], '*',
-  'event', 'CREDIT_GRANTED', 'timestamp', ARGV[2], 'scopeId', ARGV[3],
-  'appId', ARGV[4], 'tenantId', ARGV[5], 'appType', ARGV[6],
-  'serviceId', ARGV[7], 'creditType', ARGV[8], 'referenceId', ARGV[9],
-  'reason', ARGV[10], 'amount', ARGV[1], 'balanceAfter', balance)
-return {balance, 0}
+redis.call('SET', KEYS[1], walletBalance)
+local existingAmount = redis.call('HGET', KEYS[3], ARGV[1])
+if existingAmount then
+  if existingAmount ~= ARGV[2]
+    or redis.call('HGET', KEYS[5], ARGV[1]) ~= ARGV[4]
+    or redis.call('HGET', KEYS[6], ARGV[1]) ~= ARGV[3]
+    or redis.call('HGET', KEYS[7], ARGV[1]) ~= ARGV[11] then return {-1} end
+  return {redis.call('GET', KEYS[1]) or 0,
+    redis.call('HGET', KEYS[4], ARGV[1]) or 0, 1}
+end
+local ownerScope = redis.call('HGET', KEYS[10], 'scopeId')
+if ownerScope and ownerScope ~= ARGV[6] then return {-6} end
+local referencePlan = redis.call('HGET', KEYS[11], 'planId')
+local referenceScope = redis.call('HGET', KEYS[11], 'scopeId')
+if referencePlan and (referencePlan ~= ARGV[1] or referenceScope ~= ARGV[6]) then return {-2} end
+if referencePlan and not existingAmount then return {-7} end
+if tonumber(ARGV[4]) <= tonumber(ARGV[5]) then return {-5} end
+if tonumber(redis.call('ZCARD', KEYS[2])) >= tonumber(ARGV[15]) then return {-3} end
+local currentBalance = tonumber(redis.call('GET', KEYS[1]) or '0')
+if currentBalance > 9007199254740991 - tonumber(ARGV[2]) then return {-4} end
+local balance = redis.call('INCRBY', KEYS[1], ARGV[2])
+redis.call('ZADD', KEYS[2], ARGV[3], ARGV[1])
+redis.call('HSET', KEYS[3], ARGV[1], ARGV[2])
+redis.call('HSET', KEYS[4], ARGV[1], ARGV[2])
+redis.call('HSET', KEYS[5], ARGV[1], ARGV[4])
+redis.call('HSET', KEYS[6], ARGV[1], ARGV[3])
+redis.call('HSET', KEYS[7], ARGV[1], ARGV[11])
+redis.call('HSET', KEYS[8], ARGV[1], 'ACTIVE')
+redis.call('HSET', KEYS[9], ARGV[1], ARGV[17])
+redis.call('HSET', KEYS[10], 'scopeId', ARGV[6], 'referenceId', ARGV[11])
+redis.call('HSET', KEYS[11], 'planId', ARGV[1], 'scopeId', ARGV[6],
+  'amount', ARGV[2], 'grantedAt', ARGV[3], 'expiresAt', ARGV[4])
+redis.call('ZADD', KEYS[12], ARGV[4], ARGV[17])
+redis.call('XADD', KEYS[13], 'MAXLEN', '~', ARGV[14], '*',
+  'event', 'CREDIT_GRANTED', 'timestamp', ARGV[5], 'catalogId', ARGV[16],
+  'scopeId', ARGV[6], 'appId', ARGV[7], 'tenantId', ARGV[8],
+  'appType', ARGV[9], 'creditType', ARGV[10], 'planId', ARGV[1],
+  'referenceId', ARGV[11], 'reason', ARGV[12], 'amount', ARGV[2],
+  'grantedAt', ARGV[3], 'expiresAt', ARGV[4],
+  'planBalanceAfter', ARGV[2], 'balanceAfter', balance)
+return {balance, ARGV[2], 0}
 `;
 
-/** Fetches a reservation hash as a flat field/value array. */
+export const FIND_EXPIRED_PLANS_SCRIPT = `return redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, tonumber(ARGV[2]))`;
+
+export const EXPIRE_PLAN_SCRIPT = `
+local planExpiresAt = tonumber(redis.call('HGET', KEYS[4], ARGV[2]) or '0')
+if planExpiresAt == 0 then redis.call('ZREM', KEYS[6], ARGV[3]); return {0} end
+if planExpiresAt > tonumber(ARGV[1]) then return {0} end
+local status = redis.call('HGET', KEYS[5], ARGV[2])
+if status == 'EXPIRED' or status == 'REVOKED' then
+  redis.call('ZREM', KEYS[6], ARGV[3]); return {0}
+end
+local unused = tonumber(redis.call('HGET', KEYS[3], ARGV[2]) or '0')
+local balance = tonumber(redis.call('GET', KEYS[1]) or '0') - unused
+redis.call('SET', KEYS[1], balance)
+redis.call('HSET', KEYS[3], ARGV[2], 0)
+redis.call('HSET', KEYS[5], ARGV[2], 'EXPIRED')
+redis.call('ZREM', KEYS[2], ARGV[2])
+redis.call('ZREM', KEYS[6], ARGV[3])
+redis.call('XADD', KEYS[8], 'MAXLEN', '~', ARGV[10], '*',
+  'event', 'PLAN_EXPIRED', 'timestamp', ARGV[1], 'catalogId', ARGV[4],
+  'scopeId', ARGV[5], 'appId', ARGV[6], 'tenantId', ARGV[7],
+  'appType', ARGV[8], 'creditType', ARGV[9], 'planId', ARGV[2],
+  'expiredAmount', unused, 'expiresAt', planExpiresAt,
+  'planBalanceAfter', 0, 'balanceAfter', balance)
+return {1, unused, balance}
+`;
+
 export const GET_RESERVATION_SCRIPT = `return redis.call('HGETALL', KEYS[1])`;
 
-/** Returns nil for an uninitialized wallet instead of conflating it with zero. */
-export const GET_BALANCE_SCRIPT = `return redis.call('GET', KEYS[1])`;
+export const GET_BALANCE_SCRIPT = `
+if redis.call('HLEN', KEYS[1]) == 0 then return false end
+local total = 0
+local planIds = redis.call('ZRANGE', KEYS[2], 0, -1)
+for _, planId in ipairs(planIds) do
+  if tonumber(redis.call('HGET', KEYS[4], planId) or '0') > tonumber(ARGV[1]) then
+    total = total + tonumber(redis.call('HGET', KEYS[3], planId) or '0')
+  end
+end
+return total
+`;
+
+export const GET_PLANS_SCRIPT = `
+local plans = {}
+local planIds = redis.call('HKEYS', KEYS[1])
+if #planIds == 0 then return '[]' end
+for _, planId in ipairs(planIds) do
+  table.insert(plans, {planId = planId,
+    grantedAmount = tonumber(redis.call('HGET', KEYS[1], planId)),
+    availableAmount = tonumber(redis.call('HGET', KEYS[2], planId) or '0'),
+    expiresAt = tonumber(redis.call('HGET', KEYS[3], planId) or '0'),
+    grantedAt = tonumber(redis.call('HGET', KEYS[4], planId) or '0'),
+    referenceId = redis.call('HGET', KEYS[5], planId) or '',
+    status = redis.call('HGET', KEYS[6], planId) or 'EXPIRED'})
+end
+return cjson.encode(plans)
+`;

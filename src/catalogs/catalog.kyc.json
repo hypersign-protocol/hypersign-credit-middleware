@@ -1,5 +1,5 @@
 {
-  "serviceId": "KYC",
+  "catalogId": "KYC",
   "version": "3.20.0",
   "globalPrefix": "api",
   "versioning": "URI",

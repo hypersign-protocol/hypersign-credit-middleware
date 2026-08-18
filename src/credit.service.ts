@@ -4,18 +4,19 @@ import {
   HttpStatus,
   Inject,
   Injectable,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
 import {
-  ACQUIRE_LOCK_SCRIPT,
   COMMIT_SCRIPT,
+  EXPIRE_PLAN_SCRIPT,
+  FIND_EXPIRED_PLANS_SCRIPT,
   FIND_EXPIRED_SCRIPT,
   GET_BALANCE_SCRIPT,
+  GET_PLANS_SCRIPT,
   GET_RESERVATION_SCRIPT,
   GRANT_SCRIPT,
-  INITIALIZE_BALANCE_SCRIPT,
   RECOVER_SCRIPT,
-  RELEASE_LOCK_SCRIPT,
   REMOVE_EXPIRATION_SCRIPT,
   RENEW_SCRIPT,
   RESERVE_SCRIPT,
@@ -25,6 +26,9 @@ import { CreditKeyspace } from './credit-keyspace';
 import {
   CREDIT_OPTIONS,
   CREDIT_REDIS_CLIENT,
+  CreditPlan,
+  CreditPlanAllocation,
+  CreditPlanStatus,
   CreditRedisClient,
   CreditReservation,
   CreditReservationStatus,
@@ -40,18 +44,21 @@ export class InsufficientCreditsException extends HttpException {
   constructor() { super('Insufficient credits', HttpStatus.PAYMENT_REQUIRED); }
 }
 
-export class CreditBalanceInitializationException extends HttpException {
-  constructor() {
-    super('Credit balance initialization is already in progress', HttpStatus.SERVICE_UNAVAILABLE);
-  }
-}
-
-export interface RecoveredReservation extends CreditSubject {
+export interface RecoveredReservation {
   subject: CreditSubject;
   scopeId: string;
   reservationId: string;
   amount: number;
   operation?: string;
+  balanceAfter: number;
+  allocations: CreditPlanAllocation[];
+}
+
+export interface ExpiredCreditPlan {
+  subject: CreditSubject;
+  scopeId: string;
+  planId: string;
+  expiredAmount: number;
   balanceAfter: number;
 }
 
@@ -68,18 +75,12 @@ export class CreditService {
 
   async reserve(input: ReserveCreditInput): Promise<ReserveCreditResult> {
     const subject = this.keys.subject(input.subject);
-    if (!Number.isSafeInteger(input.amount) || input.amount <= 0) {
-      throw new TypeError('amount must be a positive safe integer');
-    }
+    positiveInteger(input.amount, 'amount');
     const settlementMode = input.settlementMode ?? 'IMMEDIATE';
     if (input.autoRecover === false && settlementMode !== 'DEFERRED') {
       throw new TypeError('autoRecover can be disabled only for DEFERRED reservations');
     }
-    // Resolve configuration before mutating Redis. A bad dynamic threshold
-    // must not leave a reservation behind when reserve() throws.
     const threshold = this.resolveThreshold(subject);
-    await this.initializeBalanceIfMissing(subject);
-
     const reservationId = randomUUID();
     const leaseToken = randomUUID();
     const requestId = input.requestId?.trim() || randomUUID();
@@ -89,11 +90,18 @@ export class CreditService {
     const autoRecover = input.autoRecover ?? true;
     const result = await this.redis.eval(
       RESERVE_SCRIPT,
-      5,
+      12,
       this.keys.balance(subject),
+      this.keys.planOrder(subject),
+      this.keys.planRemaining(subject),
+      this.keys.planExpires(subject),
+      this.keys.planStatuses(subject),
+      this.keys.planGrantedAt(subject),
+      this.keys.planExpirationMembers(subject),
       this.keys.reservation(reservationId),
       this.keys.request(subject, requestId),
       this.keys.expirations(),
+      this.keys.planExpirations(),
       this.keys.eventStream(),
       input.amount,
       reservationId,
@@ -101,7 +109,6 @@ export class CreditService {
       subject.appId,
       subject.tenantId ?? '',
       subject.appType ?? '',
-      subject.serviceId ?? '',
       subject.creditType ?? '',
       requestId,
       now,
@@ -113,6 +120,8 @@ export class CreditService {
       autoRecover ? '1' : '0',
       threshold,
       this.options.eventStreamMaxLength,
+      this.options.maxPlanAllocationsPerReservation,
+      this.options.catalog.catalogId,
     ) as Array<string | number>;
 
     if (!Array.isArray(result)) throw new Error(`Unexpected Redis reserve result: ${String(result)}`);
@@ -120,71 +129,111 @@ export class CreditService {
     if (Number(result[0]) === -2) {
       throw new BadRequestException('requestId was reused with different credit semantics');
     }
-    if (Number(result[0]) === -3) {
-      throw new Error('Scoped credit balance disappeared during reservation');
+    if (Number(result[0]) === -4) {
+      throw new ServiceUnavailableException(
+        'Credit cost spans more plans than maxPlanAllocationsPerReservation',
+      );
     }
-    if (result.length !== 6) throw new Error(`Unexpected Redis reserve result: ${String(result)}`);
-
-    const remainingBalance = Number(result[1]);
-    const expiresAt = Number(result[2]);
-    const existing = Number(result[3]) === 1;
+    if (result.length !== 7) throw new Error(`Unexpected Redis reserve result: ${String(result)}`);
+    const allocations = parseAllocations(String(result[6]));
     const storedAutoRecover = String(result[5]) !== '0';
     return {
       reservationId: String(result[0]),
       leaseToken: String(result[4]),
       scopeId,
-      remainingBalance,
-      expiresAt,
+      remainingBalance: safeNonNegative(result[1], 'remainingBalance'),
+      expiresAt: safePositive(result[2], 'expiresAt'),
       autoRecover: storedAutoRecover,
-      existing,
+      existing: Number(result[3]) === 1,
       settlementMode,
       subject,
+      allocations,
     };
   }
 
-  /** Atomically and idempotently tops up one scoped wallet. */
+  /** Atomically creates one immutable recharge plan. */
   async grant(input: GrantCreditsInput): Promise<GrantCreditsResult> {
     const subject = this.keys.subject(input.subject);
-    if (!Number.isSafeInteger(input.amount) || input.amount <= 0) {
-      throw new TypeError('grant amount must be a positive safe integer');
-    }
-    const referenceId = input.referenceId?.trim();
-    if (!referenceId) throw new TypeError('referenceId is required');
-    await this.initializeBalanceIfMissing(subject);
+    const planId = identifier(input.planId, 'planId');
+    const referenceId = identifier(input.referenceId, 'referenceId');
+    positiveInteger(input.amount, 'grant amount');
+    positiveInteger(input.grantedAt, 'grantedAt');
+    positiveInteger(input.expiresAt, 'expiresAt');
     const now = Date.now();
+    if (input.grantedAt > now) throw new TypeError('grantedAt cannot be in the future');
+    if (input.expiresAt <= input.grantedAt) {
+      throw new TypeError('expiresAt must be later than grantedAt');
+    }
     const scopeId = this.keys.scopeId(subject);
+    const expirationMember = this.keys.planExpirationMember(subject, planId);
     const result = await this.redis.eval(
       GRANT_SCRIPT,
-      3,
+      13,
       this.keys.balance(subject),
-      this.keys.grant(subject, referenceId),
+      this.keys.planOrder(subject),
+      this.keys.planAmounts(subject),
+      this.keys.planRemaining(subject),
+      this.keys.planExpires(subject),
+      this.keys.planGrantedAt(subject),
+      this.keys.planReferences(subject),
+      this.keys.planStatuses(subject),
+      this.keys.planExpirationMembers(subject),
+      this.keys.planOwner(planId),
+      this.keys.grant(referenceId),
+      this.keys.planExpirations(),
       this.keys.eventStream(),
+      planId,
       input.amount,
+      input.grantedAt,
+      input.expiresAt,
       now,
       scopeId,
       subject.appId,
       subject.tenantId ?? '',
       subject.appType ?? '',
-      subject.serviceId ?? '',
       subject.creditType ?? '',
       referenceId,
       input.reason ?? '',
       this.options.retentionMs,
       this.options.eventStreamMaxLength,
+      this.options.maxActivePlans,
+      this.options.catalog.catalogId,
+      expirationMember,
     ) as Array<string | number>;
     if (Number(result[0]) === -1) {
-      throw new BadRequestException('referenceId was reused with a different grant amount');
+      throw new BadRequestException('planId was reused with different grant semantics');
     }
-    if (Number(result[0]) === -2) throw new Error('Scoped balance disappeared during grant');
-    const balance = Number(result[0]);
-    const existing = Number(result[1]) === 1;
-    return { balance, existing, subject };
+    if (Number(result[0]) === -2) {
+      throw new BadRequestException('referenceId is already assigned to another plan');
+    }
+    if (Number(result[0]) === -3) {
+      throw new ServiceUnavailableException('Wallet reached maxActivePlans');
+    }
+    if (Number(result[0]) === -4) {
+      throw new BadRequestException('Grant would exceed the safe integer balance limit');
+    }
+    if (Number(result[0]) === -5) {
+      throw new BadRequestException('A new plan cannot already be expired');
+    }
+    if (Number(result[0]) === -6) {
+      throw new BadRequestException('planId is already owned by another wallet');
+    }
+    if (Number(result[0]) === -7) {
+      throw new Error('Grant reference exists but its plan state is missing');
+    }
+    return {
+      planId,
+      balance: safeNonNegative(result[0], 'balance'),
+      planBalance: safeNonNegative(result[1], 'planBalance'),
+      expiresAt: input.expiresAt,
+      existing: Number(result[2]) === 1,
+      subject,
+    };
   }
 
   async commit(reservationId: string): Promise<boolean> {
     const reservation = await this.getReservation(reservationId);
     if (!reservation) return false;
-    const now = Date.now();
     const result = await this.redis.eval(
       COMMIT_SCRIPT,
       4,
@@ -192,14 +241,13 @@ export class CreditService {
       this.keys.expirations(),
       this.keys.eventStream(),
       this.keys.request(reservation.subject, reservation.requestId!),
-      now,
+      Date.now(),
       reservationId,
       this.options.retentionMs,
       this.options.eventStreamMaxLength,
+      this.options.catalog.catalogId,
     ) as Array<string | number>;
-    if (Number(result[0]) !== 1) return false;
-    this.parseFinalizationResult(result, true);
-    return true;
+    return Number(result[0]) === 1;
   }
 
   async rollback(reservationId: string, reason = 'controller_failed'): Promise<boolean> {
@@ -234,43 +282,79 @@ export class CreditService {
     for (const reservationId of ids) {
       const reservation = await this.getReservation(reservationId);
       if (!reservation) {
-        // A reservation hash may be absent after manual Redis maintenance,
-        // eviction, or retention misconfiguration. Remove the dangling member
-        // so it cannot permanently occupy every recovery batch.
-        await this.redis.eval(
-          REMOVE_EXPIRATION_SCRIPT,
-          1,
-          this.keys.expirations(),
-          reservationId,
-        );
+        await this.redis.eval(REMOVE_EXPIRATION_SCRIPT, 1, this.keys.expirations(), reservationId);
         continue;
       }
-      const result = await this.redis.eval(
-        RECOVER_SCRIPT,
-        5,
-        this.keys.reservation(reservationId),
-        this.keys.expirations(),
-        this.keys.eventStream(),
-        this.keys.balance(reservation.subject),
-        this.keys.request(reservation.subject, reservation.requestId!),
+      const result = await this.refundResult(
+        reservation,
+        'EXPIRED',
+        'lease_expired',
         now,
-        reservationId,
-        this.options.retentionMs,
-        this.options.eventStreamMaxLength,
-      ) as Array<string | number>;
-      if (Number(result[0]) !== 1) continue;
-      const parsed = this.parseFinalizationResult(result, true);
+        RECOVER_SCRIPT,
+      );
+      if (!result) continue;
       recovered.push({
-        ...parsed.subject,
-        subject: parsed.subject,
-        scopeId: parsed.scopeId,
+        subject: reservation.subject,
+        scopeId: reservation.scopeId,
         reservationId,
-        amount: parsed.amount,
-        operation: parsed.operation,
-        balanceAfter: parsed.balanceAfter!,
+        amount: reservation.amount,
+        operation: reservation.operation,
+        balanceAfter: result.balanceAfter,
+        allocations: result.allocations,
       });
     }
     return recovered;
+  }
+
+  async recoverExpiredPlans(now = Date.now()): Promise<ExpiredCreditPlan[]> {
+    const members = await this.redis.eval(
+      FIND_EXPIRED_PLANS_SCRIPT,
+      1,
+      this.keys.planExpirations(),
+      now,
+      this.options.recoveryBatchSize,
+    ) as string[];
+    const expired: ExpiredCreditPlan[] = [];
+    for (const member of members) {
+      const decoded = decodeExpirationMember(member);
+      if (!decoded) {
+        await this.redis.eval(REMOVE_EXPIRATION_SCRIPT, 1, this.keys.planExpirations(), member);
+        continue;
+      }
+      const { subject, planId } = decoded;
+      const scopeId = this.keys.scopeId(subject);
+      const result = await this.redis.eval(
+        EXPIRE_PLAN_SCRIPT,
+        8,
+        this.keys.balance(subject),
+        this.keys.planOrder(subject),
+        this.keys.planRemaining(subject),
+        this.keys.planExpires(subject),
+        this.keys.planStatuses(subject),
+        this.keys.planExpirations(),
+        this.keys.planExpirationMembers(subject),
+        this.keys.eventStream(),
+        now,
+        planId,
+        member,
+        this.options.catalog.catalogId,
+        scopeId,
+        subject.appId,
+        subject.tenantId ?? '',
+        subject.appType ?? '',
+        subject.creditType ?? '',
+        this.options.eventStreamMaxLength,
+      ) as Array<string | number>;
+      if (Number(result[0]) !== 1) continue;
+      expired.push({
+        subject,
+        scopeId,
+        planId,
+        expiredAmount: safeNonNegative(result[1], 'expiredAmount'),
+        balanceAfter: safeNonNegative(result[2], 'balanceAfter'),
+      });
+    }
+    return expired;
   }
 
   async getReservation(reservationId: string): Promise<CreditReservation | null> {
@@ -280,22 +364,16 @@ export class CreditService {
       this.keys.reservation(reservationId),
     ) as string[];
     if (!result.length) return null;
-    const data: Record<string, string> = {};
-    for (let index = 0; index < result.length; index += 2) {
-      data[result[index]] = result[index + 1];
-    }
+    const data = pairs(result);
     const subject = this.keys.subject({
       appId: data.appId,
       tenantId: data.tenantId || undefined,
       appType: data.appType || undefined,
-      serviceId: data.serviceId || undefined,
       creditType: data.creditType || undefined,
     });
     const expectedScopeId = this.keys.scopeId(subject);
     if (data.scopeId !== expectedScopeId) {
-      throw new Error(
-        `Redis reservation scope mismatch: expected ${expectedScopeId}, received ${data.scopeId}`,
-      );
+      throw new Error(`Redis reservation scope mismatch: expected ${expectedScopeId}, received ${data.scopeId}`);
     }
     return {
       ...subject,
@@ -303,25 +381,68 @@ export class CreditService {
       reservationId: data.reservationId,
       scopeId: data.scopeId,
       requestId: data.requestId || undefined,
-      amount: Number(data.amount),
-      remainingBalance: Number(data.remainingBalance),
-      status: data.status as CreditReservationStatus,
-      createdAt: Number(data.createdAt),
-      expiresAt: Number(data.expiresAt),
+      amount: safePositive(data.amount, 'reservation amount'),
+      remainingBalance: safeNonNegative(data.remainingBalance, 'remainingBalance'),
+      status: reservationStatus(data.status),
+      createdAt: safePositive(data.createdAt, 'createdAt'),
+      expiresAt: safePositive(data.expiresAt, 'expiresAt'),
       autoRecover: data.autoRecover !== '0',
-      finalizedAt: data.finalizedAt ? Number(data.finalizedAt) : undefined,
+      finalizedAt: data.finalizedAt ? safePositive(data.finalizedAt, 'finalizedAt') : undefined,
       finalizationReason: data.finalizationReason,
-      settlementMode: data.settlementMode as CreditReservation['settlementMode'],
+      settlementMode: settlementMode(data.settlementMode),
       operation: data.operation || undefined,
-      version: Number(data.version),
+      version: safePositive(data.version, 'version'),
+      allocations: parseAllocations(data.allocations),
     };
   }
 
-  /** Returns null when this scoped wallet has never been initialized. */
+  /** Returns null when no plan has ever been granted to this wallet. */
   async getBalance(subjectInput: CreditSubject): Promise<number | null> {
     const subject = this.keys.subject(subjectInput);
-    const raw = await this.redis.eval(GET_BALANCE_SCRIPT, 1, this.keys.balance(subject));
-    return raw === null || raw === false ? null : Number(raw);
+    const raw = await this.redis.eval(
+      GET_BALANCE_SCRIPT,
+      4,
+      this.keys.planAmounts(subject),
+      this.keys.planOrder(subject),
+      this.keys.planRemaining(subject),
+      this.keys.planExpires(subject),
+      Date.now(),
+    );
+    return raw === null || raw === false ? null : safeNonNegative(raw, 'balance');
+  }
+
+  async getPlans(subjectInput: CreditSubject): Promise<CreditPlan[]> {
+    const subject = this.keys.subject(subjectInput);
+    const raw = await this.redis.eval(
+      GET_PLANS_SCRIPT,
+      6,
+      this.keys.planAmounts(subject),
+      this.keys.planRemaining(subject),
+      this.keys.planExpires(subject),
+      this.keys.planGrantedAt(subject),
+      this.keys.planReferences(subject),
+      this.keys.planStatuses(subject),
+    );
+    const parsed = JSON.parse(String(raw)) as Array<Record<string, unknown>>;
+    const now = Date.now();
+    return parsed.map((plan) => {
+      const expiresAt = safePositive(plan.expiresAt, 'plan.expiresAt');
+      const status = expiresAt <= now ? 'EXPIRED' : planStatus(plan.status);
+      return {
+        planId: identifier(plan.planId, 'plan.planId'),
+        subject,
+        scopeId: this.keys.scopeId(subject),
+        grantedAmount: safePositive(plan.grantedAmount, 'plan.grantedAmount'),
+        availableAmount: status === 'EXPIRED'
+          ? 0
+          : safeNonNegative(plan.availableAmount, 'plan.availableAmount'),
+        grantedAt: safePositive(plan.grantedAt, 'plan.grantedAt'),
+        expiresAt,
+        referenceId: identifier(plan.referenceId, 'plan.referenceId'),
+        status,
+      };
+    }).sort((left, right) =>
+      left.grantedAt - right.grantedAt || left.planId.localeCompare(right.planId));
   }
 
   private async refund(
@@ -332,77 +453,50 @@ export class CreditService {
   ): Promise<boolean> {
     const reservation = await this.getReservation(reservationId);
     if (!reservation) return false;
+    return Boolean(await this.refundResult(reservation, status, reason, now, ROLLBACK_SCRIPT));
+  }
+
+  private async refundResult(
+    reservation: CreditReservation,
+    status: 'ROLLED_BACK' | 'EXPIRED',
+    reason: string,
+    now: number,
+    script: string,
+  ): Promise<{ balanceAfter: number; allocations: CreditPlanAllocation[] } | null> {
+    const subject = reservation.subject;
     const result = await this.redis.eval(
-      ROLLBACK_SCRIPT,
-      5,
-      this.keys.reservation(reservationId),
+      script,
+      12,
+      this.keys.reservation(reservation.reservationId),
       this.keys.expirations(),
       this.keys.eventStream(),
-      this.keys.balance(reservation.subject),
-      this.keys.request(reservation.subject, reservation.requestId!),
+      this.keys.balance(subject),
+      this.keys.planRemaining(subject),
+      this.keys.planExpires(subject),
+      this.keys.planStatuses(subject),
+      this.keys.planOrder(subject),
+      this.keys.planGrantedAt(subject),
+      this.keys.planExpirations(),
+      this.keys.planExpirationMembers(subject),
+      this.keys.request(subject, reservation.requestId!),
       status,
       now,
       reason,
-      reservationId,
+      reservation.reservationId,
       this.options.retentionMs,
       this.options.eventStreamMaxLength,
+      this.options.catalog.catalogId,
     ) as Array<string | number>;
-    if (Number(result[0]) !== 1) return false;
-    this.parseFinalizationResult(result, true);
-    return true;
-  }
-
-  private async initializeBalanceIfMissing(subject: CreditSubject): Promise<void> {
-    if (await this.getBalance(subject) !== null) return;
-    const provider = this.options.balanceProvider;
-    if (!provider) {
-      throw new Error(`Credit balance is not initialized for ${this.keys.scopeId(subject)}`);
-    }
-    const lockToken = randomUUID();
-    const acquired = Number(await this.redis.eval(
-      ACQUIRE_LOCK_SCRIPT,
-      1,
-      this.keys.initializationLock(subject),
-      lockToken,
-      this.options.initializationLockMs,
-    )) === 1;
-    if (!acquired) throw new CreditBalanceInitializationException();
-
-    try {
-      if (await this.getBalance(subject) !== null) return;
-      const snapshot = await provider.getBalance(subject);
-      if (!Number.isSafeInteger(snapshot.balance) || snapshot.balance < 0) {
-        throw new Error('Credit balance provider returned an invalid balance');
-      }
-      const now = Date.now();
-      const initialized = Number(await this.redis.eval(
-        INITIALIZE_BALANCE_SCRIPT,
-        2,
-        this.keys.balance(subject),
-        this.keys.eventStream(),
-        snapshot.balance,
-        now,
-        this.keys.scopeId(subject),
-        subject.appId,
-        subject.tenantId ?? '',
-        subject.appType ?? '',
-        subject.serviceId ?? '',
-        subject.creditType ?? '',
-        snapshot.source ?? '',
-        snapshot.revision ?? '',
-        this.options.eventStreamMaxLength,
-      ));
-      if (initialized !== 0 && initialized !== 1) {
-        throw new Error(`Unexpected Redis balance initialization result: ${initialized}`);
-      }
-    } finally {
-      await this.redis.eval(
-        RELEASE_LOCK_SCRIPT,
-        1,
-        this.keys.initializationLock(subject),
-        lockToken,
-      );
-    }
+    if (Number(result[0]) !== 1) return null;
+    const outcomes = JSON.parse(String(result[9])) as Array<Record<string, unknown>>;
+    return {
+      balanceAfter: safeNonNegative(result[8], 'balanceAfter'),
+      allocations: outcomes.map((value) => ({
+        planId: identifier(value.planId, 'allocation.planId'),
+        amount: safePositive(value.amount, 'allocation.amount'),
+        planBalanceAfter: safeNonNegative(value.planBalanceAfter, 'allocation.planBalanceAfter'),
+      })),
+    };
   }
 
   private resolveThreshold(subject: CreditSubject): number {
@@ -413,62 +507,103 @@ export class CreditService {
     }
     return threshold;
   }
+}
 
-  private parseFinalizationResult(
-    result: Array<string | number>,
-    includesBalanceAfter: boolean,
-  ) {
-    const expectedLength = includesBalanceAfter ? 10 : 9;
-    if (result.length !== expectedLength) {
-      throw new Error(
-        `Unexpected Redis finalization result: expected ${expectedLength} fields, ` +
-        `received ${result.length}`,
-      );
-    }
-    const subject = this.keys.subject({
-      appId: String(result[2]),
-      tenantId: result[3] ? String(result[3]) : undefined,
-      appType: result[4] ? String(result[4]) : undefined,
-      serviceId: result[5] ? String(result[5]) : undefined,
-      creditType: result[6] ? String(result[6]) : undefined,
-    });
-    const scopeId = String(result[1]);
-    const expectedScopeId = this.keys.scopeId(subject);
-    if (scopeId !== expectedScopeId) {
-      throw new Error(
-        `Redis finalization scope mismatch: expected ${expectedScopeId}, received ${scopeId}`,
-      );
-    }
-    const amount = Number(result[7]);
-    if (!Number.isSafeInteger(amount) || amount <= 0) {
-      throw new Error(`Redis finalization returned an invalid amount: ${String(result[7])}`);
-    }
-    const balanceAfter = includesBalanceAfter ? Number(result[9]) : undefined;
-    if (includesBalanceAfter &&
-        (!Number.isSafeInteger(balanceAfter) || balanceAfter! < 0)) {
-      throw new Error(
-        `Redis finalization returned an invalid balanceAfter: ${String(result[9])}`,
-      );
-    }
-    return {
-      scopeId,
-      subject,
-      amount,
-      operation: result[8] ? String(result[8]) : undefined,
-      balanceAfter,
-    };
+function parseAllocations(raw: string): CreditPlanAllocation[] {
+  let value: unknown;
+  try { value = JSON.parse(raw); } catch { throw new Error('Redis returned invalid allocations JSON'); }
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new Error('Redis reservation must contain at least one plan allocation');
   }
+  return value.map((allocation) => {
+    if (!allocation || typeof allocation !== 'object') throw new Error('Invalid plan allocation');
+    const entry = allocation as Record<string, unknown>;
+    return {
+      planId: identifier(entry.planId, 'allocation.planId'),
+      amount: safePositive(entry.amount, 'allocation.amount'),
+      planBalanceAfter: safeNonNegative(entry.planBalanceAfter, 'allocation.planBalanceAfter'),
+    };
+  });
+}
+
+function decodeExpirationMember(value: string): { subject: CreditSubject; planId: string } | null {
+  try {
+    const decoded = JSON.parse(value) as unknown;
+    if (!Array.isArray(decoded) || decoded.length !== 5) return null;
+    const [appId, tenantId, appType, creditType, planId] = decoded;
+    if (typeof appId !== 'string' || typeof planId !== 'string') return null;
+    return {
+      subject: {
+        appId,
+        tenantId: typeof tenantId === 'string' && tenantId ? tenantId : undefined,
+        appType: typeof appType === 'string' && appType ? appType : undefined,
+        creditType: typeof creditType === 'string' && creditType ? creditType : undefined,
+      },
+      planId: identifier(planId, 'planId'),
+    };
+  } catch { return null; }
+}
+
+function pairs(values: string[]): Record<string, string> {
+  const result: Record<string, string> = {};
+  for (let index = 0; index < values.length; index += 2) result[values[index]] = values[index + 1];
+  return result;
+}
+
+function identifier(value: unknown, field: string): string {
+  if (typeof value !== 'string' || !value.trim()) throw new TypeError(`${field} is required`);
+  const result = value.trim();
+  if (/\p{Cc}/u.test(result)) throw new TypeError(`${field} cannot contain control characters`);
+  return result;
+}
+
+function positiveInteger(value: unknown, field: string): number {
+  if (!Number.isSafeInteger(value) || Number(value) <= 0) {
+    throw new TypeError(`${field} must be a positive safe integer`);
+  }
+  return Number(value);
+}
+
+function safePositive(value: unknown, field: string): number {
+  return positiveInteger(Number(value), field);
+}
+
+function safeNonNegative(value: unknown, field: string): number {
+  const result = Number(value);
+  if (!Number.isSafeInteger(result) || result < 0) {
+    throw new Error(`${field} must be a non-negative safe integer`);
+  }
+  return result;
+}
+
+function planStatus(value: unknown): CreditPlanStatus {
+  if (value === 'ACTIVE' || value === 'DEPLETED' || value === 'EXPIRED' || value === 'REVOKED') {
+    return value;
+  }
+  throw new Error(`Redis returned invalid plan status: ${String(value)}`);
+}
+
+function reservationStatus(value: unknown): CreditReservationStatus {
+  if (value === 'RESERVED' || value === 'COMMITTED' ||
+      value === 'ROLLED_BACK' || value === 'EXPIRED') return value;
+  throw new Error(`Redis returned invalid reservation status: ${String(value)}`);
+}
+
+function settlementMode(value: unknown): CreditReservation['settlementMode'] {
+  if (value === 'IMMEDIATE' || value === 'DEFERRED') return value;
+  throw new Error(`Redis returned invalid settlement mode: ${String(value)}`);
 }
 
 export {
-  ACQUIRE_LOCK_SCRIPT,
   COMMIT_SCRIPT,
+  EXPIRE_PLAN_SCRIPT,
+  FIND_EXPIRED_PLANS_SCRIPT,
   FIND_EXPIRED_SCRIPT,
+  GET_BALANCE_SCRIPT,
+  GET_PLANS_SCRIPT,
   GRANT_SCRIPT,
-  INITIALIZE_BALANCE_SCRIPT,
   RECOVER_SCRIPT,
   REMOVE_EXPIRATION_SCRIPT,
-  RELEASE_LOCK_SCRIPT,
   RENEW_SCRIPT,
   RESERVE_SCRIPT,
   ROLLBACK_SCRIPT,

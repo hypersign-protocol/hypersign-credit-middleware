@@ -9,7 +9,6 @@ import { randomUUID } from 'node:crypto';
 import { CreditCatalogService } from './credit.catalog';
 import { CREDIT_EVENT_NAMES, CreditEventName } from './credit.constants';
 import { CreditService } from './credit.service';
-import p1 from 'process';
 import {
   CREDIT_OPTIONS,
   CREDIT_REDIS_CLIENT,
@@ -20,13 +19,12 @@ import {
   CreditSubject,
   ResolvedCreditOptions,
 } from './credit.types';
-import { from } from 'rxjs';
 
 export interface CreditLifecycleEventEnvelope {
   eventId: string;
-  schemaVersion: 1;
+  schemaVersion: 2;
   catalogVersion: string;
-  serviceId: string;
+  catalogId: string;
   event: Record<string, unknown>;
 }
 
@@ -35,9 +33,9 @@ const JOB_NAMES: Record<string, CreditEventName> = {
   COMMITTED: CREDIT_EVENT_NAMES.COMMITTED,
   ROLLED_BACK: CREDIT_EVENT_NAMES.ROLLED_BACK,
   EXPIRED: CREDIT_EVENT_NAMES.EXPIRED,
+  PLAN_EXPIRED: CREDIT_EVENT_NAMES.PLAN_EXPIRED,
   CREDIT_GRANTED: CREDIT_EVENT_NAMES.CREDIT_GRANTED,
   CRITICAL_BALANCE: CREDIT_EVENT_NAMES.CRITICAL_BALANCE,
-  BALANCE_INITIALIZED: CREDIT_EVENT_NAMES.BALANCE_INITIALIZED,
 };
 
 /** Relays the transactional Redis Stream outbox to the supplied BullMQ queues. */
@@ -132,11 +130,11 @@ export class CreditEventRelay implements OnApplicationBootstrap, OnApplicationSh
         }
         const message = error instanceof Error ? error.message : String(error);
         this.logger.error(`Credit event relay pass failed: ${message}`);
-        // the process will be restarted by the BullMQ lifecycle consumer if the relay is not running
-        // restart 
-        await new Promise((resolve) => setTimeout( () => p1.exit(1), 5_000));
-        
-        
+        this.logger.error(
+          'Credit event relay stopped after a non-recoverable pass failure; ' +
+          'restart the host after correcting Redis/BullMQ configuration',
+        );
+        this.running = false;
       }
     }
   }
@@ -145,14 +143,14 @@ export class CreditEventRelay implements OnApplicationBootstrap, OnApplicationSh
     const config = this.options.bullMq!;
     for (const [eventId, values] of entries) {
       const fields = pairs(values);
-      const streamServiceId = fields.serviceId;
-      if (!streamServiceId) {
+      const streamCatalogId = fields.catalogId;
+      if (!streamCatalogId) {
         this.logger.error(
-          `Credit stream event ${eventId} has no serviceId; leaving it pending`,
+          `Credit stream event ${eventId} has no catalogId; leaving it pending`,
         );
         continue;
       }
-      if (streamServiceId !== this.catalog.serviceId) {
+      if (streamCatalogId !== this.catalog.catalogId) {
         await config.streamClient.xack(
           this.options.eventStreamKey,
           config.consumerGroup,
@@ -167,14 +165,14 @@ export class CreditEventRelay implements OnApplicationBootstrap, OnApplicationSh
       }
       const envelope: CreditLifecycleEventEnvelope = {
         eventId,
-        schemaVersion: 1,
+        schemaVersion: 2,
         catalogVersion: this.catalog.version,
-        serviceId: this.catalog.serviceId,
+        catalogId: this.catalog.catalogId,
         event: normalizeEvent(fields),
       };
       for (const queueName of config.lifecycleQueueNames) {
         await config.provider.add(queueName, jobName, envelope, {
-          jobId: `${this.catalog.serviceId}-${eventId}`,
+          jobId: `${this.catalog.catalogId}-${eventId}`,
         });
       }
       await config.streamClient.xack(
@@ -247,7 +245,10 @@ export class CreditCommandWorker implements OnApplicationBootstrap, OnApplicatio
         case CREDIT_EVENT_NAMES.GRANT_REQUESTED:
           return this.credits.grant({
             subject: this.subject(command.payload.subject),
+            planId: requiredString(command.payload.planId, 'payload.planId'),
             amount: positiveInteger(command.payload.amount, 'payload.amount'),
+            grantedAt: positiveInteger(command.payload.grantedAt, 'payload.grantedAt'),
+            expiresAt: positiveInteger(command.payload.expiresAt, 'payload.expiresAt'),
             referenceId: requiredString(
               command.payload.referenceId ?? command.commandId,
               'payload.referenceId',
@@ -280,8 +281,8 @@ export class CreditCommandWorker implements OnApplicationBootstrap, OnApplicatio
     } catch (error) {
       await this.publishRejection(command ?? {
         commandId: typeof job.id === 'string' && job.id ? job.id : randomUUID(),
-        schemaVersion: 1,
-        serviceId: this.catalog.serviceId,
+        schemaVersion: 2,
+        catalogId: this.catalog.catalogId,
         payload: {},
       }, job.name, error);
       throw error;
@@ -290,13 +291,13 @@ export class CreditCommandWorker implements OnApplicationBootstrap, OnApplicatio
 
   private command(job: CreditBullMqJob): CreditCommandEnvelope {
     const value = job.data as Partial<CreditCommandEnvelope> | undefined;
-    if (!value || value.schemaVersion !== 1 || !value.payload) {
+    if (!value || value.schemaVersion !== 2 || !value.payload) {
       throw new TypeError('Invalid credit command envelope');
     }
     const commandId = requiredString(value.commandId ?? job.id, 'commandId');
-    if (value.serviceId !== this.catalog.serviceId) {
+    if (value.catalogId !== this.catalog.catalogId) {
       throw new TypeError(
-        `Command serviceId ${String(value.serviceId)} does not match ${this.catalog.serviceId}`,
+        `Command catalogId ${String(value.catalogId)} does not match ${this.catalog.catalogId}`,
       );
     }
     return { ...value, commandId } as CreditCommandEnvelope;
@@ -305,14 +306,10 @@ export class CreditCommandWorker implements OnApplicationBootstrap, OnApplicatio
   private subject(value: unknown): CreditSubject {
     if (!value || typeof value !== 'object') throw new TypeError('payload.subject is required');
     const subject = value as Partial<CreditSubject>;
-    if (subject.serviceId && subject.serviceId !== this.catalog.serviceId) {
-      throw new TypeError('Command subject serviceId does not match installed catalog');
-    }
     return {
       appId: requiredString(subject.appId, 'payload.subject.appId'),
       tenantId: optionalString(subject.tenantId),
       appType: optionalString(subject.appType),
-      serviceId: this.catalog.serviceId,
       creditType: requiredString(subject.creditType, 'payload.subject.creditType'),
     };
   }
@@ -342,13 +339,14 @@ export class CreditCommandWorker implements OnApplicationBootstrap, OnApplicatio
     this.logger.error(`Rejected credit command ${command.commandId}: ${reason}`);
     for (const queueName of config.lifecycleQueueNames) {
       await config.provider.add(queueName, CREDIT_EVENT_NAMES.COMMAND_REJECTED, {
-        schemaVersion: 1,
-        serviceId: this.catalog.serviceId,
+        schemaVersion: 2,
+        catalogId: this.catalog.catalogId,
+        planId: optionalString(command.payload.planId),
         commandId: command.commandId,
         commandName,
         reason,
         timestamp: Date.now(),
-      }, { jobId: `${this.catalog.serviceId}-${command.commandId}-rejected` });
+      }, { jobId: `${this.catalog.catalogId}-${command.commandId}-rejected` });
     }
   }
 }
@@ -365,7 +363,9 @@ function pairs(values: string[]): Record<string, string> {
 
 function normalizeEvent(fields: Record<string, string>): Record<string, unknown> {
   const numeric = new Set([
-    'timestamp', 'amount', 'balanceAfter', 'balance', 'threshold', 'expiresAt',
+    'timestamp', 'amount', 'totalAmount', 'balanceAfter', 'planBalanceAfter',
+    'balance', 'threshold', 'expiresAt', 'grantedAt', 'expiredAmount',
+    'restoredAmount', 'allocationIndex', 'allocationCount',
   ]);
   const result: Record<string, unknown> = {};
   for (const [name, value] of Object.entries(fields)) {
@@ -379,7 +379,6 @@ function normalizeEvent(fields: Record<string, string>): Record<string, unknown>
     appId: fields.appId,
     ...(fields.tenantId ? { tenantId: fields.tenantId } : {}),
     ...(fields.appType ? { appType: fields.appType } : {}),
-    ...(fields.serviceId ? { serviceId: fields.serviceId } : {}),
     ...(fields.creditType ? { creditType: fields.creditType } : {}),
   };
   return result;

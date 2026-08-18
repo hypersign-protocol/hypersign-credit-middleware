@@ -6,7 +6,7 @@ describe('CreditPolicyExecutor', () => {
   const options = {
     ...DEFAULT_CREDIT_OPTIONS,
     catalog: {
-      serviceId: 'kyc', version: '1', routes: [{
+      catalogId: 'kyc', version: '1', routes: [{
         method: 'POST', path: '/submit', charges: [
           { id: 'api', creditType: 'API', amount: 5 },
           {
@@ -28,7 +28,8 @@ describe('CreditPolicyExecutor', () => {
     autoRecover: creditType === 'API',
     existing: false,
     settlementMode: creditType === 'API' ? 'IMMEDIATE' as const : 'DEFERRED' as const,
-    subject: { appId: 'account', serviceId: 'kyc', creditType },
+    subject: { appId: 'account', creditType },
+    allocations: [{ planId: `${creditType}-plan`, amount: 5, planBalanceAfter: 45 }],
   });
 
   it('creates independent catalog reservations with scoped request IDs', async () => {
@@ -46,7 +47,7 @@ describe('CreditPolicyExecutor', () => {
       .toEqual(['api-res', 'txn-res']);
     expect(credits.reserve).toHaveBeenNthCalledWith(1, expect.objectContaining({
       requestId: 'request-1:api',
-      subject: { appId: 'account', serviceId: 'kyc', creditType: 'API' },
+      subject: { appId: 'account', creditType: 'API' },
     }));
     expect(credits.reserve).toHaveBeenNthCalledWith(2, expect.objectContaining({
       requestId: 'request-1:txn', settlementMode: 'DEFERRED', autoRecover: false,

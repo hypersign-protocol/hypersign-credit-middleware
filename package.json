@@ -1,6 +1,6 @@
 {
   "name": "@hypersign-protocol/credit-middleware",
-  "version": "3.0.0",
+  "version": "4.0.2",
   "description": "Catalog-driven NestJS credit lifecycle SDK with Redis and BullMQ",
   "license": "ISC",
   "author": "",
@@ -37,11 +37,12 @@
     "start:example:multi": "npm run build:example && node dist-example/example/multi-module/main.js",
     "start:example:events": "npm run build:example && node dist-example/example/event-server/main.js",
     "test": "jest --runInBand",
+    "test:redis": "npm run build && node scripts/verify-redis.js",
     "lint": "tsc --noEmit -p tsconfig.json"
   },
   "peerDependencies": {
-    "@nestjs/common": ">=10 <12",
-    "@nestjs/core": ">=10 <12",
+    "@nestjs/common": ">=9 <12",
+    "@nestjs/core": ">=9 <12",
     "rxjs": ">=7 <8"
   },
   "devDependencies": {

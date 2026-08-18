@@ -51,8 +51,8 @@ export interface CreditBullMqProvider {
 
 export interface CreditCommandEnvelope {
   commandId: string;
-  schemaVersion: 1;
-  serviceId: string;
+  schemaVersion: 2;
+  catalogId: string;
   requestedAt?: string;
   source?: string;
   payload: Record<string, unknown>;
@@ -90,25 +90,7 @@ export interface CreditSubject {
   appId: string;
   tenantId?: string;
   appType?: CreditAccountType;
-  serviceId?: string;
   creditType?: string;
-}
-
-export interface CreditBalanceSnapshot {
-  balance: number;
-  /** Opaque tag identifying the data source, e.g. "billing-ledger". */
-  source?: string;
-  /** Optional authoritative ledger revision used for auditing. */
-  revision?: string;
-}
-
-/**
- * Loads an initial balance only when the scoped Redis balance key is absent.
- * It is never called merely because a balance is low or insufficient, which
- * prevents a stale provider snapshot from recreating already-spent credits.
- */
-export interface CreditBalanceProvider {
-  getBalance(subject: CreditSubject): Promise<CreditBalanceSnapshot>;
 }
 
 export interface CreditRequestContext {
@@ -137,7 +119,8 @@ export interface CreditCatalogRoute {
 }
 
 export interface CreditCatalog {
-  serviceId: string;
+  /** Installation/catalog identity used for transport routing, never wallet scoping. */
+  catalogId: string;
   version: string;
   globalPrefix?: string;
   /** URI inserts v<version> into the route; NONE covers header/media/custom versioning. */
@@ -173,20 +156,51 @@ export interface ReserveCreditResult {
   existing: boolean;
   settlementMode: CreditSettlementMode;
   subject: CreditSubject;
+  allocations: CreditPlanAllocation[];
 }
 
 export interface GrantCreditsInput {
   subject: CreditSubject;
+  /** Immutable identifier of this recharge lot. */
+  planId: string;
   amount: number;
-  /** Globally stable business transaction ID; deduplicated for `retentionMs`. */
+  /** Authoritative recharge creation time used for deterministic FIFO ordering. */
+  grantedAt: number;
+  /** Unix epoch milliseconds after which unused credits cannot be reserved. */
+  expiresAt: number;
+  /** Stable business transaction ID. A retry must reuse the same value. */
   referenceId: string;
   reason?: string;
 }
 
 export interface GrantCreditsResult {
+  planId: string;
+  planBalance: number;
   balance: number;
+  expiresAt: number;
   existing: boolean;
   subject: CreditSubject;
+}
+
+export interface CreditPlanAllocation {
+  planId: string;
+  amount: number;
+  /** Available amount in this plan immediately after reservation. */
+  planBalanceAfter: number;
+}
+
+export type CreditPlanStatus = 'ACTIVE' | 'DEPLETED' | 'EXPIRED' | 'REVOKED';
+
+export interface CreditPlan {
+  planId: string;
+  subject: CreditSubject;
+  scopeId: string;
+  grantedAmount: number;
+  availableAmount: number;
+  grantedAt: number;
+  expiresAt: number;
+  referenceId: string;
+  status: CreditPlanStatus;
 }
 
 export type CreditReservationStatus =
@@ -212,11 +226,10 @@ export interface CreditReservation extends CreditSubject {
   operation?: string;
   /** Incremented by CreditService.renew(); starts at 1 on creation. */
   version: number;
+  allocations: CreditPlanAllocation[];
 }
 
 export interface CreditOptions {
-  /** Required, authoritative route and pricing catalog for this service. */
-  catalog?: CreditCatalog;
   /** Optional durable BullMQ egress and trusted command ingress. */
   bullMq?: CreditBullMqOptions;
   /** How long a request owns a reservation without renewal. Default: 60s. */
@@ -227,10 +240,10 @@ export interface CreditOptions {
   recoveryBatchSize?: number;
   /** Low-balance notification threshold. It never triggers replenishment. */
   criticalBalance?: number | ((subject: CreditSubject) => number);
-  /** Initial balance source, consulted only when the scoped Redis key is absent. */
-  balanceProvider?: CreditBalanceProvider;
-  /** How long to hold the initialization stampede lock. Default: 5s. */
-  initializationLockMs?: number;
+  /** Maximum number of active recharge plans one wallet may retain. */
+  maxActivePlans?: number;
+  /** Maximum number of plans one reservation may consume. */
+  maxPlanAllocationsPerReservation?: number;
   /** Redis key prefix. Default: "credit". */
   keyPrefix?: string;
   /**
@@ -251,8 +264,8 @@ export interface ResolvedCreditOptions {
   retentionMs: number;
   recoveryBatchSize: number;
   criticalBalance: number | ((subject: CreditSubject) => number);
-  balanceProvider?: CreditBalanceProvider;
-  initializationLockMs: number;
+  maxActivePlans: number;
+  maxPlanAllocationsPerReservation: number;
   keyPrefix: string;
   redisHashTag: string;
   eventStreamKey: string;

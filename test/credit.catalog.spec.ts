@@ -3,18 +3,32 @@ import { MetadataScanner } from '@nestjs/core';
 import { CreditCatalogAuditor } from '../src/credit.catalog-auditor';
 import { CreditCatalogService } from '../src/credit.catalog';
 import { DEFAULT_CREDIT_OPTIONS } from '../src/credit.constants';
+import { resolveCreditOptions } from '../src/credit.module';
 
 const catalogOptions = (routes: any[]) => ({
   ...DEFAULT_CREDIT_OPTIONS,
-  catalog: { serviceId: 'catalog-test', version: '1', routes },
+  catalog: { catalogId: 'catalog-test', version: '1', routes },
 });
 
 describe('CreditCatalogService', () => {
+  it('always uses the SDK-bundled KYC catalog', () => {
+    const resolved = resolveCreditOptions({
+      catalog: {
+        catalogId: 'attempted-override',
+        version: '999',
+        routes: [],
+      },
+    } as any);
+
+    expect(resolved.catalog.catalogId).toBe('KYC');
+    expect(resolved.catalog.routes.length).toBeGreaterThan(0);
+  });
+
   it('normalizes the configured default URI version', () => {
     const catalog = new CreditCatalogService({
       ...DEFAULT_CREDIT_OPTIONS,
       catalog: {
-        serviceId: 'kyc', version: '1', defaultVersion: ' 1 ', routes: [],
+        catalogId: 'kyc', version: '1', defaultVersion: ' 1 ', routes: [],
       },
     });
     expect(catalog.defaultVersion).toBe('1');
@@ -93,7 +107,7 @@ describe('CreditCatalogAuditor', () => {
     const options = {
       ...catalogOptions([]),
       catalog: {
-        serviceId: 'catalog-test', version: '1', globalPrefix: 'api',
+        catalogId: 'catalog-test', version: '1', globalPrefix: 'api',
         defaultVersion: '1',
         routes: [{ method: 'GET', path: '/api/v1/items/:itemId', charges: [] }],
       },

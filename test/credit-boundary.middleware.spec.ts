@@ -10,7 +10,7 @@ describe('catalog-driven CreditBoundaryMiddleware', () => {
   const options = {
     ...DEFAULT_CREDIT_OPTIONS,
     catalog: {
-      serviceId: 'test', version: '1', routes: [
+      catalogId: 'test', version: '1', routes: [
         {
           method: 'POST', path: '/paid/:id', boundary: true,
           charges: [{ id: 'api', creditType: 'API_CREDIT', amount: 10 }],
@@ -19,7 +19,7 @@ describe('catalog-driven CreditBoundaryMiddleware', () => {
       ],
     },
     requestContextResolver: () => ({
-      subject: { appId: 'user_123', serviceId: 'test' },
+      subject: { appId: 'user_123' },
       requestId: 'req_1',
     }),
   };
@@ -28,7 +28,9 @@ describe('catalog-driven CreditBoundaryMiddleware', () => {
     charge: catalog.find('POST', '/paid/123')!.charges[0],
     reservation: {
       reservationId: 'res_1', remainingBalance: 90, leaseToken: 'lease_1',
-      scopeId: 'scope_1', subject: { appId: 'user_123', serviceId: 'test' },
+      scopeId: 'scope_1', subject: { appId: 'user_123' }, allocations: [
+        { planId: 'plan-1', amount: 10, planBalanceAfter: 90 },
+      ],
       expiresAt: Date.now() + 60_000, existing: false, autoRecover: true,
       settlementMode: 'IMMEDIATE' as const,
     },

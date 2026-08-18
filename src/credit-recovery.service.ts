@@ -24,13 +24,19 @@ export class CreditRecoveryService {
     if (this.running) return 0;
     this.running = true;
     try {
-      const recovered = await this.credits.recoverExpired();
-      if (recovered.length > 0) {
+      const [reservations, plans] = await Promise.all([
+        this.credits.recoverExpired(),
+        this.credits.recoverExpiredPlans(),
+      ]);
+      if (reservations.length > 0) {
         this.logger.warn(
-          `Recovered ${recovered.length} expired credit reservation(s)`,
+          `Recovered ${reservations.length} expired credit reservation(s)`,
         );
       }
-      return recovered.length;
+      if (plans.length > 0) {
+        this.logger.log(`Expired ${plans.length} recharge plan(s)`);
+      }
+      return reservations.length + plans.length;
     } catch (error) {
       this.logger.error('Credit reservation recovery failed', error);
       throw error;

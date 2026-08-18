@@ -13,7 +13,7 @@ import { DEFAULT_CREDIT_OPTIONS } from '../src/credit.constants';
 const options = {
   ...DEFAULT_CREDIT_OPTIONS,
   catalog: {
-    serviceId: 'test-service',
+    catalogId: 'test-service',
     version: '1',
     routes: [
       {
@@ -35,7 +35,7 @@ const options = {
   },
 };
 
-const subject = { appId: 'user_123', serviceId: 'test-service' };
+const subject = { appId: 'user_123' };
 const reservation = (id: string, mode: 'IMMEDIATE' | 'DEFERRED' = 'IMMEDIATE') => ({
   charge: {
     id: id.includes('deferred') ? 'txn' : 'api',
@@ -54,6 +54,7 @@ const reservation = (id: string, mode: 'IMMEDIATE' | 'DEFERRED' = 'IMMEDIATE') =
     existing: false,
     settlementMode: mode,
     subject,
+    allocations: [{ planId: 'plan-1', amount: 20, planBalanceAfter: 80 }],
   },
 });
 

@@ -5,12 +5,15 @@ import { ExampleBullMqProvider } from '../bullmq.module';
 import { CreditEventStore } from './event-store.service';
 
 interface GrantCreditRequest {
-  serviceId?: unknown;
+  catalogId?: unknown;
   tenantId?: unknown;
   appId?: unknown;
   appType?: unknown;
   creditType?: unknown;
   amount?: unknown;
+  planId?: unknown;
+  grantedAt?: unknown;
+  expiresAt?: unknown;
   referenceId?: unknown;
   reason?: unknown;
 }
@@ -33,19 +36,22 @@ export class CreditEventsController {
 
   @Post('credit-commands/grant')
   async grant(@Body() body: GrantCreditRequest) {
-    const serviceId = requiredString(body.serviceId, 'serviceId');
+    const catalogId = requiredString(body.catalogId, 'catalogId');
     const appId = requiredString(body.appId, 'appId');
     const creditType = requiredString(body.creditType, 'creditType');
     const referenceId = requiredString(body.referenceId, 'referenceId');
     const amount = positiveInteger(body.amount, 'amount');
+    const planId = requiredString(body.planId, 'planId');
+    const grantedAt = positiveInteger(body.grantedAt, 'grantedAt');
+    const expiresAt = positiveInteger(body.expiresAt, 'expiresAt');
     const tenantId = optionalString(body.tenantId);
     const appType = optionalString(body.appType);
     const commandId = randomUUID();
-    const queue = `credit.commands.${serviceId}`;
+    const queue = `credit.commands.${catalogId}`;
     await this.bullMq.add(queue, CREDIT_EVENT_NAMES.GRANT_REQUESTED, {
-      schemaVersion: 1,
+      schemaVersion: 2,
       commandId,
-      serviceId,
+      catalogId,
       source: 'example-credit-event-server',
       requestedAt: new Date().toISOString(),
       payload: {
@@ -56,12 +62,15 @@ export class CreditEventsController {
           ...(appType ? { appType } : {}),
         },
         amount,
+        planId,
+        grantedAt,
+        expiresAt,
         referenceId,
         reason: optionalString(body.reason) ?? 'demo_credit_grant',
       },
     }, { jobId: commandId });
 
-    return { queued: true, commandId, queue, referenceId };
+    return { queued: true, commandId, queue, planId, referenceId };
   }
 }
 

@@ -9,7 +9,6 @@ import {
   EXAMPLE_ACCOUNT_ID,
   EXAMPLE_COST,
   EXAMPLE_SUBJECT,
-  exampleBalanceProvider,
 } from "./credit-demo.config";
 
 interface DemoRequest {
@@ -105,9 +104,9 @@ export class ExampleDemoController {
     return this.credits.rollback(id, "deferred_operation_failed");
   }
 
-  @Get("provider-calls")
-  providerCalls() {
-    return { calls: exampleBalanceProvider.calls };
+  @Get("plans")
+  async plans() {
+    return this.credits.getPlans(EXAMPLE_SUBJECT);
   }
 
   /** Manually run one recovery pass (production should use an external worker). */

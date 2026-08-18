@@ -13,9 +13,9 @@ export const CREDIT_EVENT_NAMES = {
   COMMITTED: 'credit.committed',
   ROLLED_BACK: 'credit.rolled-back',
   EXPIRED: 'credit.expired',
+  PLAN_EXPIRED: 'credit.plan-expired',
   CREDIT_GRANTED: 'credit.granted',
   CRITICAL_BALANCE: 'credit.critical-balance',
-  BALANCE_INITIALIZED: 'credit.balance-initialized',
   COMMAND_REJECTED: 'credit.command-rejected',
   GRANT_REQUESTED: 'credit.grant.requested',
   RESERVE_REQUESTED: 'credit.reserve.requested',
@@ -28,7 +28,7 @@ export type CreditEventName =
 
 export const DEFAULT_CREDIT_OPTIONS: ResolvedCreditOptions = {
   catalog: {
-    serviceId: 'unconfigured',
+    catalogId: 'unconfigured',
     version: '0',
     routes: [],
   },
@@ -36,10 +36,11 @@ export const DEFAULT_CREDIT_OPTIONS: ResolvedCreditOptions = {
   retentionMs: 7 * 24 * 60 * 60 * 1_000,
   recoveryBatchSize: 100,
   criticalBalance: 0,
-  initializationLockMs: 5_000,
+  maxActivePlans: 1_000,
+  maxPlanAllocationsPerReservation: 100,
   keyPrefix: DEFAULT_KEY_PREFIX,
   redisHashTag: DEFAULT_REDIS_HASH_TAG,
-  eventStreamKey: `${DEFAULT_KEY_PREFIX}:{${DEFAULT_REDIS_HASH_TAG}}:events`,
+  eventStreamKey: `${DEFAULT_KEY_PREFIX}:v2:{${DEFAULT_REDIS_HASH_TAG}}:events`,
   eventStreamMaxLength: 100_000,
   requestContextResolver: (request: unknown) => {
     const req = request as {
@@ -49,7 +50,6 @@ export const DEFAULT_CREDIT_OPTIONS: ResolvedCreditOptions = {
         appId?: string;
         id?: string;
         tenantId?: string;
-        serviceId?: string;
       };
       requestId?: string;
     };
@@ -62,7 +62,6 @@ export const DEFAULT_CREDIT_OPTIONS: ResolvedCreditOptions = {
           req.service?.id ??
           '',
         tenantId: req.service?.tenantId,
-        serviceId: req.service?.serviceId,
       },
       requestId: req.requestId,
     };

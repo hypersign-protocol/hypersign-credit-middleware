@@ -48,7 +48,7 @@ export class CreditCatalogAuditor implements OnApplicationBootstrap {
     }
     this.logger.log(
       `Validated ${applicationKeys.size} route(s) against credit catalog ` +
-      `${this.catalog.serviceId}@${this.catalog.version}`,
+      `${this.catalog.catalogId}@${this.catalog.version}`,
     );
   }
 

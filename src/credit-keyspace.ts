@@ -10,7 +10,6 @@ export class CreditKeyspace {
       appId: clean(input.appId) ?? '',
       tenantId: clean(input.tenantId),
       appType: clean(input.appType),
-      serviceId: clean(input.serviceId),
       creditType: clean(input.creditType),
     };
     if (!subject.appId) throw new TypeError('subject.appId is required');
@@ -25,26 +24,46 @@ export class CreditKeyspace {
       ['tenant', subject.tenantId],
       ['appType', subject.appType],
       ['app', subject.appId],
-      ['service', subject.serviceId],
       ['creditType', subject.creditType],
     ].map(([name, value]) => `${name}=${dimension(value)}`).join('|');
   }
 
   balance(subject: CreditSubject): string { return `${this.base()}:balance:${this.scopeId(subject)}`; }
+  planOrder(subject: CreditSubject): string { return `${this.base()}:plans:order:${this.scopeId(subject)}`; }
+  planAmounts(subject: CreditSubject): string { return `${this.base()}:plans:amount:${this.scopeId(subject)}`; }
+  planRemaining(subject: CreditSubject): string { return `${this.base()}:plans:remaining:${this.scopeId(subject)}`; }
+  planExpires(subject: CreditSubject): string { return `${this.base()}:plans:expires:${this.scopeId(subject)}`; }
+  planGrantedAt(subject: CreditSubject): string { return `${this.base()}:plans:granted-at:${this.scopeId(subject)}`; }
+  planReferences(subject: CreditSubject): string { return `${this.base()}:plans:reference:${this.scopeId(subject)}`; }
+  planStatuses(subject: CreditSubject): string { return `${this.base()}:plans:status:${this.scopeId(subject)}`; }
+  planExpirationMembers(subject: CreditSubject): string {
+    return `${this.base()}:plans:expiration-member:${this.scopeId(subject)}`;
+  }
   request(subject: CreditSubject, requestId: string): string {
     return `${this.base()}:request:${this.scopeId(subject)}:${encodeURIComponent(requestId)}`;
   }
   reservation(id: string): string { return `${this.base()}:reservation:${encodeURIComponent(id)}`; }
-  grant(subject: CreditSubject, referenceId: string): string {
-    return `${this.base()}:grant:${this.scopeId(subject)}:${encodeURIComponent(referenceId)}`;
+  grant(referenceId: string): string {
+    return `${this.base()}:grant:${encodeURIComponent(referenceId)}`;
   }
-  initializationLock(subject: CreditSubject): string {
-    return `${this.base()}:initialize:${this.scopeId(subject)}`;
+  planOwner(planId: string): string {
+    return `${this.base()}:plan-owner:${encodeURIComponent(planId)}`;
   }
   expirations(): string { return `${this.base()}:reservation:expirations`; }
+  planExpirations(): string { return `${this.base()}:plan:expirations`; }
+  planExpirationMember(subject: CreditSubject, planId: string): string {
+    const value = this.subject(subject);
+    return JSON.stringify([
+      value.appId,
+      value.tenantId ?? '',
+      value.appType ?? '',
+      value.creditType ?? '',
+      planId,
+    ]);
+  }
   eventStream(): string { return this.options.eventStreamKey; }
 
   private base(): string {
-    return `${this.options.keyPrefix}:{${this.options.redisHashTag}}`;
+    return `${this.options.keyPrefix}:v2:{${this.options.redisHashTag}}`;
   }
 }
