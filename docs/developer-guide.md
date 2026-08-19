@@ -1,0 +1,1137 @@
+# Hypersign Credit Middleware — Developer Guide
+
+This guide explains how to integrate, operate, and troubleshoot
+`@hypersign-protocol/credit-middleware` in a production NestJS application.
+
+> SDK version: `4.0.2`  
+> Bundled catalog: `hypersign-kyc-api-pricing@3.20.0`  
+> Supported runtime: Node.js 18+, NestJS 9–11, Redis 6.2+
+
+## Contents
+
+- [Overview](#overview)
+- [Integration requirements](#integration-requirements)
+- [Installation](#installation)
+- [Configure Redis](#configure-redis)
+- [Deterministic Redis keys](#deterministic-redis-keys)
+- [BullMQ queues and keys](#bullmq-queues-and-keys)
+- [Register the SDK](#register-the-sdk)
+- [Request identity and idempotency](#request-identity-and-idempotency)
+- [Grant credits](#grant-credits)
+- [Automatic HTTP charging](#automatic-http-charging)
+- [Deferred settlement](#deferred-settlement)
+- [Recovery](#recovery)
+- [BullMQ transport](#bullmq-transport)
+- [Lifecycle events](#lifecycle-events)
+- [Command messages](#command-messages)
+- [Service API reference](#service-api-reference)
+- [Configuration reference](#configuration-reference)
+- [Errors and HTTP behavior](#errors-and-http-behavior)
+- [Production operations](#production-operations)
+- [Testing](#testing)
+- [Upgrade notes](#upgrade-notes)
+
+## Overview
+
+The SDK applies catalog-defined credit charges to NestJS HTTP routes. It uses
+Redis Lua scripts so that plan selection, balance changes, reservation state,
+idempotency records, and lifecycle events change atomically.
+
+```text
+authenticated request
+        |
+        v
+resolve trusted billing subject
+        |
+        v
+match route in bundled catalog
+        |
+        v
+reserve from unexpired plans (FIFO)
+        |
+        +---- request fails ------> roll back eligible allocations
+        |
+        +---- request succeeds ---> commit IMMEDIATE allocations
+                                  \-> retain DEFERRED allocations
+```
+
+Credits are stored as immutable recharge plans. Plans are consumed in
+`grantedAt` order, then by `planId` when timestamps are equal. A reservation is
+all-or-nothing: if the entire charge cannot be funded, no plan is deducted.
+
+The exact plan allocation is stored with the reservation. Commit, rollback,
+and recovery use that stored allocation and never recalculate FIFO order.
+
+## Integration requirements
+
+### Fixed route catalog
+
+This release bundles its authoritative route and pricing catalog at
+`src/catalogs/catalog.kyc.json`. Applications cannot supply or override the
+catalog through `CreditModule` configuration.
+
+The bundled catalog uses:
+
+- catalog ID `hypersign-kyc-api-pricing`;
+- catalog version `3.20.0`;
+- global prefix `api`;
+- URI versioning with prefix `v`; and
+- default controller version `1`.
+
+During application bootstrap, the SDK compares every discovered Nest HTTP
+route with the catalog. Startup fails if:
+
+- an application route is missing from the catalog;
+- a catalog route is missing from the application;
+- the application declares a duplicate resolved route; or
+- a catalog route or charge is invalid.
+
+Controller changes and catalog changes must ship together in a new SDK
+release. Treat a route-audit failure as a deployment-blocking compatibility
+error.
+
+### Wallet identity
+
+A wallet is uniquely identified by all supplied `CreditSubject` dimensions:
+
+```ts
+interface CreditSubject {
+  appId: string;
+  tenantId?: string;
+  appType?: 'USER' | 'BUSINESS' | 'SERVICE' | string;
+  creditType?: string;
+}
+```
+
+Omitted dimensions are meaningful. These are different wallets:
+
+```ts
+{ appId: 'business_123' }
+{ appId: 'business_123', appType: 'BUSINESS' }
+```
+
+`catalogId` and `serviceId` are not part of wallet identity. HTTP charges take
+`creditType` from the matched catalog route.
+
+### Required infrastructure
+
+A production deployment needs:
+
+- Redis 6.2 or later;
+- one non-blocking Redis connection for credit operations;
+- a trusted authentication context available before credit policy runs;
+- stable request, plan, payment, command, and event identifiers; and
+- an external scheduler or worker for credit recovery.
+
+BullMQ and a second, blocking Redis connection are required only when lifecycle
+delivery or trusted command ingestion is enabled.
+
+## Installation
+
+```sh
+npm install @hypersign-protocol/credit-middleware ioredis
+```
+
+Install BullMQ if transport is enabled:
+
+```sh
+npm install bullmq
+```
+
+The host must provide compatible peer dependencies:
+
+```sh
+npm install @nestjs/common @nestjs/core rxjs reflect-metadata
+```
+
+## Configure Redis
+
+Provide an ioredis-compatible operation client under the exported
+`CREDIT_REDIS_CLIENT` token.
+
+```ts
+// credit-infrastructure.module.ts
+import {
+  Global,
+  Inject,
+  Injectable,
+  Module,
+  OnApplicationShutdown,
+} from '@nestjs/common';
+import Redis from 'ioredis';
+import { CREDIT_REDIS_CLIENT } from '@hypersign-protocol/credit-middleware';
+
+export const CREDIT_STREAM_REDIS = Symbol('CREDIT_STREAM_REDIS');
+
+@Injectable()
+class RedisShutdown implements OnApplicationShutdown {
+  constructor(
+    @Inject(CREDIT_REDIS_CLIENT) private readonly operations: Redis,
+    @Inject(CREDIT_STREAM_REDIS) private readonly stream: Redis,
+  ) {}
+
+  async onApplicationShutdown(): Promise<void> {
+    await this.operations.quit();
+    await this.stream.quit();
+  }
+}
+
+@Global()
+@Module({
+  providers: [
+    {
+      provide: CREDIT_REDIS_CLIENT,
+      useFactory: async (): Promise<Redis> => {
+        const client = new Redis(process.env.REDIS_URL!, {
+          maxRetriesPerRequest: 2,
+          enableReadyCheck: true,
+        });
+        await client.ping();
+        return client;
+      },
+    },
+    {
+      provide: CREDIT_STREAM_REDIS,
+      useFactory: async (): Promise<Redis> => {
+        const client = new Redis(process.env.REDIS_URL!, {
+          maxRetriesPerRequest: null,
+          enableReadyCheck: true,
+        });
+        await client.ping();
+        return client;
+      },
+    },
+    RedisShutdown,
+  ],
+  exports: [CREDIT_REDIS_CLIENT, CREDIT_STREAM_REDIS],
+})
+export class CreditInfrastructureModule {}
+```
+
+The Stream connection is shown because most production installations enable
+BullMQ. It must be a different client instance from `CREDIT_REDIS_CLIENT`:
+blocking Stream reads cannot share the operation connection.
+
+## Deterministic Redis keys
+
+The SDK constructs every state key from normalized configuration, wallet
+identity, and stable business identifiers. Given the same inputs, every API
+instance and recovery worker derives exactly the same keys without consulting
+a registry or database.
+
+### Versioned key base
+
+All SDK-owned Redis keys begin with:
+
+```text
+<keyPrefix>:v2:{<redisHashTag>}
+```
+
+With this configuration:
+
+```ts
+{
+  keyPrefix: 'hypersign-credit',
+  redisHashTag: 'hypersign-credit'
+}
+```
+
+the base is:
+
+```text
+hypersign-credit:v2:{hypersign-credit}
+```
+
+The braces are Redis Cluster hash-tag syntax. Redis hashes only the text inside
+the braces, so every key passed to a multi-key Lua transition occupies the same
+Cluster slot. The SDK rejects braces inside either configuration value to
+prevent an ambiguous or broken tag.
+
+`v2` is the storage-schema version, not the npm package version or catalog
+version. Changing `keyPrefix` or `redisHashTag` points the application at a
+different logical keyspace. Treat either change as a data migration, not a
+cosmetic rename.
+
+Use a unique `keyPrefix` for each environment and independently operated SDK
+installation. The catalog ID is not included in financial keys and does not
+isolate wallets.
+
+### Deterministic wallet scope
+
+The wallet scope uses four dimensions in this fixed order:
+
+```text
+tenant, appType, app, creditType
+```
+
+Each value is trimmed. An absent or empty optional dimension becomes `0`; a
+present value becomes `1:<URI-encoded-value>`. Dimension names and presence
+markers prevent ambiguous concatenation.
+
+For this subject:
+
+```ts
+const subject = {
+  tenantId: 'tenant/acme',
+  appType: 'BUSINESS',
+  appId: 'business:123',
+  creditType: 'API_CREDIT',
+};
+```
+
+the deterministic scope ID is:
+
+```text
+tenant=1:tenant%2Facme|appType=1:BUSINESS|app=1:business%3A123|creditType=1:API_CREDIT
+```
+
+If `tenantId` and `appType` are absent, the scope begins:
+
+```text
+tenant=0|appType=0|...
+```
+
+Case is preserved: `business` and `BUSINESS` are different values. Scope IDs
+and Redis keys contain business identifiers in encoded—not encrypted—form.
+Treat Redis key names as sensitive metadata and restrict key enumeration.
+
+### Exact SDK key patterns
+
+`<base>` below means `<keyPrefix>:v2:{<redisHashTag>}` and `<scope>` means the
+deterministic scope ID above.
+
+| Purpose | Exact pattern | Redis type | Key/member detail |
+| --- | --- | --- | --- |
+| Cached wallet total | `<base>:balance:<scope>` | String | Non-negative integer maintained with mutations. |
+| Active FIFO plans | `<base>:plans:order:<scope>` | Sorted set | Member is `planId`; score is `grantedAt`. Equal scores are ordered by `planId`. |
+| Original plan amounts | `<base>:plans:amount:<scope>` | Hash | `planId -> granted amount`. |
+| Available plan amounts | `<base>:plans:remaining:<scope>` | Hash | `planId -> currently available amount`. |
+| Plan expiry times | `<base>:plans:expires:<scope>` | Hash | `planId -> Unix epoch milliseconds`. |
+| Plan grant times | `<base>:plans:granted-at:<scope>` | Hash | `planId -> Unix epoch milliseconds`. |
+| Plan references | `<base>:plans:reference:<scope>` | Hash | `planId -> referenceId`. |
+| Plan statuses | `<base>:plans:status:<scope>` | Hash | `planId -> ACTIVE, DEPLETED, EXPIRED, or REVOKED`. |
+| Plan expiry members | `<base>:plans:expiration-member:<scope>` | Hash | `planId -> encoded global-expiry member`. |
+| Plan ownership | `<base>:plan-owner:<encoded-planId>` | Hash | Globally binds a plan ID to its scope and reference. |
+| Grant idempotency | `<base>:grant:<encoded-referenceId>` | Hash | Globally binds a payment reference to immutable grant semantics. |
+| Plan expiry index | `<base>:plan:expirations` | Sorted set | Score is plan expiry; member encodes subject dimensions and `planId` as JSON. |
+| Reservation record | `<base>:reservation:<encoded-reservationId>` | Hash | Status, lease, subject, operation, and immutable allocations. |
+| Request idempotency | `<base>:request:<scope>:<encoded-requestId>` | Hash | Maps request semantics to its reservation. HTTP charge IDs are already appended to request IDs. |
+| Reservation expiry index | `<base>:reservation:expirations` | Sorted set | Score is lease expiry; member is `reservationId`. |
+| Transactional outbox | `<base>:events` | Stream | State-transition events written by the same Lua transaction. |
+
+`planId`, `referenceId`, `requestId`, and `reservationId` are URI-encoded where
+they appear in key names. New reservation IDs and lease tokens are random UUIDs;
+keys derived from an existing reservation remain deterministic.
+
+### Source of truth and retention
+
+The aggregate balance key is a transactionally maintained cache. Plan order,
+remaining amounts, expiries, and statuses retain the allocation detail;
+`getBalance()` evaluates currently unexpired active plans so it does not report
+an expired cached amount before recovery runs.
+
+Retention behavior differs by record:
+
+- active reservations and their request mappings have no TTL;
+- finalized reservation and request keys receive `retentionMs`;
+- plan metadata, plan ownership, and grant idempotency records are persistent;
+- depleted and expired plans leave the active FIFO sorted set but retain audit
+  metadata; and
+- the event Stream is approximately trimmed to `eventStreamMaxLength` by
+  `XADD MAXLEN ~`.
+
+Do not add independent TTLs or delete individual keys. An active reservation
+can still reference a depleted or expired plan, and partial cleanup can make a
+later settlement or audit impossible.
+
+### Worked key example
+
+Using the configuration and subject above, representative keys are:
+
+```text
+hypersign-credit:v2:{hypersign-credit}:balance:tenant=1:tenant%2Facme|appType=1:BUSINESS|app=1:business%3A123|creditType=1:API_CREDIT
+
+hypersign-credit:v2:{hypersign-credit}:plans:remaining:tenant=1:tenant%2Facme|appType=1:BUSINESS|app=1:business%3A123|creditType=1:API_CREDIT
+
+hypersign-credit:v2:{hypersign-credit}:request:tenant=1:tenant%2Facme|appType=1:BUSINESS|app=1:business%3A123|creditType=1:API_CREDIT:req%2F019%3Aapi
+
+hypersign-credit:v2:{hypersign-credit}:plan-owner:plan%2F2026%2F001
+
+hypersign-credit:v2:{hypersign-credit}:reservation:3db57c81-0000-4000-8000-000000000000
+
+hypersign-credit:v2:{hypersign-credit}:events
+```
+
+The braces appear unchanged in every key and therefore keep all examples in
+the same Redis Cluster slot.
+
+## BullMQ queues and keys
+
+SDK financial keys and BullMQ keys are separate namespaces with separate
+construction rules.
+
+The SDK controls:
+
+- lifecycle and command queue names;
+- lifecycle, rejection, and command job names;
+- deterministic lifecycle/rejection job IDs; and
+- the data envelope sent to the host provider.
+
+The host's `CreditBullMqProvider` and BullMQ options control:
+
+- the physical BullMQ Redis prefix;
+- connection and Cluster configuration;
+- attempts, backoff, concurrency, and rate limits;
+- completed/failed job retention; and
+- dead-letter and replay procedures.
+
+### Queue names
+
+| Queue role | Default name | Configuration |
+| --- | --- | --- |
+| Lifecycle delivery | `credit.lifecycle` | `bullMq.lifecycleQueueNames` |
+| Trusted commands | `credit.commands.hypersign-kyc-api-pricing` | `bullMq.commandQueueName` |
+
+`hypersign-kyc-api-pricing` comes from the bundled `catalogId`. If multiple lifecycle queue names are
+configured, the SDK publishes every event to each queue before acknowledging
+the Redis Stream entry.
+
+Queue names are not wallet scopes. Workers on one queue compete; separate
+delivery audiences require separate queue names.
+
+### Physical BullMQ key patterns
+
+With BullMQ's default prefix `bull`, physical keys generally use:
+
+```text
+bull:<queueName>:<suffix>
+```
+
+For the default queues, examples include:
+
+```text
+bull:credit.lifecycle:wait
+bull:credit.lifecycle:active
+bull:credit.lifecycle:delayed
+bull:credit.lifecycle:completed
+bull:credit.lifecycle:failed
+bull:credit.lifecycle:events
+bull:credit.lifecycle:meta
+
+bull:credit.commands.hypersign-kyc-api-pricing:wait
+bull:credit.commands.hypersign-kyc-api-pricing:active
+bull:credit.commands.hypersign-kyc-api-pricing:delayed
+bull:credit.commands.hypersign-kyc-api-pricing:failed
+bull:credit.commands.hypersign-kyc-api-pricing:events
+```
+
+BullMQ also creates job records and internal keys such as IDs, markers,
+priorities, stalled checks, and dependency state. These are BullMQ
+implementation details and may vary by BullMQ version. Do not read, mutate, or
+expire them directly; use BullMQ APIs.
+
+The physical prefix defaults to `bull` only when the host adapter does not set
+BullMQ's `prefix` option. The SDK's `keyPrefix` and `redisHashTag` do not change
+BullMQ keys. Likewise, an ioredis `keyPrefix` must not be used for BullMQ;
+configure BullMQ's own `prefix` option in the host adapter when isolation is
+required.
+
+### Deterministic job IDs
+
+| Message | SDK/provider job ID |
+| --- | --- |
+| Lifecycle event | `<catalogId>-<redis-stream-eventId>` |
+| Rejected command event | `<catalogId>-<commandId>-rejected` |
+| Inbound command | Set by the trusted producer; normally the same stable value as `commandId`. |
+
+Example lifecycle identifiers:
+
+```text
+Redis Stream event ID:  1787123456789-0
+Catalog ID:             hypersign-kyc-api-pricing
+BullMQ job ID:          hypersign-kyc-api-pricing-1787123456789-0
+```
+
+The stable lifecycle job ID helps BullMQ reject a duplicate while that job
+record still exists. It is not a permanent idempotency guarantee: a job can be
+created again after host retention removes the old record. Downstream consumers
+must enforce a durable unique constraint on envelope `eventId`.
+
+The Redis Stream consumer group is not a BullMQ key. By default it is named
+`credit-bull-relay:hypersign-kyc-api-pricing` and is stored as metadata on the SDK outbox Stream. Each
+relay process uses a unique `<process-id>-<UUID>` consumer name so pending work
+can be reclaimed after `pendingIdleMs`.
+
+## Register the SDK
+
+`CreditModule` is global and installs `CreditInterceptor` as an
+`APP_INTERCEPTOR`. Controllers need no pricing decorator.
+
+```ts
+// app.module.ts
+import { Module } from '@nestjs/common';
+import { CreditModule } from '@hypersign-protocol/credit-middleware';
+import { CreditInfrastructureModule } from './credit-infrastructure.module';
+
+interface AuthenticatedRequest {
+  auth?: {
+    tenantId: string;
+    applicationId: string;
+    accountType: 'BUSINESS';
+  };
+  requestId?: string;
+}
+
+@Module({
+  imports: [
+    CreditInfrastructureModule,
+    CreditModule.forRoot({
+      keyPrefix: 'hypersign-credit',
+      redisHashTag: 'hypersign-credit',
+      leaseMs: 60_000,
+      retentionMs: 7 * 24 * 60 * 60 * 1_000,
+      criticalBalance: 20,
+      requestContextResolver: (unknownRequest) => {
+        const request = unknownRequest as AuthenticatedRequest;
+        return {
+          subject: {
+            appId: request.auth?.applicationId ?? '',
+            tenantId: request.auth?.tenantId,
+            appType: request.auth?.accountType,
+          },
+          requestId: request.requestId,
+        };
+      },
+    }),
+  ],
+})
+export class AppModule {}
+```
+
+Resolve the subject only from identity already verified by the host. Never
+trust an `appId`, `tenantId`, `appType`, or `creditType` supplied directly by a
+request body, query string, or unverified header.
+
+Use `forRootAsync()` when configuration or adapters come from Nest DI:
+
+```ts
+CreditModule.forRootAsync({
+  imports: [CreditInfrastructureModule, ConfigurationModule],
+  inject: [AppConfig],
+  useFactory: (config: AppConfig) => ({
+    keyPrefix: config.creditKeyPrefix,
+    redisHashTag: config.creditHashTag,
+    requestContextResolver: resolveCreditContext,
+  }),
+});
+```
+
+The default context resolver is a compatibility fallback. Production
+applications should always provide an explicit resolver.
+
+## Request identity and idempotency
+
+Set a stable request ID before the global interceptor runs, preferably in the
+authentication middleware. It should be:
+
+- unique for each logical API attempt;
+- stable across an infrastructure retry of that same attempt; and
+- generated by trusted server infrastructure.
+
+The catalog policy appends each charge ID to the request ID. Reusing an ID with
+different credit semantics is rejected. Replaying an already-created catalog
+reservation returns HTTP `409 Conflict` instead of running the controller
+again.
+
+When the resolver does not return a request ID, the SDK generates a UUID. That
+keeps one execution safe but cannot deduplicate a later client retry.
+
+## Grant credits
+
+Grant plans only from trusted billing or payment infrastructure.
+
+```ts
+import {
+  CreditService,
+  CreditSubject,
+} from '@hypersign-protocol/credit-middleware';
+
+const subject: CreditSubject = {
+  tenantId: 'tenant_1',
+  appType: 'BUSINESS',
+  appId: 'business_123',
+  creditType: 'API_CREDIT',
+};
+
+await creditService.grant({
+  subject,
+  planId: 'plan_01',
+  amount: 100,
+  grantedAt: Date.now(),
+  expiresAt: Date.now() + 30 * 24 * 60 * 60 * 1_000,
+  referenceId: 'payment_txn_01',
+  reason: 'credit_purchase',
+});
+```
+
+`amount`, `grantedAt`, and `expiresAt` must be positive safe integers.
+Timestamps use Unix epoch milliseconds. `grantedAt` cannot be in the future,
+and a new plan cannot already be expired.
+
+Grant retries are idempotent only when the plan's wallet, amount, grant time,
+expiry, and reference all match. Within one SDK Redis namespace:
+
+- a `planId` belongs to only one wallet;
+- a `referenceId` identifies only one plan; and
+- reusing either identifier with different semantics is rejected.
+
+Before the first grant, `getBalance(subject)` returns `null`. Paid requests fail
+closed with HTTP `402 Payment Required`.
+
+## Automatic HTTP charging
+
+For each non-free catalog route, the interceptor:
+
+1. resolves the trusted subject;
+2. reserves every catalog charge;
+3. invokes the controller only after all reservations succeed;
+4. commits `IMMEDIATE` reservations after the response Observable completes;
+5. leaves `DEFERRED` reservations active; and
+6. rolls back active reservations if controller execution or settlement fails.
+
+If a route has multiple charges and a later reservation fails, the SDK rolls
+back earlier reservations created during the same policy execution.
+
+### FIFO example
+
+```text
+plan-old available  10
+plan-new available  50
+request cost        25
+
+stored allocation:
+  plan-old          10
+  plan-new          15
+```
+
+Commit produces one event per allocation. Rollback restores each allocation to
+its original plan only while the plan is still active. If the plan expires
+while credit is reserved, rollback records the expired amount and does not
+resurrect it. Commit remains valid after plan expiry because reservation-time
+eligibility was already established.
+
+### Early-return middleware
+
+Middleware can terminate a response before the global interceptor runs. For a
+catalog route released with `boundary: true`, install
+`CreditBoundaryMiddleware` after trusted authentication and before any
+early-return middleware:
+
+```ts
+consumer
+  .apply(
+    AuthenticationContextMiddleware,
+    CreditBoundaryMiddleware,
+    EarlyReturnMiddleware,
+  )
+  .forRoutes('*');
+```
+
+If the response ends before the interceptor claims the reservation, the
+boundary rolls it back. Routes without `boundary: true` are unaffected.
+
+## Deferred settlement
+
+Use `DEFERRED` settlement when another process determines the final outcome.
+
+```ts
+const reservation = await creditService.reserve({
+  subject,
+  requestId: 'job_019',
+  operation: 'GENERATE_REPORT',
+  amount: 25,
+  settlementMode: 'DEFERRED',
+});
+
+// Renew long-running work before reservation.expiresAt.
+const newExpiry = await creditService.renew(
+  reservation.reservationId,
+  reservation.leaseToken,
+);
+
+// Apply exactly one final outcome.
+await creditService.commit(reservation.reservationId);
+// or:
+await creditService.rollback(reservation.reservationId, 'job_failed');
+```
+
+`renew()` extends the reservation lease by `leaseMs`, increments its version,
+and returns the new expiry. It does not extend the underlying plan expiry.
+
+Set `autoRecover: false` only on a `DEFERRED` reservation that must remain
+active until explicit settlement. The host then owns orphan detection and
+settlement completely.
+
+For a catalog-created deferred charge, use `getCreditRequestState()` to obtain
+the reservation ID inside the controller:
+
+```ts
+import { getCreditRequestState } from '@hypersign-protocol/credit-middleware';
+
+const state = getCreditRequestState(request);
+const reservationId = state?.reservations.find(
+  ({ charge }) => charge.settlementMode === 'DEFERRED',
+)?.reservation.reservationId;
+```
+
+## Recovery
+
+The SDK does not start an interval or cron job. Invoke the stateless recovery
+entry point from external scheduling infrastructure or a dedicated worker:
+
+```ts
+const processed = await creditRecoveryService.runOnce();
+```
+
+Each pass processes a bounded batch of:
+
+- expired reservation leases with `autoRecover: true`; and
+- expired, unused plan balances.
+
+Run recovery more frequently than `leaseMs`. During a backlog, repeat passes
+until due work is drained. Multiple processes may run recovery concurrently;
+Lua state transitions ensure only one applies each transition. Overlapping
+calls on the same service instance return `0` for the additional call.
+
+## BullMQ transport
+
+BullMQ transport is optional. When enabled, the SDK:
+
+- relays the transactional Redis Stream outbox to lifecycle queues; and
+- creates a worker for trusted credit commands.
+
+The host supplies a structural `CreditBullMqProvider`. A complete adapter is in
+[`../example/bullmq.module.ts`](../example/bullmq.module.ts).
+
+```ts
+CreditModule.forRootAsync({
+  imports: [CreditInfrastructureModule, BillingQueueModule],
+  inject: [CREDIT_BULLMQ_PROVIDER, CREDIT_STREAM_REDIS],
+  useFactory: (provider, streamClient) => ({
+    keyPrefix: 'hypersign-credit',
+    redisHashTag: 'hypersign-credit',
+    requestContextResolver: resolveCreditContext,
+    bullMq: {
+      provider,
+      streamClient,
+      lifecycleQueueNames: [
+        'credit.lifecycle.reconciliation',
+        'credit.lifecycle.notifications',
+      ],
+      commandQueueName: 'credit.commands.hypersign-kyc-api-pricing',
+    },
+  }),
+});
+```
+
+The Stream entry is acknowledged only after every configured lifecycle queue
+accepts the BullMQ job. Delivery is at least once: consumers must apply
+`eventId` idempotently.
+
+BullMQ workers on the same queue compete. Use separate queue names when
+reconciliation, notifications, and analytics must each receive every event.
+
+## Lifecycle events
+
+Lifecycle jobs use this envelope:
+
+```ts
+interface CreditLifecycleEventEnvelope {
+  eventId: string;
+  schemaVersion: 2;
+  catalogVersion: string;
+  catalogId: string;
+  event: Record<string, unknown>;
+}
+```
+
+| Job name | Event type | Meaning |
+| --- | --- | --- |
+| `credit.granted` | `CREDIT_GRANTED` | A recharge plan was created. |
+| `credit.plan-expired` | `PLAN_EXPIRED` | Unused plan credit expired. |
+| `credit.reserved` | `RESERVED` | Credit was allocated from one plan. |
+| `credit.committed` | `COMMITTED` | One plan allocation was finalized. |
+| `credit.rolled-back` | `ROLLED_BACK` | One allocation was processed as a rollback. |
+| `credit.expired` | `EXPIRED` | Recovery processed an abandoned allocation. |
+| `credit.critical-balance` | `CRITICAL_BALANCE` | A reserve left the wallet at or below its threshold. |
+| `credit.command-rejected` | n/a | An inbound command failed validation or execution. |
+
+A reservation funded by multiple plans emits a separate reserved and
+finalization event for each `planId`. Rollback/recovery events distinguish
+`restoredAmount` from `expiredAmount`; consumers must not assume the full
+allocation was restored.
+
+Recommended downstream keys:
+
+- delivery idempotency: envelope `eventId`;
+- reconciliation: `reservationId + planId + event type`.
+
+Persist the event receipt and its financial side effect in the same database
+transaction before acknowledging the BullMQ job.
+
+## Command messages
+
+Trusted producers send schema-v2 envelopes to
+`credit.commands.<catalogId>` by default:
+
+```ts
+interface CreditCommandEnvelope {
+  commandId: string;
+  schemaVersion: 2;
+  catalogId: string;
+  requestedAt?: string;
+  source?: string;
+  payload: Record<string, unknown>;
+}
+```
+
+Use the originating business event ID for both `commandId` and BullMQ `jobId`.
+
+### Grant command
+
+Job name: `credit.grant.requested`
+
+```ts
+await provider.add(
+  'credit.commands.hypersign-kyc-api-pricing',
+  'credit.grant.requested',
+  {
+    schemaVersion: 2,
+    commandId: payment.eventId,
+    catalogId: 'hypersign-kyc-api-pricing',
+    source: 'payment-service',
+    payload: {
+      subject: {
+        tenantId: 'tenant_1',
+        appType: 'BUSINESS',
+        appId: 'business_123',
+        creditType: 'API_CREDIT',
+      },
+      planId: payment.planId,
+      amount: 100,
+      grantedAt: payment.createdAt.getTime(),
+      expiresAt: payment.expiresAt.getTime(),
+      referenceId: payment.transactionId,
+      reason: 'credit_purchase',
+    },
+  },
+  { jobId: payment.eventId },
+);
+```
+
+If `referenceId` is absent, the command worker uses `commandId`.
+
+### Reserve command
+
+Job name: `credit.reserve.requested`
+
+Command-created reservations support only `DEFERRED` settlement.
+
+```json
+{
+  "schemaVersion": 2,
+  "commandId": "async-job-019",
+  "catalogId": "hypersign-kyc-api-pricing",
+  "source": "workflow-service",
+  "payload": {
+    "subject": {
+      "tenantId": "tenant_1",
+      "appType": "BUSINESS",
+      "appId": "business_123",
+      "creditType": "API_CREDIT"
+    },
+    "requestId": "async-job-019",
+    "amount": 25,
+    "operation": "GENERATE_REPORT",
+    "settlementMode": "DEFERRED",
+    "autoRecover": true
+  }
+}
+```
+
+### Settlement commands
+
+Job names:
+
+- `credit.commit.requested`
+- `credit.rollback.requested`
+
+```json
+{
+  "schemaVersion": 2,
+  "commandId": "async-job-019:commit",
+  "catalogId": "hypersign-kyc-api-pricing",
+  "payload": { "reservationId": "3db57c81-..." }
+}
+```
+
+Rollback also accepts an optional `payload.reason`. Settlement returns
+`APPLIED`, the existing reservation status, or `NOT_FOUND` as the BullMQ job
+result.
+
+Invalid commands publish `credit.command-rejected` when possible and then
+throw, allowing the host's BullMQ retry policy to run.
+
+## Service API reference
+
+`CreditService` is injectable after `CreditModule` registration.
+
+| Method | Behavior |
+| --- | --- |
+| `grant(input)` | Creates or exactly replays an immutable recharge plan. |
+| `reserve(input)` | Atomically allocates credit and creates a leased reservation. |
+| `commit(id)` | Commits an active reservation; returns `true` only when applied. |
+| `rollback(id, reason?)` | Rolls back an active reservation; returns `true` only when applied. |
+| `renew(id, leaseToken)` | Renews an active lease and returns the new expiry. |
+| `getBalance(subject)` | Returns available unexpired credit, or `null` before any grant. |
+| `getPlans(subject)` | Returns plans ordered by grant time and plan ID. |
+| `getReservation(id)` | Returns retained reservation state or `null`. |
+| `recoverExpired(now?)` | Recovers due auto-recoverable reservations. |
+| `recoverExpiredPlans(now?)` | Expires due unused plan balances. |
+
+### `GrantCreditsInput`
+
+```ts
+interface GrantCreditsInput {
+  subject: CreditSubject;
+  planId: string;
+  amount: number;
+  grantedAt: number;
+  expiresAt: number;
+  referenceId: string;
+  reason?: string;
+}
+```
+
+### `ReserveCreditInput`
+
+```ts
+interface ReserveCreditInput {
+  subject: CreditSubject;
+  requestId?: string;
+  amount: number;
+  settlementMode?: 'IMMEDIATE' | 'DEFERRED';
+  operation?: string;
+  autoRecover?: boolean;
+}
+```
+
+`settlementMode` defaults to `IMMEDIATE`; `autoRecover` defaults to `true`.
+`autoRecover: false` requires `DEFERRED` settlement.
+
+### `ReserveCreditResult`
+
+```ts
+interface ReserveCreditResult {
+  reservationId: string;
+  leaseToken: string;
+  scopeId: string;
+  remainingBalance: number;
+  expiresAt: number;
+  autoRecover: boolean;
+  existing: boolean;
+  settlementMode: 'IMMEDIATE' | 'DEFERRED';
+  subject: CreditSubject;
+  allocations: Array<{
+    planId: string;
+    amount: number;
+    planBalanceAfter: number;
+  }>;
+}
+```
+
+### Plan status
+
+`getPlans()` returns `ACTIVE`, `DEPLETED`, `EXPIRED`, or `REVOKED`. Expired
+plans are reported with zero available credit even before recovery persists
+their expiry event.
+
+### Reservation status
+
+`getReservation()` returns `RESERVED`, `COMMITTED`, `ROLLED_BACK`, or `EXPIRED`.
+Finalized reservation and request-id records are retained for `retentionMs`.
+
+### Return-value idempotency
+
+`commit()` and `rollback()` return `true` only when that call applies the state
+transition. They return `false` for missing or already-finalized reservations.
+Call `getReservation()` when a caller needs to distinguish those cases.
+
+## Configuration reference
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `requestContextResolver` | compatibility fallback | Returns the trusted subject and optional request ID. Override in production. |
+| `leaseMs` | `60000` | Reservation lease duration in milliseconds. |
+| `retentionMs` | `604800000` | Finalized reservation and request-record retention (7 days). |
+| `recoveryBatchSize` | `100` | Maximum reservations and maximum plans processed per recovery pass. |
+| `criticalBalance` | `0` | Threshold or subject-based function. Emits an event; never replenishes credit. |
+| `maxActivePlans` | `1000` | Maximum active FIFO plans for one wallet. |
+| `maxPlanAllocationsPerReservation` | `100` | Maximum plans one reservation may span. |
+| `keyPrefix` | `credit` | Redis namespace prefix; braces are forbidden. |
+| `redisHashTag` | `credit` | Shared Redis Cluster hash tag; braces are forbidden. |
+| `eventStreamMaxLength` | `100000` | Approximate Redis Stream entry limit. |
+| `bullMq` | disabled | Optional lifecycle relay and command worker configuration. |
+
+BullMQ defaults:
+
+| Option | Default |
+| --- | --- |
+| `lifecycleQueueNames` | `['credit.lifecycle']` |
+| `commandQueueName` | `credit.commands.<catalogId>` |
+| `consumerGroup` | `credit-bull-relay:<catalogId>` |
+| `batchSize` | `100` |
+| `blockMs` | `5000` |
+| `pendingIdleMs` | `30000` |
+
+Durations, capacities, and batch sizes must be positive safe integers.
+`criticalBalance` must be, or resolve to, a non-negative safe integer.
+
+## Errors and HTTP behavior
+
+| Status | Typical condition |
+| --- | --- |
+| `400 Bad Request` | Reused identity with different semantics, invalid grant state, or invalid boundary claim. |
+| `401 Unauthorized` | A charged request has no non-empty trusted `subject.appId`. |
+| `402 Payment Required` | Unexpired plans cannot fund the complete charge. |
+| `409 Conflict` | A catalog request ID already has a reservation. |
+| `500 Internal Server Error` | A request route is not cataloged or stored state is inconsistent. |
+| `503 Service Unavailable` | Active-plan or allocation limit reached, or automatic commit could not apply. |
+
+Configuration and catalog-audit errors throw during bootstrap. Do not catch and
+ignore these failures.
+
+## Production operations
+
+### Redis baseline
+
+- Enable TLS and authentication.
+- Use AOF, replication, and tested backups.
+- Set `maxmemory-policy noeviction`.
+- Monitor latency, memory, persistence, replication lag, and failover.
+- Capacity-plan the single Cluster slot used by the SDK hash tag.
+
+All Lua keys intentionally share one Redis Cluster slot. For independent
+scaling, deploy separate namespaces rather than splitting one namespace.
+
+Never delete or edit individual SDK keys during an incident. Plans,
+reservations, idempotency records, expiry indexes, and events cross-reference
+one another.
+
+### Required alerts
+
+Alert on:
+
+- HTTP `402`, `409`, and credit-policy `503` rates;
+- recovery errors, due backlog, and repeated batch saturation;
+- Stream pending depth and oldest pending age;
+- relay shutdown or BullMQ add failures;
+- `credit.command-rejected` events;
+- wallets approaching `maxActivePlans`;
+- reservations approaching lease expiry; and
+- Redis memory, persistence, and replication health.
+
+The relay automatically recreates a missing Stream consumer group. Other
+non-recoverable relay failures stop its loop. Correct the dependency or
+configuration failure and restart the host.
+
+### Stream capacity
+
+Set `eventStreamMaxLength` above peak event volume multiplied by the longest
+credible relay outage. Stream trimming is approximate. An entry trimmed before
+delivery cannot be reconstructed solely from BullMQ.
+
+### Reconciliation
+
+Regularly reconcile:
+
+- payment transactions against immutable grant plans;
+- plan totals, remaining amounts, and statuses;
+- reservations against their allocation arrays;
+- Stream IDs against downstream event receipts; and
+- committed allocation events against the financial ledger.
+
+Use envelope `eventId` for delivery idempotency. Retain
+`reservationId + planId + event type` as a business reconciliation key.
+
+### Incident response
+
+1. Stop manual settlement and replay actions.
+2. Preserve Redis, BullMQ, API, recovery-worker, and consumer logs.
+3. Identify the namespace, subject, plan, reservation, request, command, and
+   event IDs involved.
+4. Read and reconcile state without modifying Redis keys.
+5. Repair the failed transport or consumer and replay idempotently.
+6. Resume recovery and verify convergence across all stores.
+
+Never correct a balance with a direct Redis edit. Use a reviewed migration or
+application-level financial operation that preserves the audit trail.
+
+## Testing
+
+### Local validation
+
+```sh
+npm ci
+npm run build
+npm test
+npm run lint
+```
+
+Redis integration verification requires a reachable Redis instance:
+
+```sh
+REDIS_URL=redis://localhost:6379 npm run test:redis
+```
+
+### Application test matrix
+
+Before production rollout, verify:
+
+- free and charged catalog routes;
+- missing and exhausted wallets;
+- exact grant retries and conflicting identifier reuse;
+- duplicate request IDs and retry behavior;
+- controller success, synchronous failure, and Observable failure;
+- multi-charge compensation;
+- reservations spanning several FIFO plans;
+- plan expiry during an active reservation;
+- deferred renewal, commit, rollback, and orphan recovery;
+- concurrent reserve and recovery workers;
+- Stream/BullMQ outage and replay;
+- duplicate lifecycle delivery; and
+- route-audit failure during an intentional catalog mismatch.
+
+## Upgrade notes
+
+Version 4 stores Redis state under:
+
+```text
+<keyPrefix>:v2:{<redisHashTag>}:...
+```
+
+It does not read version 3 aggregate-balance keys. Moving from v3 requires an
+explicit migration or an isolated namespace whose grants are rebuilt from the
+financial system of record.
+
+Before rollback, confirm the target SDK understands the existing key schema,
+catalog, and event schema. Do not point incompatible SDK versions at the same
+namespace.
+
+## Related technical references
+
+- [End-to-end technical architecture](technical-architecture.md)
+- [Redis keyspace and stored records](redis-keyspace.md)
+- [Lua state transitions](lua-scripts.md)
+- [Runnable SDK example](../example/)
+- [Independent lifecycle and command example](../example/event-server/README.md)

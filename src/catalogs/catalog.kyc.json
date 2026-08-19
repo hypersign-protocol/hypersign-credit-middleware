@@ -1,5 +1,5 @@
 {
-  "catalogId": "KYC",
+  "catalogId": "hypersign-kyc-api-pricing",
   "version": "3.20.0",
   "globalPrefix": "api",
   "versioning": "URI",

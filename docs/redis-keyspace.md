@@ -1,5 +1,8 @@
 # Redis keyspace
 
+For command-to-event sequence diagrams and complete execution algorithms, see
+the [technical architecture](technical-architecture.md).
+
 Version 4 uses a versioned base:
 
 ```text
@@ -17,6 +20,42 @@ tenantId, appType, appId, creditType
 
 Each dimension records whether it is absent and URI-encodes its value. The
 catalog ID is transport identity and is not part of wallet scope.
+
+## Deterministic construction
+
+The scope uses this fixed dimension order and presence-marker format:
+
+```text
+tenant=<encoded>|appType=<encoded>|app=<encoded>|creditType=<encoded>
+```
+
+`<encoded>` is `0` for an absent or trimmed-empty optional value and
+`1:<encodeURIComponent(value)>` for a present value. `appId` is required.
+Values are trimmed and case-sensitive.
+
+For example:
+
+```ts
+{
+  tenantId: 'tenant/acme',
+  appType: 'BUSINESS',
+  appId: 'business:123',
+  creditType: 'API_CREDIT'
+}
+```
+
+produces:
+
+```text
+tenant=1:tenant%2Facme|appType=1:BUSINESS|app=1:business%3A123|creditType=1:API_CREDIT
+```
+
+This value is an identifier, not encrypted data. Redis key enumeration can
+expose encoded account metadata and must be access-controlled.
+
+`planId`, `referenceId`, `requestId`, and `reservationId` are URI-encoded when
+used in keys. The versioned base and scope make key generation identical across
+API instances and recovery workers.
 
 ## Keys
 
@@ -117,6 +156,41 @@ it. BullMQ itself creates keys such as:
 bull:credit.lifecycle:*
 bull:credit.commands.<catalogId>:*
 ```
+
+These physical names assume BullMQ's default `prefix: 'bull'`. A host adapter
+may configure another BullMQ prefix. The SDK's `keyPrefix` and
+`redisHashTag` affect only SDK-owned state and Stream keys; they do not affect
+BullMQ keys.
+
+Typical BullMQ suffixes include `wait`, `active`, `delayed`, `completed`,
+`failed`, `events`, `meta`, IDs, markers, and individual job records. They are
+owned by BullMQ and must be accessed through BullMQ APIs rather than edited or
+expired directly.
+
+Default queue and relay identifiers are:
+
+```text
+lifecycle queue:       credit.lifecycle
+command queue:         credit.commands.<catalogId>
+Stream consumer group: credit-bull-relay:<catalogId>
+```
+
+Lifecycle BullMQ job IDs are deterministic:
+
+```text
+<catalogId>-<redisStreamEventId>
+```
+
+A rejected command uses:
+
+```text
+<catalogId>-<commandId>-rejected
+```
+
+Inbound command job IDs are chosen by the trusted producer and should match the
+stable `commandId`. BullMQ job-ID deduplication lasts only while the job record
+is retained; lifecycle consumers still need a durable uniqueness constraint on
+the envelope `eventId`.
 
 Use AOF, replication, tested backups, and `noeviction`. Evicting a plan or
 reservation independently can make a later rollback unrecoverable.
