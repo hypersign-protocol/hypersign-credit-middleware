@@ -1,10 +1,15 @@
 # Independent lifecycle and command server
 
+First-time integrators should follow the
+[integration guide](../../docs/integration-guide.md). It shows where
+this process fits, how to start it, and how to verify the first plan before the
+details below.
+
 This process represents trusted billing infrastructure outside the SDK-installed
 API server. It:
 
 - consumes plan-level lifecycle jobs from `credit.lifecycle`;
-- consumes DEV `credit.observed` usage jobs from the same lifecycle queue;
+- consumes `dev` `credit.observed` usage jobs from the same lifecycle queue;
 - publishes schema-v3 commands to `credit.commands.CAVACH_API`;
 - keeps a small in-memory event list only for demonstration.
 
@@ -78,7 +83,7 @@ with a durable consumer that validates the envelope and applies a unique
 constraint on `eventId`. Persist the event receipt and its financial side
 effect in one database transaction before returning from the BullMQ worker.
 
-A DEV HTTP call produces `credit.observed` with `requestedAmount` and
+A `dev` HTTP call produces `credit.observed` with `requestedAmount` and
 `deductedAmount: 0`; it does not produce reservation or settlement jobs.
 
 This service and the API server must use the same Redis/BullMQ configuration.

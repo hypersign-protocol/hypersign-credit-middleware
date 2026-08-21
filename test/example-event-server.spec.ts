@@ -1,4 +1,11 @@
-import { CREDIT_EVENT_NAMES, CreditBullMqJob } from '../src';
+import {
+  CreditAppType,
+  CreditBullMqJob,
+  CreditEventType,
+  CreditEventName,
+  CreditServiceType,
+  CreditType,
+} from '../src';
 import { ExampleBullMqProvider } from '../example/bullmq.module';
 import { CreditEventsController } from '../example/event-server/credit-events.controller';
 import { CreditEventStore } from '../example/event-server/event-store.service';
@@ -30,17 +37,17 @@ describe('repository event-server example', () => {
     });
     expect(add).toHaveBeenCalledWith(
       'credit.commands.CAVACH_API',
-      CREDIT_EVENT_NAMES.GRANT_REQUESTED,
+      CreditEventName.GRANT_REQUESTED,
       expect.objectContaining({
         schemaVersion: 3,
         commandId: 'grant-CAVACH_API-api-plan-001',
-        serviceType: 'CAVACH_API',
+        serviceType: CreditServiceType.CAVACH_API,
         payload: expect.objectContaining({
           subject: {
             tenantId: 'tenant/acme',
             appId: 'app:123',
-            appType: 'CAVACH_API',
-            creditType: 'API_CREDIT',
+            appType: CreditAppType.CAVACH_API,
+            creditType: CreditType.API_CREDIT,
           },
           amount: 1_000,
           criticalBalance: 400,
@@ -67,13 +74,13 @@ describe('repository event-server example', () => {
 
     const job: CreditBullMqJob = {
       id: 'CAVACH_API-1-0',
-      name: CREDIT_EVENT_NAMES.CREDIT_GRANTED,
+      name: CreditEventName.CREDIT_GRANTED,
       data: {
         schemaVersion: 3,
-        serviceType: 'CAVACH_API',
+        serviceType: CreditServiceType.CAVACH_API,
         catalogVersion: '3.20.0',
         eventId: '1-0',
-        event: { type: 'CREDIT_GRANTED', appId: 'app:123' },
+        event: { type: CreditEventType.CREDIT_GRANTED, appId: 'app:123' },
       },
     };
     await processor!(job);

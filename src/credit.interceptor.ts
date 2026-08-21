@@ -36,6 +36,10 @@ import {
   CreditRequestContext,
   ResolvedCreditOptions,
 } from './credit.types';
+import {
+  CreditBillingMode,
+  CreditSettlementMode,
+} from './credit.enums';
 
 export const CREDIT_REQUEST_STATE = Symbol('CREDIT_REQUEST_STATE');
 
@@ -131,9 +135,9 @@ export class CreditInterceptor implements NestInterceptor {
 
   private async commitSequentially(actions: AppliedCreditAction[]): Promise<void> {
     for (const action of actions) {
-      if (action.billingMode !== 'ENFORCE') continue;
+      if (action.billingMode !== CreditBillingMode.ENFORCE) continue;
       const { charge, reservation } = action;
-      if (charge.settlementMode !== 'IMMEDIATE') continue;
+      if (charge.settlementMode !== CreditSettlementMode.IMMEDIATE) continue;
       if (!await this.credits.commit(reservation.reservationId)) {
         throw new ServiceUnavailableException(
           `Credit reservation ${reservation.reservationId} could not be committed`,

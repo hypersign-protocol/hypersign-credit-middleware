@@ -5,6 +5,11 @@ import {
   CreditBoundaryMiddleware,
 } from '../src/credit-boundary.middleware';
 import { DEFAULT_CREDIT_OPTIONS } from '../src/credit.constants';
+import {
+  CreditBillingMode,
+  CreditEnvironment,
+  CreditSettlementMode,
+} from '../src/credit.enums';
 
 describe('catalog-driven CreditBoundaryMiddleware', () => {
   const options = {
@@ -21,12 +26,12 @@ describe('catalog-driven CreditBoundaryMiddleware', () => {
     requestContextResolver: () => ({
       subject: { appId: 'user_123' },
       requestId: 'req_1',
-      environment: 'PROD' as const,
+      environment: CreditEnvironment.PROD,
     }),
   };
   const catalog = new CreditCatalogService(options);
   const applied = [{
-    billingMode: 'ENFORCE' as const,
+    billingMode: CreditBillingMode.ENFORCE,
     charge: catalog.find('POST', '/paid/123')!.charges[0],
     reservation: {
       reservationId: 'res_1', remainingBalance: 90, leaseToken: 'lease_1',
@@ -34,8 +39,9 @@ describe('catalog-driven CreditBoundaryMiddleware', () => {
         { planId: 'plan-1', amount: 10, planBalanceAfter: 90 },
       ],
       expiresAt: Date.now() + 60_000, existing: false, autoRecover: true,
-      environment: 'PROD' as const, billingMode: 'ENFORCE' as const,
-      settlementMode: 'IMMEDIATE' as const,
+      environment: CreditEnvironment.PROD,
+      billingMode: CreditBillingMode.ENFORCE,
+      settlementMode: CreditSettlementMode.IMMEDIATE,
     },
   }];
   const executor = { apply: jest.fn(), rollbackAll: jest.fn() };

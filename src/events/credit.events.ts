@@ -1,15 +1,11 @@
+import {
+  CreditBillingMode,
+  CreditEnvironment,
+  CreditEventType,
+} from '../credit.enums';
 import { CreditSettlementMode, CreditSubject } from '../credit.types';
 
-/** All event type identifiers emitted by this SDK. */
-export type CreditEventType =
-  | 'RESERVED'
-  | 'COMMITTED'
-  | 'ROLLED_BACK'
-  | 'EXPIRED'
-  | 'PLAN_EXPIRED'
-  | 'CREDIT_GRANTED'
-  | 'CREDIT_OBSERVED'
-  | 'CRITICAL_BALANCE';
+export { CreditEventType } from '../credit.enums';
 
 /** Fields present on every credit event. */
 export interface BaseCreditEvent {
@@ -31,9 +27,9 @@ export interface BaseCreditEvent {
 
 /** Emitted after a credit reservation is successfully created in Redis. */
 export interface CreditReservedEvent extends BaseCreditEvent {
-  type: 'RESERVED';
-  environment: 'PROD';
-  billingMode: 'ENFORCE';
+  type: CreditEventType.RESERVED;
+  environment: CreditEnvironment.PROD;
+  billingMode: CreditBillingMode.ENFORCE;
   planId: string;
   reservationId: string;
   requestId?: string;
@@ -58,9 +54,9 @@ export interface CreditReservedEvent extends BaseCreditEvent {
  * credit deduction is permanent).
  */
 export interface CreditCommittedEvent extends BaseCreditEvent {
-  type: 'COMMITTED';
-  environment: 'PROD';
-  billingMode: 'ENFORCE';
+  type: CreditEventType.COMMITTED;
+  environment: CreditEnvironment.PROD;
+  billingMode: CreditBillingMode.ENFORCE;
   planId: string;
   reservationId: string;
   /** Number of credits that were permanently deducted. */
@@ -79,9 +75,9 @@ export interface CreditCommittedEvent extends BaseCreditEvent {
  * were refunded to the account).
  */
 export interface CreditRolledBackEvent extends BaseCreditEvent {
-  type: 'ROLLED_BACK';
-  environment: 'PROD';
-  billingMode: 'ENFORCE';
+  type: CreditEventType.ROLLED_BACK;
+  environment: CreditEnvironment.PROD;
+  billingMode: CreditBillingMode.ENFORCE;
   planId: string;
   reservationId: string;
   /** Number of credits refunded. */
@@ -104,9 +100,9 @@ export interface CreditRolledBackEvent extends BaseCreditEvent {
  * whose lease expired without being settled (e.g. process crash).
  */
 export interface CreditExpiredEvent extends BaseCreditEvent {
-  type: 'EXPIRED';
-  environment: 'PROD';
-  billingMode: 'ENFORCE';
+  type: CreditEventType.EXPIRED;
+  environment: CreditEnvironment.PROD;
+  billingMode: CreditBillingMode.ENFORCE;
   planId: string;
   reservationId: string;
   /** Number of credits refunded by the recovery pass. */
@@ -124,7 +120,7 @@ export interface CreditExpiredEvent extends BaseCreditEvent {
 
 /** Emitted after an idempotent credit top-up changes a scoped wallet. */
 export interface CreditGrantedEvent extends BaseCreditEvent {
-  type: 'CREDIT_GRANTED';
+  type: CreditEventType.CREDIT_GRANTED;
   planId: string;
   referenceId: string;
   amount: number;
@@ -137,7 +133,7 @@ export interface CreditGrantedEvent extends BaseCreditEvent {
 }
 
 export interface CreditPlanExpiredEvent extends BaseCreditEvent {
-  type: 'PLAN_EXPIRED';
+  type: CreditEventType.PLAN_EXPIRED;
   planId: string;
   expiredAmount: number;
   expiresAt: number;
@@ -151,9 +147,9 @@ export interface CreditPlanExpiredEvent extends BaseCreditEvent {
  * to send low-balance alerts or trigger a top-up workflow.
  */
 export interface CreditCriticalBalanceEvent extends BaseCreditEvent {
-  type: 'CRITICAL_BALANCE';
-  environment: 'PROD';
-  billingMode: 'ENFORCE';
+  type: CreditEventType.CRITICAL_BALANCE;
+  environment: CreditEnvironment.PROD;
+  billingMode: CreditBillingMode.ENFORCE;
   planId: string;
   /** Current aggregate wallet balance. */
   balanceAfter: number;
@@ -163,12 +159,12 @@ export interface CreditCriticalBalanceEvent extends BaseCreditEvent {
   threshold: number;
 }
 
-/** Emitted for a DEV request whose catalog usage was observed without billing. */
+/** Emitted for a dev request whose catalog usage was observed without billing. */
 export interface CreditObservedEvent extends BaseCreditEvent {
-  type: 'CREDIT_OBSERVED';
+  type: CreditEventType.CREDIT_OBSERVED;
   requestId: string;
-  environment: 'DEV';
-  billingMode: 'OBSERVE';
+  environment: CreditEnvironment.DEV;
+  billingMode: CreditBillingMode.OBSERVE;
   requestedAmount: number;
   deductedAmount: 0;
   operation?: string;

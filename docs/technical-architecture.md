@@ -255,20 +255,27 @@ sequenceDiagram
 The producer sends:
 
 ```ts
+import {
+  CreditAccountType,
+  CreditEventName,
+  CreditServiceType,
+  CreditType,
+} from '@hypersign-protocol/credit-middleware';
+
 await queue.add(
-  'credit.grant.requested',
+  CreditEventName.GRANT_REQUESTED,
   {
     schemaVersion: 3,
     commandId: payment.eventId,
-    serviceType: 'CAVACH_API',
+    serviceType: CreditServiceType.CAVACH_API,
     source: 'payment-service',
     requestedAt: new Date().toISOString(),
     payload: {
       subject: {
         tenantId: 'tenant_1',
-        appType: 'BUSINESS',
+        appType: CreditAccountType.BUSINESS,
         appId: 'business_123',
-        creditType: 'API_CREDIT',
+        creditType: CreditType.API_CREDIT,
       },
       planId: payment.planId,
       amount: 100,
@@ -404,14 +411,14 @@ flowchart TD
     Match -- Yes --> Free{charges empty?}
     Free -- Yes --> Controller[Execute controller]
     Free -- No --> Context[Resolve trusted subject + requestId + environment]
-    Context --> Identity{appId and PROD/DEV valid?}
+    Context --> Identity{appId and prod/dev valid?}
     Identity -- No --> Unauthorized[401]
     Identity -- Yes --> Environment{environment}
-    Environment -- DEV --> Observe[Atomically append one CREDIT_OBSERVED per charge]
+    Environment -- dev --> Observe[Atomically append one CREDIT_OBSERVED per charge]
     Observe --> Observed{Any observation replayed?}
     Observed -- Yes --> Conflict
     Observed -- No --> Run
-    Environment -- PROD --> Charges[Reserve each catalog charge sequentially]
+    Environment -- prod --> Charges[Reserve each catalog charge sequentially]
     Charges --> Funded{All reservations succeed?}
     Funded -- No --> Compensate[Rollback newly-created earlier reservations]
     Compensate --> Error[Return reservation error]
@@ -436,7 +443,7 @@ Its `creditType` comes from the catalog and is applied to the trusted base
 subject. This makes charges for different credit types separate wallets and
 separate reservations. Environment is not added to wallet scope.
 
-### DEV observation algorithm
+### dev observation algorithm
 
 One observation uses two keys: the scoped observation-idempotency hash and the
 transactional event Stream.
@@ -453,7 +460,7 @@ OBSERVE(input, now):
 ```
 
 The script never reads or writes balance, plan, reservation, or expiry-index
-keys. Thus a DEV call works without any granted plan and cannot consume PROD
+keys. Thus a `dev` call works without any granted plan and cannot consume `prod`
 credit. The observation remains an audit of attempted usage if the controller
 later fails or an early boundary ends the response. A missing or unknown
 environment is rejected before either Lua path.
@@ -632,7 +639,7 @@ configuration problem.
 | `CREDIT_GRANTED` | `credit.granted` | New grant Lua transaction | Once per new plan |
 | `PLAN_EXPIRED` | `credit.plan-expired` | Lazy expiry or recovery | Once per applied plan-expiry transition |
 | `RESERVED` | `credit.reserved` | Reserve Lua transaction | Once per plan allocation |
-| `CREDIT_OBSERVED` | `credit.observed` | DEV observation Lua transaction | Once per new catalog charge request ID |
+| `CREDIT_OBSERVED` | `credit.observed` | `dev` observation Lua transaction | Once per new catalog charge request ID |
 | `CRITICAL_BALANCE` | `credit.critical-balance` | Commit with a plan at/below its threshold | Once per qualifying committed plan allocation |
 | `COMMITTED` | `credit.committed` | Commit Lua transaction | Once per plan allocation |
 | `ROLLED_BACK` | `credit.rolled-back` | Explicit or interceptor rollback | Once per plan allocation |
@@ -663,10 +670,10 @@ Key fields:
 
 ```text
 type, timestamp, subject, scopeId, requestId, operation,
-environment=DEV, billingMode=OBSERVE, requestedAmount, deductedAmount=0
+environment=dev, billingMode=OBSERVE, requestedAmount, deductedAmount=0
 ```
 
-Meaning: the SDK matched and recorded a DEV catalog charge but performed no
+Meaning: the SDK matched and recorded a `dev` catalog charge but performed no
 balance check, reservation, plan allocation, or settlement. It therefore has
 no `planId` or `reservationId`.
 
@@ -702,7 +709,7 @@ Key fields:
 type, timestamp, subject, scopeId, planId, reservationId, requestId,
 amount, totalAmount, allocationIndex, allocationCount,
 balanceAfter, planBalanceAfter, expiresAt,
-autoRecover, settlementMode, operation, environment=PROD, billingMode=ENFORCE
+autoRecover, settlementMode, operation, environment=prod, billingMode=ENFORCE
 ```
 
 Meaning: `amount` was allocated from this event's plan. `totalAmount` is the
@@ -716,7 +723,7 @@ Key fields:
 ```text
 type, timestamp, subject, scopeId, planId,
 balanceAfter, planBalanceAfter, threshold,
-environment=PROD, billingMode=ENFORCE
+environment=prod, billingMode=ENFORCE
 ```
 
 Meaning: a committed allocation left this plan at or below the threshold fixed
@@ -733,7 +740,7 @@ Key fields:
 type, timestamp, subject, scopeId, planId, reservationId,
 amount, totalAmount, allocationIndex, allocationCount,
 balanceAfter, planBalanceAfter, operation,
-environment=PROD, billingMode=ENFORCE
+environment=prod, billingMode=ENFORCE
 ```
 
 Meaning: the allocation became a permanent charge. `balanceAfter` and
@@ -748,7 +755,7 @@ Key fields:
 type, timestamp, subject, scopeId, planId, reservationId,
 amount, totalAmount, allocationIndex, allocationCount,
 restoredAmount, expiredAmount, balanceAfter, planBalanceAfter,
-operation, reason, environment=PROD, billingMode=ENFORCE
+operation, reason, environment=prod, billingMode=ENFORCE
 ```
 
 Meaning: the allocation was finalized without commitment. A still-active plan
@@ -810,7 +817,7 @@ Idempotency exists at several independent layers:
 | Grant plan | global `plan-owner:<planId>` plus wallet plan hashes | Persistent | Prevent cross-wallet plan reuse and changed plan semantics |
 | Grant reference | global `grant:<referenceId>` | Persistent | Prevent payment reference reuse |
 | Reservation request | `request:<scope>:<requestId>` | Active + `retentionMs` after finalization | Return/reject duplicate reservation semantics |
-| DEV observation | `observation:<scope>:<requestId>` | `retentionMs` | Return original event ID or reject changed observation semantics |
+| `dev` observation | `observation:<scope>:<requestId>` | `retentionMs` | Return original event ID or reject changed observation semantics |
 | Reservation finalization | reservation status | Active + `retentionMs` | Ensure only first final transition applies |
 | Stream relay job | `<serviceType>-<eventId>` | Host BullMQ retention | Reduce duplicate lifecycle jobs while job record exists |
 | Downstream consumer | unique `eventId` in consumer database | Business retention | Permanent at-least-once delivery protection |

@@ -5,6 +5,10 @@ whose controllers implement the SDK's bundled CAVACH catalog. It is not a
 standalone application because a partial application would correctly fail the
 catalog route audit.
 
+For a walkthrough with every command and expected result, start with the
+[integration guide](../../docs/integration-guide.md).
+Use this page afterward as the copy-ready file reference.
+
 ## What each file does
 
 | File | Copy into the host as | Purpose |
@@ -77,7 +81,7 @@ Before the global credit interceptor runs, authentication must populate:
 request.service = {
   appId: verifiedApplication.appId,
   subdomain: verifiedApplication.subdomain,
-  env: verifiedApiCall.environment, // exactly PROD or DEV
+  env: verifiedApiCall.environment, // exactly lowercase prod or dev
 };
 request.requestId = trustedRequestId;
 ```
@@ -89,8 +93,9 @@ query, or an unauthenticated header.
 
 One server may process both environments:
 
-- `PROD` reserves and deducts catalog credit;
-- `DEV` emits `CREDIT_OBSERVED` with zero deduction; and
+- `prod` (`CreditEnvironment.PROD`) reserves and deducts catalog credit;
+- `dev` (`CreditEnvironment.DEV`) emits `CREDIT_OBSERVED` with zero deduction;
+  and
 - missing or unknown values are rejected before the controller executes.
 
 The example resolves this wallet:
@@ -99,8 +104,8 @@ The example resolves this wallet:
 {
   tenantId: request.service.subdomain,
   appId: request.service.appId,
-  appType: 'CAVACH_API',
-  creditType: 'API_CREDIT'
+  appType: CreditAppType.CAVACH_API,
+  creditType: CreditType.API_CREDIT
 }
 ```
 
@@ -135,9 +140,9 @@ Run these checks before enabling paid traffic:
 4. Inject `CreditService` in a temporary authenticated diagnostic endpoint or
    test and confirm `getBalance()` returns the granted amount for the exact
    resolved subject. Do not keep an unauthenticated balance endpoint.
-5. Call one priced route as PROD and confirm `credit.reserved` followed by
+5. Call one priced route as `prod` and confirm `credit.reserved` followed by
    `credit.committed`.
-6. Call the same route as DEV and confirm `credit.observed` with
+6. Call the same route as `dev` and confirm `credit.observed` with
    `deductedAmount: 0` and no wallet balance change.
 7. Grant a second plan before plan 1 runs out. Confirm FIFO consumes plan 1 and
    then plan 2 without HTTP 402.
@@ -169,7 +174,7 @@ when multiple systems must each receive every event.
 | Symptom | First check |
 | --- | --- |
 | Startup route-audit failure | The host must implement exactly the bundled catalog routes with prefix `api` and URI versions. |
-| HTTP 401 before controller | Auth did not provide a valid per-request `PROD` or `DEV` environment. |
+| HTTP 401 before controller | Auth did not provide a valid lowercase per-request `prod` or `dev` environment. |
 | HTTP 402 despite plan 2 in the database | Confirm plan 2 produced `CREDIT_GRANTED` and exists in the SDK Redis FIFO wallet. |
 | Grant command rejected | Inspect `credit.command-rejected` for subject, timestamp, identifier, or amount validation errors. |
 | Duplicate lifecycle processing | Add a durable unique index on envelope `eventId`; BullMQ delivery is at least once. |

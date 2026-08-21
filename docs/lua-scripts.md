@@ -6,13 +6,13 @@ safety and idempotency.
 
 ## OBSERVE_SCRIPT
 
-Records one DEV catalog charge without reading or changing any wallet, plan, or
+Records one `dev` catalog charge without reading or changing any wallet, plan, or
 reservation key. It atomically writes `CREDIT_OBSERVED` to the transactional
 outbox and an idempotency hash retained for `retentionMs`.
 
 - exact request retry returns the original Stream event ID;
 - changed amount, operation, or environment returns a conflict; and
-- the event reports `requestedAmount`, `deductedAmount=0`, `environment=DEV`,
+- the event reports `requestedAmount`, `deductedAmount=0`, `environment=dev`,
   and `billingMode=OBSERVE`.
 
 ## GRANT_SCRIPT

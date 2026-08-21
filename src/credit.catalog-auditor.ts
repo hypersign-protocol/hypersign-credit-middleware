@@ -11,6 +11,7 @@ import {
 } from '@nestjs/common/constants';
 import { DiscoveryService, MetadataScanner } from '@nestjs/core';
 import { CreditCatalogService, normalizePath } from './credit.catalog';
+import { CreditCatalogVersioning } from './credit.enums';
 import { CREDIT_OPTIONS, ResolvedCreditOptions } from './credit.types';
 import { Inject } from '@nestjs/common';
 
@@ -80,7 +81,8 @@ export class CreditCatalogAuditor implements OnApplicationBootstrap {
           for (const methodPath of methodPaths) {
             for (const version of versions) {
               const versionPath = typeof version === 'string' &&
-                (this.options.catalog.versioning ?? 'URI') === 'URI'
+                (this.options.catalog.versioning ?? CreditCatalogVersioning.URI) ===
+                  CreditCatalogVersioning.URI
                 ? `${this.options.catalog.uriVersionPrefix ?? 'v'}${version}`
                 : undefined;
               discovered.push({

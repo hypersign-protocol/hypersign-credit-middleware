@@ -25,14 +25,19 @@ import {
 } from './credit.scripts';
 import { CreditKeyspace } from './credit-keyspace';
 import {
+  CreditBillingMode,
+  CreditEnvironment,
+  CreditPlanStatus,
+  CreditReservationStatus,
+  CreditSettlementMode,
+} from './credit.enums';
+import {
   CREDIT_OPTIONS,
   CREDIT_REDIS_CLIENT,
   CreditPlan,
   CreditPlanAllocation,
-  CreditPlanStatus,
   CreditRedisClient,
   CreditReservation,
-  CreditReservationStatus,
   CreditSubject,
   GrantCreditsInput,
   GrantCreditsResult,
@@ -79,12 +84,16 @@ export class CreditService {
   async reserve(input: ReserveCreditInput): Promise<ReserveCreditResult> {
     const subject = this.keys.subject(input.subject);
     positiveInteger(input.amount, 'amount');
-    const settlementMode = input.settlementMode ?? 'IMMEDIATE';
-    const environment = input.environment ?? 'PROD';
-    if (environment !== 'PROD') {
-      throw new TypeError('reserve() supports only the PROD environment');
+    const settlementMode =
+      input.settlementMode ?? CreditSettlementMode.IMMEDIATE;
+    const environment = input.environment ?? CreditEnvironment.PROD;
+    if (environment !== CreditEnvironment.PROD) {
+      throw new TypeError('reserve() supports only the prod environment');
     }
-    if (input.autoRecover === false && settlementMode !== 'DEFERRED') {
+    if (
+      input.autoRecover === false &&
+      settlementMode !== CreditSettlementMode.DEFERRED
+    ) {
       throw new TypeError('autoRecover can be disabled only for DEFERRED reservations');
     }
     const reservationId = randomUUID();
@@ -150,8 +159,8 @@ export class CreditService {
       remainingBalance: safeNonNegative(result[1], 'remainingBalance'),
       expiresAt: safePositive(result[2], 'expiresAt'),
       autoRecover: storedAutoRecover,
-      environment: 'PROD',
-      billingMode: 'ENFORCE',
+      environment: CreditEnvironment.PROD,
+      billingMode: CreditBillingMode.ENFORCE,
       existing: Number(result[3]) === 1,
       settlementMode,
       subject,
@@ -159,12 +168,12 @@ export class CreditService {
     };
   }
 
-  /** Records a DEV usage event without reading or mutating wallet balances. */
+  /** Records a dev usage event without reading or mutating wallet balances. */
   async observe(input: ObserveCreditInput): Promise<ObserveCreditResult> {
     const subject = this.keys.subject(input.subject);
     positiveInteger(input.amount, 'amount');
-    if (input.environment !== 'DEV') {
-      throw new TypeError('observe() supports only the DEV environment');
+    if (input.environment !== CreditEnvironment.DEV) {
+      throw new TypeError('observe() supports only the dev environment');
     }
     const requestId = identifier(input.requestId?.trim() || randomUUID(), 'requestId');
     const scopeId = this.keys.scopeId(subject);
@@ -203,8 +212,8 @@ export class CreditService {
       eventId: String(result[0]),
       requestId,
       scopeId,
-      environment: 'DEV',
-      billingMode: 'OBSERVE',
+      environment: CreditEnvironment.DEV,
+      billingMode: CreditBillingMode.OBSERVE,
       requestedAmount: input.amount,
       deductedAmount: 0,
       existing: Number(result[1]) === 1,
@@ -320,7 +329,12 @@ export class CreditService {
   }
 
   async rollback(reservationId: string, reason = 'controller_failed'): Promise<boolean> {
-    return this.refund(reservationId, 'ROLLED_BACK', reason, Date.now());
+    return this.refund(
+      reservationId,
+      CreditReservationStatus.ROLLED_BACK,
+      reason,
+      Date.now(),
+    );
   }
 
   async renew(reservationId: string, leaseToken: string): Promise<number> {
@@ -356,7 +370,7 @@ export class CreditService {
       }
       const result = await this.refundResult(
         reservation,
-        'EXPIRED',
+        CreditReservationStatus.EXPIRED,
         'lease_expired',
         now,
         RECOVER_SCRIPT,
@@ -457,7 +471,7 @@ export class CreditService {
       expiresAt: safePositive(data.expiresAt, 'expiresAt'),
       autoRecover: data.autoRecover !== '0',
       environment: productionEnvironment(data.environment),
-      billingMode: 'ENFORCE',
+      billingMode: CreditBillingMode.ENFORCE,
       finalizedAt: data.finalizedAt ? safePositive(data.finalizedAt, 'finalizedAt') : undefined,
       finalizationReason: data.finalizationReason,
       settlementMode: settlementMode(data.settlementMode),
@@ -499,13 +513,15 @@ export class CreditService {
     const now = Date.now();
     return parsed.map((plan) => {
       const expiresAt = safePositive(plan.expiresAt, 'plan.expiresAt');
-      const status = expiresAt <= now ? 'EXPIRED' : planStatus(plan.status);
+      const status = expiresAt <= now
+        ? CreditPlanStatus.EXPIRED
+        : planStatus(plan.status);
       return {
         planId: identifier(plan.planId, 'plan.planId'),
         subject,
         scopeId: this.keys.scopeId(subject),
         grantedAmount: safePositive(plan.grantedAmount, 'plan.grantedAmount'),
-        availableAmount: status === 'EXPIRED'
+        availableAmount: status === CreditPlanStatus.EXPIRED
           ? 0
           : safeNonNegative(plan.availableAmount, 'plan.availableAmount'),
         criticalBalance: safeNonNegative(
@@ -523,7 +539,9 @@ export class CreditService {
 
   private async refund(
     reservationId: string,
-    status: 'ROLLED_BACK' | 'EXPIRED',
+    status:
+      | CreditReservationStatus.ROLLED_BACK
+      | CreditReservationStatus.EXPIRED,
     reason: string,
     now: number,
   ): Promise<boolean> {
@@ -534,7 +552,9 @@ export class CreditService {
 
   private async refundResult(
     reservation: CreditReservation,
-    status: 'ROLLED_BACK' | 'EXPIRED',
+    status:
+      | CreditReservationStatus.ROLLED_BACK
+      | CreditReservationStatus.EXPIRED,
     reason: string,
     now: number,
     script: string,
@@ -639,11 +659,11 @@ function nonNegativeInteger(value: unknown, field: string): number {
   return Number(value);
 }
 
-function productionEnvironment(value: unknown): 'PROD' {
-  if (value !== 'PROD') {
-    throw new Error('Redis reservation environment must be PROD');
+function productionEnvironment(value: unknown): CreditEnvironment.PROD {
+  if (value !== CreditEnvironment.PROD) {
+    throw new Error('Redis reservation environment must be prod');
   }
-  return 'PROD';
+  return CreditEnvironment.PROD;
 }
 
 function safePositive(value: unknown, field: string): number {
@@ -659,20 +679,25 @@ function safeNonNegative(value: unknown, field: string): number {
 }
 
 function planStatus(value: unknown): CreditPlanStatus {
-  if (value === 'ACTIVE' || value === 'DEPLETED' || value === 'EXPIRED' || value === 'REVOKED') {
-    return value;
+  if (Object.values(CreditPlanStatus).includes(value as CreditPlanStatus)) {
+    return value as CreditPlanStatus;
   }
   throw new Error(`Redis returned invalid plan status: ${String(value)}`);
 }
 
 function reservationStatus(value: unknown): CreditReservationStatus {
-  if (value === 'RESERVED' || value === 'COMMITTED' ||
-      value === 'ROLLED_BACK' || value === 'EXPIRED') return value;
+  if (
+    Object.values(CreditReservationStatus).includes(
+      value as CreditReservationStatus,
+    )
+  ) return value as CreditReservationStatus;
   throw new Error(`Redis returned invalid reservation status: ${String(value)}`);
 }
 
 function settlementMode(value: unknown): CreditReservation['settlementMode'] {
-  if (value === 'IMMEDIATE' || value === 'DEFERRED') return value;
+  if (Object.values(CreditSettlementMode).includes(value as CreditSettlementMode)) {
+    return value as CreditSettlementMode;
+  }
   throw new Error(`Redis returned invalid settlement mode: ${String(value)}`);
 }
 

@@ -5,7 +5,7 @@ immutable recharge plans instead of one aggregate balance or a balance provider.
 Each API reservation records exactly which plans funded it, consumes plans FIFO,
 and emits one settlement event per affected plan.
 
-- [Developer integration guide — start here](docs/developer-guide.md#start-here-complete-integration)
+- [Integration guide — start here](docs/integration-guide.md)
 - [Technical architecture](docs/technical-architecture.md)
 - [Redis keys and records](docs/redis-keyspace.md)
 - [Lua state transitions](docs/lua-scripts.md)
@@ -15,16 +15,22 @@ and emits one settlement event per affected plan.
 A wallet is scoped by `tenantId`, `appType`, `appId`, and `creditType`.
 `serviceId` is not part of billing identity.
 
-The trusted request context also carries `environment: 'PROD' | 'DEV'`. It is
-not part of wallet identity: PROD calls enforce credit, while DEV calls only
-record usage.
+The trusted request context also carries a `CreditEnvironment` value. Its wire
+values are lowercase: `prod` calls enforce credit, while `dev` calls only
+record usage. Environment is not part of wallet identity.
 
 ```ts
+import {
+  CreditAccountType,
+  CreditSubject,
+  CreditType,
+} from '@hypersign-protocol/credit-middleware';
+
 const subject: CreditSubject = {
   tenantId: 'tenant_1',
-  appType: 'BUSINESS',
+  appType: CreditAccountType.BUSINESS,
   appId: 'business_123',
-  creditType: 'API_CREDIT',
+  creditType: CreditType.API_CREDIT,
 };
 ```
 
@@ -101,6 +107,12 @@ separate from `CreditSubject` and does not split a wallet.
 ## Registration
 
 ```ts
+import {
+  CreditAppType,
+  CreditEnvironment,
+  CreditModule,
+} from '@hypersign-protocol/credit-middleware';
+
 CreditModule.forRootAsync({
   imports: [RedisModule],
   useFactory: () => ({
@@ -108,14 +120,17 @@ CreditModule.forRootAsync({
     redisHashTag: 'credit-kyc',
     requestContextResolver: (unknownRequest) => {
       const request = unknownRequest as AuthenticatedRequest;
-      const environment = request.service.env?.trim().toUpperCase();
-      if (environment !== 'PROD' && environment !== 'DEV') {
-        throw new Error('Trusted service environment must be PROD or DEV');
+      const environment = request.service.env?.trim();
+      if (
+        environment !== CreditEnvironment.PROD &&
+        environment !== CreditEnvironment.DEV
+      ) {
+        throw new Error('Trusted service environment must be prod or dev');
       }
       return {
         subject: {
           tenantId: request.service.subdomain,
-          appType: 'CAVACH_API',
+          appType: CreditAppType.CAVACH_API,
           appId: request.service.appId ?? '',
         },
         requestId: request.requestId,
@@ -136,15 +151,15 @@ default and can be disabled explicitly with `transport: false`.
 ```text
 catalog match
   -> resolve trusted per-request environment
-  -> PROD: atomically reserve FIFO plan allocations
-  -> DEV: atomically append CREDIT_OBSERVED with deductedAmount=0
+  -> prod: atomically reserve FIFO plan allocations
+  -> dev: atomically append CREDIT_OBSERVED with deductedAmount=0
   -> execute controller
-  -> PROD only: commit/leave deferred/roll back reservations
+  -> prod only: commit/leave deferred/roll back reservations
 ```
 
 Catalog routes may contain several credit types. Each catalog charge creates an
-independent PROD reservation or DEV observation. DEV does not read balances,
-require a grant, or mutate plans. If a later PROD charge fails, earlier new
+independent prod reservation or dev observation. dev does not read balances,
+require a grant, or mutate plans. If a later prod charge fails, earlier new
 reservations are compensated.
 
 For middleware that can return before the interceptor, use `boundary: true` and
@@ -192,20 +207,27 @@ credit.rollback.requested
 Grant command example:
 
 ```ts
+import {
+  CreditAppType,
+  CreditEventName,
+  CreditServiceType,
+  CreditType,
+} from '@hypersign-protocol/credit-middleware';
+
 await queueProvider.add(
-  'credit.commands.CAVACH_API',
-  CREDIT_EVENT_NAMES.GRANT_REQUESTED,
+  `credit.commands.${CreditServiceType.CAVACH_API}`,
+  CreditEventName.GRANT_REQUESTED,
   {
     schemaVersion: 3,
     commandId: payment.eventId,
-    serviceType: 'CAVACH_API',
+    serviceType: CreditServiceType.CAVACH_API,
     source: 'payment-service',
     payload: {
       subject: {
         tenantId: 'tenant_1',
-        appType: 'BUSINESS',
+        appType: CreditAppType.CAVACH_API,
         appId: 'business_123',
-        creditType: 'API_CREDIT',
+        creditType: CreditType.API_CREDIT,
       },
       planId: payment.planId,
       amount: 100,
@@ -254,6 +276,10 @@ Plan records do not use Redis TTL because an active reservation may still refer
 to an expired plan. Finalized reservation/request records use `retentionMs`.
 
 ## Examples
+
+New to the SDK? Follow the
+[integration guide](docs/integration-guide.md) from installation to a
+verified grant, prod deduction, and dev zero-deduction request.
 
 Repository checkouts contain an `example/` folder with:
 

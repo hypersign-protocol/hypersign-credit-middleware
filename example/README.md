@@ -1,5 +1,10 @@
 # SDK integration examples
 
+If this is your first integration, start with the
+[integration guide](../docs/integration-guide.md). It explains what
+runs in the API host, what runs in the trusted event service, and how to verify
+the first `prod` and `dev` calls.
+
 The example folder has two intentionally separate parts:
 
 - `host/` contains compile-checked NestJS modules to copy into the real CAVACH
@@ -42,7 +47,7 @@ npm run start:example:events
 ```
 
 Continue with [the event-server walkthrough](event-server/README.md) to grant
-two plans, exercise PROD/DEV requests in the real host, and inspect lifecycle
+two plans, exercise `prod`/`dev` requests in the real host, and inspect lifecycle
 events.
 
 For a complete explanation of every step, see the

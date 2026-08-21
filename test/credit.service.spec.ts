@@ -1,6 +1,13 @@
 import { BadRequestException } from '@nestjs/common';
 import { DEFAULT_CREDIT_OPTIONS } from '../src/credit.constants';
 import {
+  CreditBillingMode,
+  CreditEnvironment,
+  CreditEventType,
+  CreditPlanStatus,
+  CreditReservationStatus,
+} from '../src/credit.enums';
+import {
   CreditService,
   InsufficientCreditsException,
 } from '../src/credit.service';
@@ -20,7 +27,7 @@ import {
   RESERVE_SCRIPT,
   ROLLBACK_SCRIPT,
 } from '../src/credit.scripts';
-import { CreditSubject } from '../src/credit.types';
+import { CreditSubject, ObserveCreditInput } from '../src/credit.types';
 
 type Hash = Map<string, string>;
 
@@ -97,11 +104,15 @@ class PlanRedis {
         const unused = Number(this.hash(keys[3]).get(activePlanId) ?? 0);
         wallet -= unused;
         this.hash(keys[3]).set(activePlanId, '0');
-        this.hash(keys[7]).set(activePlanId, 'EXPIRED');
+        this.hash(keys[7]).set(activePlanId, CreditPlanStatus.EXPIRED);
         this.zset(keys[1]).delete(activePlanId);
         const member = this.hash(keys[8]).get(activePlanId);
         if (member) this.zset(keys[11]).delete(member);
-        this.events.push({ type: 'PLAN_EXPIRED', planId: activePlanId, expiredAmount: unused });
+        this.events.push({
+          type: CreditEventType.PLAN_EXPIRED,
+          planId: activePlanId,
+          expiredAmount: unused,
+        });
       }
     }
     this.strings.set(keys[0], wallet);
@@ -131,7 +142,7 @@ class PlanRedis {
     this.hash(keys[4]).set(planId, expiresAt);
     this.hash(keys[5]).set(planId, grantedAt);
     this.hash(keys[6]).set(planId, argv[10]);
-    this.hash(keys[7]).set(planId, 'ACTIVE');
+    this.hash(keys[7]).set(planId, CreditPlanStatus.ACTIVE);
     this.hash(keys[8]).set(planId, argv[16]);
     this.hash(keys[13]).set(planId, argv[17]);
     this.hash(keys[9]).set('scopeId', argv[5]);
@@ -139,7 +150,7 @@ class PlanRedis {
     this.hash(keys[10]).set('scopeId', argv[5]);
     this.zset(keys[11]).set(argv[16], Number(expiresAt));
     this.events.push({
-      type: 'CREDIT_GRANTED', planId, amount: Number(amount),
+      type: CreditEventType.CREDIT_GRANTED, planId, amount: Number(amount),
       criticalBalance: Number(argv[17]), balanceAfter: balance,
     });
     return [balance, Number(amount), 0];
@@ -158,11 +169,12 @@ class PlanRedis {
       eventId, amount: argv[9], operation: argv[8], environment: argv[10],
     })));
     this.events.push({
-      type: 'CREDIT_OBSERVED', timestamp: Number(argv[0]), serviceType: argv[1],
+      type: CreditEventType.CREDIT_OBSERVED,
+      timestamp: Number(argv[0]), serviceType: argv[1],
       scopeId: argv[2], appId: argv[3], tenantId: argv[4], appType: argv[5],
       creditType: argv[6], requestId: argv[7], operation: argv[8],
       requestedAmount: Number(argv[9]), deductedAmount: 0,
-      environment: argv[10], billingMode: 'OBSERVE', eventId,
+      environment: argv[10], billingMode: CreditBillingMode.OBSERVE, eventId,
     });
     return [eventId, 0];
   }
@@ -183,11 +195,15 @@ class PlanRedis {
         const unused = Number(this.hash(keys[2]).get(planId) ?? 0);
         wallet -= unused;
         this.hash(keys[2]).set(planId, '0');
-        this.hash(keys[4]).set(planId, 'EXPIRED');
+        this.hash(keys[4]).set(planId, CreditPlanStatus.EXPIRED);
         this.zset(keys[1]).delete(planId);
         const member = this.hash(keys[6]).get(planId);
         if (member) this.zset(keys[10]).delete(member);
-        this.events.push({ type: 'PLAN_EXPIRED', planId, expiredAmount: unused });
+        this.events.push({
+          type: CreditEventType.PLAN_EXPIRED,
+          planId,
+          expiredAmount: unused,
+        });
       }
     }
     this.strings.set(keys[0], wallet);
@@ -210,7 +226,7 @@ class PlanRedis {
       allocation.planBalanceAfter = after;
       this.hash(keys[2]).set(allocation.planId, String(after));
       if (after === 0) {
-        this.hash(keys[4]).set(allocation.planId, 'DEPLETED');
+        this.hash(keys[4]).set(allocation.planId, CreditPlanStatus.DEPLETED);
         this.zset(keys[1]).delete(allocation.planId);
         const member = this.hash(keys[6]).get(allocation.planId);
         if (member) this.zset(keys[10]).delete(member);
@@ -221,7 +237,9 @@ class PlanRedis {
     const values: Record<string, string> = {
       reservationId: argv[1], scopeId: argv[2], appId: argv[3], tenantId: argv[4],
       appType: argv[5], creditType: argv[6], requestId: argv[7], amount: argv[0],
-      remainingBalance: String(wallet), status: 'RESERVED', leaseToken: argv[10],
+      remainingBalance: String(wallet),
+      status: CreditReservationStatus.RESERVED,
+      leaseToken: argv[10],
       createdAt: argv[8], expiresAt: String(expiresAt), version: '1',
       settlementMode: argv[12], operation: argv[13], autoRecover: argv[14],
       environment: argv[18], allocations: json,
@@ -230,9 +248,10 @@ class PlanRedis {
     this.hashes.set(keys[8], new Map(Object.entries(values)));
     if (argv[14] === '1') this.zset(keys[9]).set(argv[1], expiresAt);
     allocations.forEach((allocation, index) => this.events.push({
-      type: 'RESERVED', reservationId: argv[1], planId: allocation.planId,
+      type: CreditEventType.RESERVED,
+      reservationId: argv[1], planId: allocation.planId,
       amount: allocation.amount, allocationIndex: index, allocationCount: allocations.length,
-      environment: argv[18], billingMode: 'ENFORCE',
+      environment: argv[18], billingMode: CreditBillingMode.ENFORCE,
     }));
     return [argv[1], wallet, expiresAt, 0, argv[10], argv[14], json];
   }
@@ -240,23 +259,26 @@ class PlanRedis {
   private commit(keys: string[], argv: string[]) {
     const reservation = this.hashes.get(keys[0]);
     if (!reservation) return [-2];
-    if (reservation.get('status') === 'COMMITTED') return [0];
-    if (reservation.get('status') !== 'RESERVED') return [-1];
-    reservation.set('status', 'COMMITTED');
+    if (reservation.get('status') === CreditReservationStatus.COMMITTED) return [0];
+    if (reservation.get('status') !== CreditReservationStatus.RESERVED) return [-1];
+    reservation.set('status', CreditReservationStatus.COMMITTED);
     reservation.set('finalizedAt', argv[0]);
     this.zset(keys[1]).delete(argv[1]);
     const allocations = JSON.parse(reservation.get('allocations')!);
     allocations.forEach((allocation: any, index: number) => this.events.push({
-      type: 'COMMITTED', reservationId: argv[1], planId: allocation.planId,
+      type: CreditEventType.COMMITTED,
+      reservationId: argv[1], planId: allocation.planId,
       amount: allocation.amount, allocationIndex: index, allocationCount: allocations.length,
-      environment: reservation.get('environment'), billingMode: 'ENFORCE',
+      environment: reservation.get('environment'),
+      billingMode: CreditBillingMode.ENFORCE,
     }));
     allocations.forEach((allocation: any) => {
       const planBalanceAfter = Number(this.hash(keys[4]).get(allocation.planId) ?? 0);
       const threshold = Number(this.hash(keys[5]).get(allocation.planId) ?? 0);
       if (planBalanceAfter <= threshold) {
         this.events.push({
-          type: 'CRITICAL_BALANCE', planId: allocation.planId,
+          type: CreditEventType.CRITICAL_BALANCE,
+          planId: allocation.planId,
           planBalanceAfter, threshold, balanceAfter: this.strings.get(keys[6]) ?? 0,
         });
       }
@@ -266,7 +288,10 @@ class PlanRedis {
 
   private refund(keys: string[], argv: string[], recovering: boolean) {
     const reservation = this.hashes.get(keys[0]);
-    if (!reservation || reservation.get('status') !== 'RESERVED') {
+    if (
+      !reservation ||
+      reservation.get('status') !== CreditReservationStatus.RESERVED
+    ) {
       if (recovering) this.zset(keys[1]).delete(argv[3]);
       return [0];
     }
@@ -279,10 +304,14 @@ class PlanRedis {
       const current = Number(this.hash(keys[4]).get(planId) ?? 0);
       const planExpiresAt = Number(this.hash(keys[5]).get(planId) ?? 0);
       const status = this.hash(keys[6]).get(planId);
-      if (planExpiresAt > Number(argv[1]) && status !== 'EXPIRED' && status !== 'REVOKED') {
+      if (
+        planExpiresAt > Number(argv[1]) &&
+        status !== CreditPlanStatus.EXPIRED &&
+        status !== CreditPlanStatus.REVOKED
+      ) {
         const after = current + Number(allocation.amount);
         this.hash(keys[4]).set(planId, String(after));
-        this.hash(keys[6]).set(planId, 'ACTIVE');
+        this.hash(keys[6]).set(planId, CreditPlanStatus.ACTIVE);
         this.zset(keys[7]).set(planId, Number(this.hash(keys[8]).get(planId)));
         const member = this.hash(keys[10]).get(planId);
         if (member) this.zset(keys[9]).set(member, planExpiresAt);
@@ -292,7 +321,7 @@ class PlanRedis {
       }
       wallet -= current;
       this.hash(keys[4]).set(planId, '0');
-      this.hash(keys[6]).set(planId, 'EXPIRED');
+      this.hash(keys[6]).set(planId, CreditPlanStatus.EXPIRED);
       this.zset(keys[7]).delete(planId);
       return { ...allocation, restoredAmount: 0, expiredAmount: allocation.amount,
         planBalanceAfter: 0 };
@@ -304,7 +333,8 @@ class PlanRedis {
     outcomes.forEach((outcome: any) => this.events.push({
       type: argv[0], reservationId: argv[3], planId: outcome.planId,
       restoredAmount: outcome.restoredAmount, expiredAmount: outcome.expiredAmount,
-      environment: reservation.get('environment'), billingMode: 'ENFORCE',
+      environment: reservation.get('environment'),
+      billingMode: CreditBillingMode.ENFORCE,
     }));
     return [1, reservation.get('scopeId')!, reservation.get('appId')!,
       reservation.get('tenantId')!, reservation.get('appType')!,
@@ -314,7 +344,7 @@ class PlanRedis {
 
   private renew(keys: string[], argv: string[]) {
     const reservation = this.hashes.get(keys[0]);
-    if (reservation?.get('status') !== 'RESERVED') return -1;
+    if (reservation?.get('status') !== CreditReservationStatus.RESERVED) return -1;
     if (reservation.get('leaseToken') !== argv[0]) return -2;
     const expiresAt = Number(argv[1]) + Number(argv[2]);
     reservation.set('expiresAt', String(expiresAt));
@@ -327,17 +357,24 @@ class PlanRedis {
     const expiresAt = Number(this.hash(keys[3]).get(argv[1]) ?? 0);
     if (!expiresAt || expiresAt > Number(argv[0])) return [0];
     const status = this.hash(keys[4]).get(argv[1]);
-    if (status === 'EXPIRED' || status === 'REVOKED') {
+    if (
+      status === CreditPlanStatus.EXPIRED ||
+      status === CreditPlanStatus.REVOKED
+    ) {
       this.zset(keys[5]).delete(argv[2]); return [0];
     }
     const unused = Number(this.hash(keys[2]).get(argv[1]) ?? 0);
     const balance = (this.strings.get(keys[0]) ?? 0) - unused;
     this.strings.set(keys[0], balance);
     this.hash(keys[2]).set(argv[1], '0');
-    this.hash(keys[4]).set(argv[1], 'EXPIRED');
+    this.hash(keys[4]).set(argv[1], CreditPlanStatus.EXPIRED);
     this.zset(keys[1]).delete(argv[1]);
     this.zset(keys[5]).delete(argv[2]);
-    this.events.push({ type: 'PLAN_EXPIRED', planId: argv[1], expiredAmount: unused });
+    this.events.push({
+      type: CreditEventType.PLAN_EXPIRED,
+      planId: argv[1],
+      expiredAmount: unused,
+    });
     return [1, unused, balance];
   }
 }
@@ -382,17 +419,19 @@ describe('CreditService FIFO recharge plans', () => {
     expect(await service.getBalance(subject)).toBe(100);
   });
 
-  it('records an idempotent DEV observation without creating or changing a wallet', async () => {
-    const input = {
+  it('records an idempotent dev observation without creating or changing a wallet', async () => {
+    const input: ObserveCreditInput = {
       subject,
       requestId: 'dev-request:api',
       amount: 10,
       operation: 'POST /api/verify',
-      environment: 'DEV' as const,
+      environment: CreditEnvironment.DEV,
     };
     await expect(service.observe(input)).resolves.toMatchObject({
       eventId: '1-0', existing: false, requestedAmount: 10,
-      deductedAmount: 0, environment: 'DEV', billingMode: 'OBSERVE',
+      deductedAmount: 0,
+      environment: CreditEnvironment.DEV,
+      billingMode: CreditBillingMode.OBSERVE,
     });
     await expect(service.observe(input)).resolves.toMatchObject({
       eventId: '1-0', existing: true,
@@ -403,16 +442,19 @@ describe('CreditService FIFO recharge plans', () => {
     expect(await service.getPlans(subject)).toEqual([]);
     expect(redis.events).toEqual([
       expect.objectContaining({
-        type: 'CREDIT_OBSERVED', requestedAmount: 10, deductedAmount: 0,
-        environment: 'DEV', billingMode: 'OBSERVE',
+        type: CreditEventType.CREDIT_OBSERVED,
+        requestedAmount: 10,
+        deductedAmount: 0,
+        environment: CreditEnvironment.DEV,
+        billingMode: CreditBillingMode.OBSERVE,
       }),
     ]);
   });
 
   it('rejects using the observation API for production traffic', async () => {
     await expect(service.observe({
-      subject, amount: 10, environment: 'PROD' as any,
-    })).rejects.toThrow('observe() supports only the DEV environment');
+      subject, amount: 10, environment: CreditEnvironment.PROD as any,
+    })).rejects.toThrow('observe() supports only the dev environment');
   });
 
   it('deduplicates an exact plan retry and rejects changed semantics', async () => {
@@ -447,25 +489,32 @@ describe('CreditService FIFO recharge plans', () => {
     await grant('new-plan', 50, clock - 100, clock + 20_000);
     const reservation = await service.reserve({ subject, amount: 25, requestId: 'request-1' });
     expect(reservation).toMatchObject({
-      environment: 'PROD', billingMode: 'ENFORCE',
+      environment: CreditEnvironment.PROD,
+      billingMode: CreditBillingMode.ENFORCE,
     });
     expect(reservation.allocations).toEqual([
       { planId: 'old-plan', amount: 10, planBalanceAfter: 0 },
       { planId: 'new-plan', amount: 15, planBalanceAfter: 35 },
     ]);
     expect(await service.commit(reservation.reservationId)).toBe(true);
-    expect(redis.events.filter((event) => event.type === 'RESERVED'))
+    expect(redis.events.filter((event) => event.type === CreditEventType.RESERVED))
       .toEqual(expect.arrayContaining([
-        expect.objectContaining({ environment: 'PROD', billingMode: 'ENFORCE' }),
+        expect.objectContaining({
+          environment: CreditEnvironment.PROD,
+          billingMode: CreditBillingMode.ENFORCE,
+        }),
       ]));
-    expect(redis.events.filter((event) => event.type === 'COMMITTED')).toEqual([
+    expect(redis.events.filter((event) =>
+      event.type === CreditEventType.COMMITTED)).toEqual([
       expect.objectContaining({
         planId: 'old-plan', amount: 10, allocationIndex: 0,
-        environment: 'PROD', billingMode: 'ENFORCE',
+        environment: CreditEnvironment.PROD,
+        billingMode: CreditBillingMode.ENFORCE,
       }),
       expect.objectContaining({
         planId: 'new-plan', amount: 15, allocationIndex: 1,
-        environment: 'PROD', billingMode: 'ENFORCE',
+        environment: CreditEnvironment.PROD,
+        billingMode: CreditBillingMode.ENFORCE,
       }),
     ]);
     expect(await service.getBalance(subject)).toBe(35);
@@ -478,12 +527,15 @@ describe('CreditService FIFO recharge plans', () => {
     ]);
 
     const reservation = await service.reserve({ subject, amount: 80 });
-    expect(redis.events.filter((event) => event.type === 'CRITICAL_BALANCE')).toHaveLength(0);
+    expect(redis.events.filter((event) =>
+      event.type === CreditEventType.CRITICAL_BALANCE)).toHaveLength(0);
 
     await service.commit(reservation.reservationId);
-    const critical = redis.events.find((event) => event.type === 'CRITICAL_BALANCE');
+    const critical = redis.events.find((event) =>
+      event.type === CreditEventType.CRITICAL_BALANCE);
     expect(critical).toEqual(expect.objectContaining({
-      type: 'CRITICAL_BALANCE', planId: 'plan-1', planBalanceAfter: 20,
+      type: CreditEventType.CRITICAL_BALANCE,
+      planId: 'plan-1', planBalanceAfter: 20,
       threshold: 25, balanceAfter: 20,
     }));
     expect(critical).not.toHaveProperty('balance');
@@ -514,7 +566,8 @@ describe('CreditService FIFO recharge plans', () => {
     expect(await service.rollback(reservation.reservationId, 'failed')).toBe(true);
     expect(await service.getBalance(subject)).toBe(0);
     expect(redis.events).toContainEqual(expect.objectContaining({
-      type: 'ROLLED_BACK', planId: 'short-plan', restoredAmount: 0, expiredAmount: 10,
+      type: CreditEventType.ROLLED_BACK,
+      planId: 'short-plan', restoredAmount: 0, expiredAmount: 10,
     }));
   });
 
@@ -524,7 +577,7 @@ describe('CreditService FIFO recharge plans', () => {
     clock += 101;
     expect(await service.commit(reservation.reservationId)).toBe(true);
     expect(redis.events).toContainEqual(expect.objectContaining({
-      type: 'COMMITTED', planId: 'short-plan', amount: 10,
+      type: CreditEventType.COMMITTED, planId: 'short-plan', amount: 10,
     }));
   });
 
@@ -555,7 +608,8 @@ describe('CreditService FIFO recharge plans', () => {
     expect(result.balance).toBe(50);
     expect(await service.getBalance(subject)).toBe(50);
     expect(redis.events).toContainEqual(expect.objectContaining({
-      type: 'PLAN_EXPIRED', planId: 'expired-plan', expiredAmount: 20,
+      type: CreditEventType.PLAN_EXPIRED,
+      planId: 'expired-plan', expiredAmount: 20,
     }));
   });
 });

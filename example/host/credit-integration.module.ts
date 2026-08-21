@@ -1,8 +1,10 @@
 import { Global, Module, UnauthorizedException } from '@nestjs/common';
 import { ScheduleModule } from '@nestjs/schedule';
 import {
+  CreditAppType,
   CreditEnvironment,
   CreditModule,
+  CreditType,
 } from '../../src';
 import { CreditInfrastructureModule } from './credit-infrastructure.module';
 import { CreditRecoveryScheduler } from './credit-recovery.scheduler';
@@ -26,10 +28,13 @@ interface TrustedServiceRequest {
       useFactory: () => ({
         requestContextResolver: (unknownRequest: unknown) => {
           const request = unknownRequest as TrustedServiceRequest;
-          const environment = request.service?.env?.trim().toUpperCase();
-          if (environment !== 'PROD' && environment !== 'DEV') {
+          const environment = request.service?.env?.trim();
+          if (
+            environment !== CreditEnvironment.PROD &&
+            environment !== CreditEnvironment.DEV
+          ) {
             throw new UnauthorizedException(
-              'Trusted service environment must be PROD or DEV',
+              'Trusted service environment must be prod or dev',
             );
           }
 
@@ -37,11 +42,11 @@ interface TrustedServiceRequest {
             subject: {
               tenantId: request.service?.subdomain,
               appId: request.service?.appId ?? '',
-              appType: 'CAVACH_API',
-              creditType: 'API_CREDIT',
+              appType: CreditAppType.CAVACH_API,
+              creditType: CreditType.API_CREDIT,
             },
             requestId: request.requestId,
-            environment: environment as CreditEnvironment,
+            environment,
           };
         },
       }),

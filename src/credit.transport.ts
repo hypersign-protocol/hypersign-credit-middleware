@@ -7,7 +7,13 @@ import {
 } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
 import { CreditCatalogService } from './credit.catalog';
-import { CREDIT_EVENT_NAMES, CreditEventName } from './credit.constants';
+import {
+  CreditEventName,
+  CreditEventType,
+  CreditSettlementAction,
+  CreditSettlementMode,
+  CreditSettlementOutcome,
+} from './credit.enums';
 import { CreditService } from './credit.service';
 import { CreditTransportInfrastructure } from './credit-transport.infrastructure';
 import {
@@ -28,15 +34,15 @@ export interface CreditLifecycleEventEnvelope {
   event: Record<string, unknown>;
 }
 
-const JOB_NAMES: Record<string, CreditEventName> = {
-  RESERVED: CREDIT_EVENT_NAMES.RESERVED,
-  COMMITTED: CREDIT_EVENT_NAMES.COMMITTED,
-  ROLLED_BACK: CREDIT_EVENT_NAMES.ROLLED_BACK,
-  EXPIRED: CREDIT_EVENT_NAMES.EXPIRED,
-  PLAN_EXPIRED: CREDIT_EVENT_NAMES.PLAN_EXPIRED,
-  CREDIT_GRANTED: CREDIT_EVENT_NAMES.CREDIT_GRANTED,
-  CREDIT_OBSERVED: CREDIT_EVENT_NAMES.CREDIT_OBSERVED,
-  CRITICAL_BALANCE: CREDIT_EVENT_NAMES.CRITICAL_BALANCE,
+const JOB_NAMES: Record<CreditEventType, CreditEventName> = {
+  [CreditEventType.RESERVED]: CreditEventName.RESERVED,
+  [CreditEventType.COMMITTED]: CreditEventName.COMMITTED,
+  [CreditEventType.ROLLED_BACK]: CreditEventName.ROLLED_BACK,
+  [CreditEventType.EXPIRED]: CreditEventName.EXPIRED,
+  [CreditEventType.PLAN_EXPIRED]: CreditEventName.PLAN_EXPIRED,
+  [CreditEventType.CREDIT_GRANTED]: CreditEventName.CREDIT_GRANTED,
+  [CreditEventType.CREDIT_OBSERVED]: CreditEventName.CREDIT_OBSERVED,
+  [CreditEventType.CRITICAL_BALANCE]: CreditEventName.CRITICAL_BALANCE,
 };
 
 /** Relays the transactional Redis Stream outbox through SDK-owned BullMQ queues. */
@@ -157,7 +163,7 @@ export class CreditEventRelay implements OnApplicationBootstrap, OnApplicationSh
         );
         continue;
       }
-      const jobName = JOB_NAMES[fields.event];
+      const jobName = JOB_NAMES[fields.event as CreditEventType];
       if (!jobName) {
         this.logger.error(`Unknown credit stream event ${fields.event}; leaving ${eventId} pending`);
         continue;
@@ -247,7 +253,7 @@ export class CreditCommandWorker implements OnApplicationBootstrap, OnApplicatio
     try {
       command = this.command(job);
       switch (job.name) {
-        case CREDIT_EVENT_NAMES.GRANT_REQUESTED:
+        case CreditEventName.GRANT_REQUESTED:
           return this.credits.grant({
             subject: this.subject(command.payload.subject),
             planId: requiredString(command.payload.planId, 'payload.planId'),
@@ -264,7 +270,7 @@ export class CreditCommandWorker implements OnApplicationBootstrap, OnApplicatio
             ),
             reason: optionalString(command.payload.reason),
           });
-        case CREDIT_EVENT_NAMES.RESERVE_REQUESTED:
+        case CreditEventName.RESERVE_REQUESTED:
           return this.credits.reserve({
             subject: this.subject(command.payload.subject),
             requestId: optionalString(command.payload.requestId) ?? command.commandId,
@@ -273,15 +279,15 @@ export class CreditCommandWorker implements OnApplicationBootstrap, OnApplicatio
             settlementMode: deferredSettlement(command.payload.settlementMode),
             autoRecover: command.payload.autoRecover !== false,
           });
-        case CREDIT_EVENT_NAMES.COMMIT_REQUESTED:
+        case CreditEventName.COMMIT_REQUESTED:
           return this.settle(
             requiredString(command.payload.reservationId, 'payload.reservationId'),
-            'COMMIT',
+            CreditSettlementAction.COMMIT,
           );
-        case CREDIT_EVENT_NAMES.ROLLBACK_REQUESTED:
+        case CreditEventName.ROLLBACK_REQUESTED:
           return this.settle(
             requiredString(command.payload.reservationId, 'payload.reservationId'),
-            'ROLLBACK',
+            CreditSettlementAction.ROLLBACK,
             optionalString(command.payload.reason) ?? 'external_command',
           );
         default:
@@ -325,17 +331,24 @@ export class CreditCommandWorker implements OnApplicationBootstrap, OnApplicatio
 
   private async settle(
     reservationId: string,
-    action: 'COMMIT' | 'ROLLBACK',
+    action: CreditSettlementAction,
     reason?: string,
   ): Promise<{ reservationId: string; outcome: string }> {
     const before = await this.credits.getReservation(reservationId);
-    if (!before) return { reservationId, outcome: 'NOT_FOUND' };
-    const applied = action === 'COMMIT'
+    if (!before) {
+      return { reservationId, outcome: CreditSettlementOutcome.NOT_FOUND };
+    }
+    const applied = action === CreditSettlementAction.COMMIT
       ? await this.credits.commit(reservationId)
       : await this.credits.rollback(reservationId, reason);
-    if (applied) return { reservationId, outcome: 'APPLIED' };
+    if (applied) {
+      return { reservationId, outcome: CreditSettlementOutcome.APPLIED };
+    }
     const after = await this.credits.getReservation(reservationId);
-    return { reservationId, outcome: after?.status ?? 'NOT_FOUND' };
+    return {
+      reservationId,
+      outcome: after?.status ?? CreditSettlementOutcome.NOT_FOUND,
+    };
   }
 
   private async publishRejection(
@@ -348,7 +361,7 @@ export class CreditCommandWorker implements OnApplicationBootstrap, OnApplicatio
     const reason = error instanceof Error ? error.message : String(error);
     this.logger.error(`Rejected credit command ${command.commandId}: ${reason}`);
     for (const queueName of config.lifecycleQueueNames) {
-      await this.infrastructure.add(queueName, CREDIT_EVENT_NAMES.COMMAND_REJECTED, {
+      await this.infrastructure.add(queueName, CreditEventName.COMMAND_REJECTED, {
         schemaVersion: 3,
         serviceType: this.catalog.serviceType,
         planId: optionalString(command.payload.planId),
@@ -418,9 +431,9 @@ function nonNegativeInteger(value: unknown, field: string): number {
   return Number(value);
 }
 
-function deferredSettlement(value: unknown): 'DEFERRED' {
-  if (value !== undefined && value !== 'DEFERRED') {
+function deferredSettlement(value: unknown): CreditSettlementMode.DEFERRED {
+  if (value !== undefined && value !== CreditSettlementMode.DEFERRED) {
     throw new TypeError('Command reservations support only DEFERRED settlement');
   }
-  return 'DEFERRED';
+  return CreditSettlementMode.DEFERRED;
 }

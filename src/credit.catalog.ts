@@ -8,10 +8,13 @@ import {
   CreditCatalog,
   CreditCatalogCharge,
   CreditCatalogRoute,
-  CreditSettlementMode,
   CREDIT_OPTIONS,
   ResolvedCreditOptions,
 } from './credit.types';
+import {
+  CreditCatalogVersioning,
+  CreditSettlementMode,
+} from './credit.enums';
 
 export interface ResolvedCreditCatalogCharge extends CreditCatalogCharge {
   settlementMode: CreditSettlementMode;
@@ -46,7 +49,8 @@ export class CreditCatalogService {
     this.serviceType = required(catalog.serviceType, 'catalog.serviceType');
     this.version = required(catalog.version, 'catalog.version');
     if (catalog.versioning !== undefined &&
-        catalog.versioning !== 'URI' && catalog.versioning !== 'NONE') {
+        catalog.versioning !== CreditCatalogVersioning.URI &&
+        catalog.versioning !== CreditCatalogVersioning.NONE) {
       throw new TypeError('catalog.versioning must be URI or NONE');
     }
     this.defaultVersion = optional(catalog.defaultVersion);
@@ -98,9 +102,10 @@ export class CreditCatalogService {
         throw new TypeError(`${field}.amount must be a positive safe integer`);
       }
       const creditType = required(charge.creditType, `${field}.creditType`);
-      const settlementMode = charge.settlementMode ?? 'IMMEDIATE';
+      const settlementMode =
+        charge.settlementMode ?? CreditSettlementMode.IMMEDIATE;
       const autoRecover = charge.autoRecover ?? true;
-      if (!autoRecover && settlementMode !== 'DEFERRED') {
+      if (!autoRecover && settlementMode !== CreditSettlementMode.DEFERRED) {
         throw new TypeError(`${field}.autoRecover=false requires DEFERRED settlement`);
       }
       return { ...charge, id, creditType, settlementMode, autoRecover };

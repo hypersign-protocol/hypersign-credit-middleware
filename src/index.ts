@@ -2,6 +2,7 @@
 export * from './credit.catalog';
 export * from './credit-boundary.middleware';
 export * from './credit.constants';
+export * from './credit.enums';
 export * from './credit-recovery.service';
 export * from './credit.interceptor';
 export * from './credit-policy.executor';

@@ -47,12 +47,17 @@ Values are trimmed and case-sensitive.
 For example:
 
 ```ts
-{
+import {
+  CreditAppType,
+  CreditType,
+} from '@hypersign-protocol/credit-middleware';
+
+const subject = {
   tenantId: 'tenant/acme',
-  appType: 'CAVACH_API',
+  appType: CreditAppType.CAVACH_API,
   appId: 'app:123',
-  creditType: 'API_CREDIT'
-}
+  creditType: CreditType.API_CREDIT,
+};
 ```
 
 produces:
@@ -112,7 +117,7 @@ four-dimensional scope string shown above.
 | Plan expiry index | `<base>:plan:expirations` | Sorted set | JSON member; score `expiresAt` in epoch ms | Member removed when handled/depleted |
 | Reservation | `<base>:reservation:<encoded-reservationId>` | Hash | State, lease, subject, operation, and allocation JSON | TTL only after finalization |
 | Request idempotency | `<base>:request:<scope>:<encoded-requestId>` | Hash | Request-to-reservation mapping and semantics | TTL only after finalization |
-| DEV observation | `<base>:observation:<scope>:<encoded-requestId>` | Hash | Event ID, amount, operation, and environment | `retentionMs` |
+| `dev` observation | `<base>:observation:<scope>:<encoded-requestId>` | Hash | Event ID, amount, operation, and environment | `retentionMs` |
 | Reservation expiry | `<base>:reservation:expirations` | Sorted set | Member `reservationId`; score lease expiry | Member removed when finalized |
 | Transactional outbox | `<base>:events` | Stream | Credit lifecycle event fields | Approximate `eventStreamMaxLength` |
 
@@ -140,12 +145,12 @@ credit:v2:{credit}:plan-owner:plan%2F2026%2F001
 credit:v2:{credit}:grant:payment%2Fstripe%2Fpi_001
 credit:v2:{credit}:plan:expirations
 
-# PROD reservation and request idempotency
+# prod reservation and request idempotency
 credit:v2:{credit}:reservation:3db57c81-0000-4000-8000-000000000000
 credit:v2:{credit}:request:tenant=1:tenant%2Facme|appType=1:CAVACH_API|app=1:app%3A123|creditType=1:API_CREDIT:req%2F019%3Aapi
 credit:v2:{credit}:reservation:expirations
 
-# DEV observation idempotency (requestId: req/dev:api)
+# dev observation idempotency (requestId: req/dev:api)
 credit:v2:{credit}:observation:tenant=1:tenant%2Facme|appType=1:CAVACH_API|app=1:app%3A123|creditType=1:API_CREDIT:req%2Fdev%3Aapi
 
 # Transactional event outbox
@@ -261,7 +266,7 @@ A reservation stores:
 reservationId, scopeId, appId, tenantId, appType, creditType,
 requestId, total amount, aggregate balance after reservation,
 status, leaseToken, createdAt, expiresAt, version,
-settlementMode, operation, autoRecover, environment=PROD, allocations JSON
+settlementMode, operation, autoRecover, environment=prod, allocations JSON
 ```
 
 Allocation JSON is an array of:
@@ -280,20 +285,20 @@ Finalized reservation and request records receive `retentionMs`. Active records
 have no TTL. Only `autoRecover=true` reservations are added to the reservation
 expiry index.
 
-## DEV observation state
+## dev observation state
 
-A DEV catalog charge never creates a reservation and never reads or mutates
+A `dev` catalog charge never creates a reservation and never reads or mutates
 wallet or plan keys. One Lua transaction appends `CREDIT_OBSERVED` to the outbox
 and stores this short idempotency hash:
 
 ```text
-eventId, amount, operation, environment=DEV
+eventId, amount, operation, environment=dev
 ```
 
 The hash receives `retentionMs`. An exact retry returns the original event ID
 without appending another event; reuse with a different amount, operation, or
 environment is rejected. Environment is deliberately absent from wallet scope,
-so observation cannot create a parallel DEV balance.
+so observation cannot create a parallel `dev` balance.
 
 ## Expiration indexes
 

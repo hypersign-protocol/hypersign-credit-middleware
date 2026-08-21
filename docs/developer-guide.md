@@ -9,7 +9,9 @@ This guide explains how to integrate, operate, and troubleshoot
 
 ## Contents
 
+- [Integration guide](integration-guide.md)
 - [Overview](#overview)
+- [Domain enums](#domain-enums)
 - [Start here: complete integration](#start-here-complete-integration)
 - [Integration requirements](#integration-requirements)
 - [Installation](#installation)
@@ -64,11 +66,53 @@ all-or-nothing: if the entire charge cannot be funded, no plan is deducted.
 The exact plan allocation is stored with the reservation. Commit, rollback,
 and recovery use that stored allocation and never recalculate FIFO order.
 
+## Domain enums
+
+Use the SDK's exported enums instead of repeating protocol strings in
+TypeScript. Enum member names remain uppercase; only the environment wire
+values are lowercase.
+
+| Enum | Members and values |
+| --- | --- |
+| `CreditEnvironment` | `PROD = 'prod'`, `DEV = 'dev'` |
+| `CreditBillingMode` | `ENFORCE`, `OBSERVE` |
+| `CreditSettlementMode` | `IMMEDIATE`, `DEFERRED` |
+| `CreditPlanStatus` | `ACTIVE`, `DEPLETED`, `EXPIRED`, `REVOKED` |
+| `CreditReservationStatus` | `RESERVED`, `COMMITTED`, `ROLLED_BACK`, `EXPIRED` |
+| `CreditCatalogVersioning` | `URI`, `NONE` |
+| `CreditServiceType` | `CAVACH_API`; identifies the catalog, command envelope, lifecycle envelope, and transport namespace. It is not a wallet dimension. |
+| `CreditAppType` | `CAVACH_API`; identifies `subject.appType` and is part of the wallet key. Grants and requests must match it. |
+| `CreditType` | `API_CREDIT` |
+| `CreditEventType` | Redis outbox event types such as `CREDIT_GRANTED` and `CREDIT_OBSERVED` |
+| `CreditEventName` | BullMQ names such as `credit.granted` and `credit.grant.requested` |
+
+Example:
+
+```ts
+import {
+  CreditAppType,
+  CreditBillingMode,
+  CreditEnvironment,
+  CreditEventName,
+  CreditSettlementMode,
+  CreditServiceType,
+  CreditType,
+} from '@hypersign-protocol/credit-middleware';
+```
+
+Incoming JSON and Redis/BullMQ payloads contain the enum values, not member
+expressions. For example, `CreditEnvironment.PROD` is serialized as `"prod"`.
+
 ## Start here: complete integration
 
 This section is the shortest complete path for a developer integrating the SDK
 for the first time. Later sections explain each decision and production edge
 case in detail.
+
+If this is your first integration, begin with the standalone
+[integration guide](integration-guide.md). It explains the two
+applications, gives the exact files to create, and includes a first-grant and
+first-request checklist. Return here afterward for the full technical details.
 
 Repository checkouts also contain copy-ready modules and a runnable external
 grant/lifecycle process under `example/`. These demo sources are intentionally
@@ -167,17 +211,17 @@ interface TrustedCreditRequest {
   service?: {
     subdomain?: string; // tenantId
     appId?: string;
-    env?: string;       // PROD or DEV for this API call
+    env?: string;       // exactly lowercase prod or dev for this API call
   };
   requestId?: string;   // stable ID created by trusted infrastructure
 }
 ```
 
-The same server can process PROD and DEV calls. `env` is per-request trusted
+The same server can process `prod` and `dev` calls. `env` is per-request trusted
 metadata, not an application-wide environment variable:
 
-- `PROD` reserves and deducts credit;
-- `DEV` emits an observation with `deductedAmount: 0`; and
+- `prod` reserves and deducts credit;
+- `dev` emits an observation with `deductedAmount: 0`; and
 - missing/unknown values fail closed before the controller runs.
 
 ### 5. Register the SDK and the five-minute recovery job
@@ -206,7 +250,12 @@ export class CreditRecoveryScheduler {
 // app.module.ts
 import { Module, UnauthorizedException } from '@nestjs/common';
 import { ScheduleModule } from '@nestjs/schedule';
-import { CreditModule } from '@hypersign-protocol/credit-middleware';
+import {
+  CreditAppType,
+  CreditEnvironment,
+  CreditModule,
+  CreditType,
+} from '@hypersign-protocol/credit-middleware';
 import { CreditInfrastructureModule } from './credit-infrastructure.module';
 import { CreditRecoveryScheduler } from './credit-recovery.scheduler';
 
@@ -228,18 +277,21 @@ interface TrustedCreditRequest {
       useFactory: () => ({
         requestContextResolver: (unknownRequest: unknown) => {
           const request = unknownRequest as TrustedCreditRequest;
-          const environment = request.service?.env?.trim().toUpperCase();
-          if (environment !== 'PROD' && environment !== 'DEV') {
+          const environment = request.service?.env?.trim();
+          if (
+            environment !== CreditEnvironment.PROD &&
+            environment !== CreditEnvironment.DEV
+          ) {
             throw new UnauthorizedException(
-              'Trusted service environment must be PROD or DEV',
+              'Trusted service environment must be prod or dev',
             );
           }
           return {
             subject: {
               tenantId: request.service?.subdomain,
               appId: request.service?.appId ?? '',
-              appType: 'CAVACH_API',
-              creditType: 'API_CREDIT',
+              appType: CreditAppType.CAVACH_API,
+              creditType: CreditType.API_CREDIT,
             },
             requestId: request.requestId,
             environment,
@@ -266,12 +318,17 @@ reason.
 For a same-process trusted flow, inject `CreditService` and call `grant()`:
 
 ```ts
+import {
+  CreditAppType,
+  CreditType,
+} from '@hypersign-protocol/credit-middleware';
+
 await creditService.grant({
   subject: {
     tenantId: 'tenant/acme',
-    appType: 'CAVACH_API',
+    appType: CreditAppType.CAVACH_API,
     appId: 'app:123',
-    creditType: 'API_CREDIT',
+    creditType: CreditType.API_CREDIT,
   },
   planId: 'plan-001',
   amount: 1_000,
@@ -290,7 +347,7 @@ as both `commandId` and BullMQ `jobId`. The SDK creates its command worker, but
 the external producer still owns its own queue producer connection.
 
 The grant subject must exactly match the request resolver on all four fields.
-For example, `appType: 'BUSINESS'` and `appType: 'CAVACH_API'` are different
+For example, `CreditAccountType.BUSINESS` and `CreditAppType.CAVACH_API` are different
 wallets even when `appId` is identical.
 
 Grant every plan before the SDK needs to spend it. Multiple granted plans are
@@ -301,7 +358,8 @@ emits a notification; it does not load the next plan into Redis.
 
 Create a BullMQ worker for `credit.lifecycle`. For every job:
 
-1. validate `schemaVersion === 3` and `serviceType === 'CAVACH_API'`;
+1. validate `schemaVersion === 3` and
+   `serviceType === CreditServiceType.CAVACH_API`;
 2. insert the envelope `eventId` into a database column with a unique index;
 3. apply the corresponding plan/usage update in the same database transaction;
 4. return successfully only after the transaction commits; and
@@ -319,8 +377,8 @@ Use this acceptance sequence:
 2. Publish one grant and confirm the command job completes.
 3. Confirm a `credit.granted` lifecycle job and `CREDIT_GRANTED` event arrive.
 4. Call `creditService.getBalance(subject)` and confirm the granted amount.
-5. Call one priced route with `env=PROD`; confirm `RESERVED` then `COMMITTED`.
-6. Call it with `env=DEV`; confirm `CREDIT_OBSERVED` and no balance change.
+5. Call one priced route with `env=prod`; confirm `RESERVED` then `COMMITTED`.
+6. Call it with `env=dev`; confirm `CREDIT_OBSERVED` and no balance change.
 7. Grant two plans, exhaust plan 1, and confirm allocation continues into plan
    2 without HTTP 402.
 8. Confirm the recovery scheduler runs and application shutdown closes Redis
@@ -367,7 +425,7 @@ A wallet is uniquely identified by all supplied `CreditSubject` dimensions:
 interface CreditSubject {
   appId: string;
   tenantId?: string;
-  appType?: 'USER' | 'BUSINESS' | 'SERVICE' | string;
+  appType?: CreditAccountType | string;
   creditType?: string;
 }
 ```
@@ -376,7 +434,7 @@ Omitted dimensions are meaningful. These are different wallets:
 
 ```ts
 { appId: 'business_123' }
-{ appId: 'business_123', appType: 'BUSINESS' }
+{ appId: 'business_123', appType: CreditAccountType.BUSINESS }
 ```
 
 `serviceType` and `serviceId` are not part of wallet identity. HTTP charges take
@@ -501,7 +559,7 @@ different logical keyspace. Treat either change as a data migration, not a
 cosmetic rename.
 
 Use a unique `keyPrefix` for each independently operated SDK deployment or
-financial namespace. Do not change it for per-request PROD/DEV values. The
+financial namespace. Do not change it for per-request `prod`/`dev` values. The
 service type is not included in financial keys and does not isolate wallets.
 
 ### Deterministic wallet scope
@@ -519,11 +577,16 @@ markers prevent ambiguous concatenation.
 For this subject:
 
 ```ts
+import {
+  CreditAccountType,
+  CreditType,
+} from '@hypersign-protocol/credit-middleware';
+
 const subject = {
   tenantId: 'tenant/acme',
-  appType: 'BUSINESS',
+  appType: CreditAccountType.BUSINESS,
   appId: 'business:123',
-  creditType: 'API_CREDIT',
+  creditType: CreditType.API_CREDIT,
 };
 ```
 
@@ -565,7 +628,7 @@ deterministic scope ID above.
 | Plan expiry index | `<base>:plan:expirations` | Sorted set | Score is plan expiry; member encodes subject dimensions and `planId` as JSON. |
 | Reservation record | `<base>:reservation:<encoded-reservationId>` | Hash | Status, lease, subject, operation, and immutable allocations. |
 | Request idempotency | `<base>:request:<scope>:<encoded-requestId>` | Hash | Maps request semantics to its reservation. HTTP charge IDs are already appended to request IDs. |
-| Observation idempotency | `<base>:observation:<scope>:<encoded-requestId>` | Hash | Retains DEV event ID, amount, operation, and environment for exact retry handling. |
+| Observation idempotency | `<base>:observation:<scope>:<encoded-requestId>` | Hash | Retains `dev` event ID, amount, operation, and environment for exact retry handling. |
 | Reservation expiry index | `<base>:reservation:expirations` | Sorted set | Score is lease expiry; member is `reservationId`. |
 | Transactional outbox | `<base>:events` | Stream | State-transition events written by the same Lua transaction. |
 
@@ -714,7 +777,11 @@ can be reclaimed after `pendingIdleMs`.
 ```ts
 // app.module.ts
 import { Module } from '@nestjs/common';
-import { CreditModule } from '@hypersign-protocol/credit-middleware';
+import {
+  CreditAppType,
+  CreditEnvironment,
+  CreditModule,
+} from '@hypersign-protocol/credit-middleware';
 import { CreditInfrastructureModule } from './credit-infrastructure.module';
 
 interface AuthenticatedRequest {
@@ -734,15 +801,18 @@ interface AuthenticatedRequest {
       redisHashTag: 'hypersign-credit',
       requestContextResolver: (unknownRequest) => {
         const request = unknownRequest as AuthenticatedRequest;
-        const environment = request.service?.env?.trim().toUpperCase();
-        if (environment !== 'PROD' && environment !== 'DEV') {
-          throw new Error('Trusted service environment must be PROD or DEV');
+        const environment = request.service?.env?.trim();
+        if (
+          environment !== CreditEnvironment.PROD &&
+          environment !== CreditEnvironment.DEV
+        ) {
+          throw new Error('Trusted service environment must be prod or dev');
         }
         return {
           subject: {
             tenantId: request.service?.subdomain,
             appId: request.service?.appId ?? '',
-            appType: 'CAVACH_API',
+            appType: CreditAppType.CAVACH_API,
           },
           requestId: request.requestId,
           environment,
@@ -773,7 +843,8 @@ CreditModule.forRootAsync({
 ```
 
 The default context resolver is a compatibility fallback. Charged requests
-fail closed unless their resolver returns exactly `PROD` or `DEV`. Production
+fail closed unless their resolver returns exactly lowercase `prod` or `dev`.
+Uppercase values are rejected. Production
 applications should always provide an explicit resolver.
 
 ## Per-request billing environment
@@ -785,17 +856,17 @@ trusted request metadata, not a server-wide setting and not a wallet dimension.
 interface CreditRequestContext {
   subject: CreditSubject;
   requestId?: string;
-  environment: 'PROD' | 'DEV';
+  environment: CreditEnvironment;
 }
 ```
 
 | Request environment | Billing mode | Balance behavior | Lifecycle event |
 | --- | --- | --- | --- |
-| `PROD` | `ENFORCE` | Reserve and settle the catalog cost normally. | Normal financial events with `environment: 'PROD'` and `billingMode: 'ENFORCE'`. |
-| `DEV` | `OBSERVE` | Never reads or changes wallet, plan, or reservation balances. | One idempotent `CREDIT_OBSERVED` per catalog charge with `deductedAmount: 0`. |
+| `prod` (`CreditEnvironment.PROD`) | `CreditBillingMode.ENFORCE` | Reserve and settle the catalog cost normally. | Normal financial events with `environment: 'prod'` and `billingMode: 'ENFORCE'`. |
+| `dev` (`CreditEnvironment.DEV`) | `CreditBillingMode.OBSERVE` | Never reads or changes wallet, plan, or reservation balances. | One idempotent `CREDIT_OBSERVED` per catalog charge with `deductedAmount: 0`. |
 
-Missing values and values other than `PROD` or `DEV` are rejected before the
-controller runs. Do not default an unknown value to DEV, because that could
+Missing values and values other than lowercase `prod` or `dev` are rejected
+before the controller runs. Do not default an unknown value to `dev`, because that could
 silently bypass billing.
 
 ## Request identity and idempotency
@@ -809,7 +880,7 @@ authentication middleware. It should be:
 
 The catalog policy appends each charge ID to the request ID. Reusing an ID with
 different credit semantics is rejected. Replaying an already-created catalog
-reservation or DEV observation returns HTTP `409 Conflict` instead of running
+reservation or `dev` observation returns HTTP `409 Conflict` instead of running
 the controller again.
 
 When the resolver does not return a request ID, the SDK generates a UUID. That
@@ -821,15 +892,17 @@ Grant plans only from trusted billing or payment infrastructure.
 
 ```ts
 import {
+  CreditAccountType,
+  CreditType,
   CreditService,
   CreditSubject,
 } from '@hypersign-protocol/credit-middleware';
 
 const subject: CreditSubject = {
   tenantId: 'tenant_1',
-  appType: 'BUSINESS',
+  appType: CreditAccountType.BUSINESS,
   appId: 'business_123',
-  creditType: 'API_CREDIT',
+  creditType: CreditType.API_CREDIT,
 };
 
 await creditService.grant({
@@ -864,12 +937,12 @@ closed with HTTP `402 Payment Required`.
 For each non-free catalog route, the interceptor:
 
 1. resolves the trusted subject and per-request environment;
-2. for PROD, reserves every catalog charge;
-3. for DEV, records every catalog charge using the observation Lua transaction;
+2. for `prod`, reserves every catalog charge;
+3. for `dev`, records every catalog charge using the observation Lua transaction;
 4. invokes the controller only after all actions succeed;
-5. for PROD, commits `IMMEDIATE` reservations and leaves `DEFERRED` reservations
+5. for `prod`, commits `IMMEDIATE` reservations and leaves `DEFERRED` reservations
    active after success; and
-6. for PROD, rolls back active reservations if execution or settlement fails.
+6. for `prod`, rolls back active reservations if execution or settlement fails.
 
 If a route has multiple charges and a later reservation fails, the SDK rolls
 back earlier reservations created during the same policy execution.
@@ -914,15 +987,18 @@ boundary rolls it back. Routes without `boundary: true` are unaffected.
 
 ## Deferred settlement
 
-Use `DEFERRED` settlement when another process determines the final outcome.
+Use `CreditSettlementMode.DEFERRED` when another process determines the final
+outcome.
 
 ```ts
+import { CreditSettlementMode } from '@hypersign-protocol/credit-middleware';
+
 const reservation = await creditService.reserve({
   subject,
   requestId: 'job_019',
   operation: 'GENERATE_REPORT',
   amount: 25,
-  settlementMode: 'DEFERRED',
+  settlementMode: CreditSettlementMode.DEFERRED,
 });
 
 // Renew long-running work before reservation.expiresAt.
@@ -940,21 +1016,25 @@ await creditService.rollback(reservation.reservationId, 'job_failed');
 `renew()` extends the reservation lease by `leaseMs`, increments its version,
 and returns the new expiry. It does not extend the underlying plan expiry.
 
-Set `autoRecover: false` only on a `DEFERRED` reservation that must remain
-active until explicit settlement. The host then owns orphan detection and
-settlement completely.
+Set `autoRecover: false` only on a `CreditSettlementMode.DEFERRED` reservation
+that must remain active until explicit settlement. The host then owns orphan
+detection and settlement completely.
 
 For a catalog-created deferred charge, use `getCreditRequestState()` to obtain
 the reservation ID inside the controller:
 
 ```ts
-import { getCreditRequestState } from '@hypersign-protocol/credit-middleware';
+import {
+  CreditBillingMode,
+  CreditSettlementMode,
+  getCreditRequestState,
+} from '@hypersign-protocol/credit-middleware';
 
 const state = getCreditRequestState(request);
 const action = state?.actions.find(
-  ({ charge }) => charge.settlementMode === 'DEFERRED',
+  ({ charge }) => charge.settlementMode === CreditSettlementMode.DEFERRED,
 );
-const reservationId = action?.billingMode === 'ENFORCE'
+const reservationId = action?.billingMode === CreditBillingMode.ENFORCE
   ? action.reservation.reservationId
   : undefined;
 ```
@@ -1015,6 +1095,8 @@ No BullMQ provider or Stream Redis client is injected by the host. Configure
 only names and relay tuning when the defaults are not suitable:
 
 ```ts
+import { CreditServiceType } from '@hypersign-protocol/credit-middleware';
+
 CreditModule.forRootAsync({
   imports: [CreditInfrastructureModule],
   useFactory: () => ({
@@ -1026,7 +1108,7 @@ CreditModule.forRootAsync({
         'credit.lifecycle.reconciliation',
         'credit.lifecycle.notifications',
       ],
-      commandQueueName: 'credit.commands.CAVACH_API',
+      commandQueueName: `credit.commands.${CreditServiceType.CAVACH_API}`,
     },
   }),
 });
@@ -1065,7 +1147,7 @@ interface CreditLifecycleEventEnvelope {
 | `credit.rolled-back` | `ROLLED_BACK` | One allocation was processed as a rollback. |
 | `credit.expired` | `EXPIRED` | Recovery processed an abandoned allocation. |
 | `credit.critical-balance` | `CRITICAL_BALANCE` | Commit left a plan at or below its immutable threshold. |
-| `credit.observed` | `CREDIT_OBSERVED` | A DEV catalog charge was recorded with no deduction. |
+| `credit.observed` | `CREDIT_OBSERVED` | A `dev` catalog charge was recorded with no deduction. |
 | `credit.command-rejected` | n/a | An inbound command failed validation or execution. |
 
 A reservation funded by multiple plans emits a separate reserved and
@@ -1081,7 +1163,7 @@ Recommended downstream keys:
 Persist the event receipt and its financial side effect in the same database
 transaction before acknowledging the BullMQ job.
 
-`CREDIT_OBSERVED` contains `environment: 'DEV'`, `billingMode: 'OBSERVE'`,
+`CREDIT_OBSERVED` contains `environment: 'dev'`, `billingMode: 'OBSERVE'`,
 `requestedAmount`, `deductedAmount: 0`, `requestId`, `operation`, and the scoped
 subject. It has no `reservationId` or `planId` because no financial state was
 created. Exact retries reuse the original observation and do not emit a second
@@ -1110,20 +1192,27 @@ Use the originating business event ID for both `commandId` and BullMQ `jobId`.
 Job name: `credit.grant.requested`
 
 ```ts
+import {
+  CreditAppType,
+  CreditEventName,
+  CreditServiceType,
+  CreditType,
+} from '@hypersign-protocol/credit-middleware';
+
 await provider.add(
-  'credit.commands.CAVACH_API',
-  'credit.grant.requested',
+  `credit.commands.${CreditServiceType.CAVACH_API}`,
+  CreditEventName.GRANT_REQUESTED,
   {
     schemaVersion: 3,
     commandId: payment.eventId,
-    serviceType: 'CAVACH_API',
+    serviceType: CreditServiceType.CAVACH_API,
     source: 'payment-service',
     payload: {
       subject: {
         tenantId: 'tenant_1',
-        appType: 'BUSINESS',
+        appType: CreditAppType.CAVACH_API,
         appId: 'business_123',
-        creditType: 'API_CREDIT',
+        creditType: CreditType.API_CREDIT,
       },
       planId: payment.planId,
       amount: 100,
@@ -1199,7 +1288,7 @@ throw, allowing the SDK's BullMQ retry policy to run.
 | --- | --- |
 | `grant(input)` | Creates or exactly replays an immutable recharge plan. |
 | `reserve(input)` | Atomically allocates credit and creates a leased reservation. |
-| `observe(input)` | Atomically records DEV usage without reading or mutating financial balances. |
+| `observe(input)` | Atomically records `dev` usage without reading or mutating financial balances. |
 | `commit(id)` | Commits an active reservation; returns `true` only when applied. |
 | `rollback(id, reason?)` | Rolls back an active reservation; returns `true` only when applied. |
 | `renew(id, leaseToken)` | Renews an active lease and returns the new expiry. |
@@ -1231,16 +1320,17 @@ interface ReserveCreditInput {
   subject: CreditSubject;
   requestId?: string;
   amount: number;
-  settlementMode?: 'IMMEDIATE' | 'DEFERRED';
+  settlementMode?: CreditSettlementMode;
   operation?: string;
   autoRecover?: boolean;
-  environment?: 'PROD';
+  environment?: CreditEnvironment.PROD;
 }
 ```
 
-`settlementMode` defaults to `IMMEDIATE`; `autoRecover` defaults to `true`.
-`autoRecover: false` requires `DEFERRED` settlement. Direct financial reserves
-default to PROD and reject any other environment.
+`settlementMode` defaults to `CreditSettlementMode.IMMEDIATE`; `autoRecover`
+defaults to `true`. `autoRecover: false` requires
+`CreditSettlementMode.DEFERRED`. Direct financial reserves default to `prod`
+and reject any other environment.
 
 ### `ObserveCreditInput`
 
@@ -1250,7 +1340,7 @@ interface ObserveCreditInput {
   requestId?: string;
   amount: number;
   operation?: string;
-  environment: 'DEV';
+  environment: CreditEnvironment.DEV;
 }
 ```
 
@@ -1264,10 +1354,10 @@ interface ReserveCreditResult {
   remainingBalance: number;
   expiresAt: number;
   autoRecover: boolean;
-  environment: 'PROD';
-  billingMode: 'ENFORCE';
+  environment: CreditEnvironment.PROD;
+  billingMode: CreditBillingMode.ENFORCE;
   existing: boolean;
-  settlementMode: 'IMMEDIATE' | 'DEFERRED';
+  settlementMode: CreditSettlementMode;
   subject: CreditSubject;
   allocations: Array<{
     planId: string;
@@ -1279,13 +1369,15 @@ interface ReserveCreditResult {
 
 ### Plan status
 
-`getPlans()` returns `ACTIVE`, `DEPLETED`, `EXPIRED`, or `REVOKED`. Expired
+`getPlans()` returns `CreditPlanStatus.ACTIVE`, `.DEPLETED`, `.EXPIRED`, or
+`.REVOKED`. Expired
 plans are reported with zero available credit even before recovery persists
 their expiry event. Each plan also returns its immutable `criticalBalance`.
 
 ### Reservation status
 
-`getReservation()` returns `RESERVED`, `COMMITTED`, `ROLLED_BACK`, or `EXPIRED`.
+`getReservation()` returns `CreditReservationStatus.RESERVED`, `.COMMITTED`,
+`.ROLLED_BACK`, or `.EXPIRED`.
 Finalized reservation and request-id records are retained for `retentionMs`.
 
 ### Return-value idempotency
@@ -1298,7 +1390,7 @@ Call `getReservation()` when a caller needs to distinguish those cases.
 
 | Option | Default | Description |
 | --- | --- | --- |
-| `requestContextResolver` | compatibility fallback | Returns the trusted subject, optional request ID, and required per-request `PROD`/`DEV` environment. Override in production. |
+| `requestContextResolver` | compatibility fallback | Returns the trusted subject, optional request ID, and required lowercase per-request `prod`/`dev` environment. Override in production. |
 | `leaseMs` | `60000` | Reservation lease duration in milliseconds. |
 | `retentionMs` | `604800000` | Finalized reservation and request-record retention (7 days). |
 | `recoveryBatchSize` | `100` | Maximum reservations and maximum plans processed per recovery pass. |
@@ -1329,9 +1421,9 @@ grant's `criticalBalance` must be a non-negative safe integer.
 | Status | Typical condition |
 | --- | --- |
 | `400 Bad Request` | Reused identity with different semantics, invalid grant state, or invalid boundary claim. |
-| `401 Unauthorized` | A charged request lacks a trusted subject or valid `PROD`/`DEV` environment. |
+| `401 Unauthorized` | A charged request lacks a trusted subject or valid lowercase `prod`/`dev` environment. |
 | `402 Payment Required` | Unexpired plans cannot fund the complete charge. |
-| `409 Conflict` | A catalog request ID already has a reservation or DEV observation. |
+| `409 Conflict` | A catalog request ID already has a reservation or `dev` observation. |
 | `500 Internal Server Error` | A request route is not cataloged or stored state is inconsistent. |
 | `503 Service Unavailable` | Active-plan or allocation limit reached, or automatic commit could not apply. |
 

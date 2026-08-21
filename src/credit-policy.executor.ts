@@ -12,6 +12,11 @@ import {
 } from './credit.catalog';
 import { CreditService } from './credit.service';
 import {
+  CreditBillingMode,
+  CreditEnvironment,
+  CreditReservationStatus,
+} from './credit.enums';
+import {
   CreditRequestContext,
   CreditSubject,
   ObserveCreditResult,
@@ -19,13 +24,13 @@ import {
 } from './credit.types';
 
 export interface AppliedCreditReservation {
-  billingMode: 'ENFORCE';
+  billingMode: CreditBillingMode.ENFORCE;
   charge: ResolvedCreditCatalogCharge;
   reservation: ReserveCreditResult;
 }
 
 export interface AppliedCreditObservation {
-  billingMode: 'OBSERVE';
+  billingMode: CreditBillingMode.OBSERVE;
   charge: ResolvedCreditCatalogCharge;
   observation: ObserveCreditResult;
 }
@@ -51,7 +56,7 @@ export class CreditPolicyExecutor {
     }
     const environment = this.environment(context.environment);
     const requestId = context.requestId?.trim() || randomUUID();
-    return environment === 'PROD'
+    return environment === CreditEnvironment.PROD
       ? this.reserve(route, context.subject, requestId)
       : this.observe(route, context.subject, requestId);
   }
@@ -71,9 +76,13 @@ export class CreditPolicyExecutor {
           settlementMode: charge.settlementMode,
           operation: route.operation,
           autoRecover: charge.autoRecover,
-          environment: 'PROD',
+          environment: CreditEnvironment.PROD,
         });
-        applied.push({ billingMode: 'ENFORCE', charge, reservation });
+        applied.push({
+          billingMode: CreditBillingMode.ENFORCE,
+          charge,
+          reservation,
+        });
       }
       if (applied.some(({ reservation }) => reservation.existing)) {
         throw new ConflictException('This credit requestId already has a reservation');
@@ -97,9 +106,9 @@ export class CreditPolicyExecutor {
     for (let index = 0; index < route.charges.length; index++) {
       const expected = route.charges[index];
       const value = applied[index];
-      if (environment === 'DEV') {
-        if (value.billingMode !== 'OBSERVE' ||
-            value.observation.environment !== 'DEV' ||
+      if (environment === CreditEnvironment.DEV) {
+        if (value.billingMode !== CreditBillingMode.OBSERVE ||
+            value.observation.environment !== CreditEnvironment.DEV ||
             value.observation.requestedAmount !== expected.amount ||
             value.observation.operation !== route.operation ||
             !sameSubject(
@@ -112,14 +121,14 @@ export class CreditPolicyExecutor {
         }
         continue;
       }
-      if (value.billingMode !== 'ENFORCE') {
+      if (value.billingMode !== CreditBillingMode.ENFORCE) {
         throw new BadRequestException(
           `Early credit reservation does not match catalog charge ${expected.id}`,
         );
       }
       const stored = await this.credits.getReservation(value.reservation.reservationId);
       const subject = this.subject(context.subject, expected.creditType);
-      if (!stored || stored.status !== 'RESERVED' ||
+      if (!stored || stored.status !== CreditReservationStatus.RESERVED ||
           stored.amount !== expected.amount ||
           stored.settlementMode !== expected.settlementMode ||
           stored.autoRecover !== expected.autoRecover ||
@@ -136,7 +145,7 @@ export class CreditPolicyExecutor {
   async rollbackAll(applied: AppliedCreditAction[], reason: string): Promise<void> {
     await Promise.all(applied
       .filter((value): value is AppliedCreditReservation =>
-        value.billingMode === 'ENFORCE')
+        value.billingMode === CreditBillingMode.ENFORCE)
       .map(({ reservation }) =>
         this.credits.rollback(reservation.reservationId, reason),
       ));
@@ -154,9 +163,13 @@ export class CreditPolicyExecutor {
         requestId: `${requestId}:${charge.id}`,
         amount: charge.amount,
         operation: route.operation,
-        environment: 'DEV',
+        environment: CreditEnvironment.DEV,
       });
-      applied.push({ billingMode: 'OBSERVE', charge, observation });
+      applied.push({
+        billingMode: CreditBillingMode.OBSERVE,
+        charge,
+        observation,
+      });
     }
     if (applied.some(({ observation }) => observation.existing)) {
       throw new ConflictException('This credit requestId was already observed');
@@ -177,13 +190,16 @@ export class CreditPolicyExecutor {
     return { ...base, creditType };
   }
 
-  private environment(value: unknown): 'PROD' | 'DEV' {
+  private environment(value: unknown): CreditEnvironment {
     if (typeof value !== 'string') {
       throw new UnauthorizedException('A trusted billing environment is required');
     }
-    const normalized = value.trim().toUpperCase();
-    if (normalized !== 'PROD' && normalized !== 'DEV') {
-      throw new UnauthorizedException('Billing environment must be PROD or DEV');
+    const normalized = value.trim();
+    if (
+      normalized !== CreditEnvironment.PROD &&
+      normalized !== CreditEnvironment.DEV
+    ) {
+      throw new UnauthorizedException('Billing environment must be prod or dev');
     }
     return normalized;
   }

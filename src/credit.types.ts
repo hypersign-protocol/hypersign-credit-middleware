@@ -5,6 +5,25 @@ import {
 } from '@nestjs/common';
 import type Redis from 'ioredis';
 import type { RedisOptions } from 'ioredis';
+import {
+  CreditBillingMode,
+  CreditAccountType,
+  CreditCatalogVersioning,
+  CreditEnvironment,
+  CreditPlanStatus,
+  CreditReservationStatus,
+  CreditSettlementMode,
+} from './credit.enums';
+
+export {
+  CreditBillingMode,
+  CreditAccountType,
+  CreditCatalogVersioning,
+  CreditEnvironment,
+  CreditPlanStatus,
+  CreditReservationStatus,
+  CreditSettlementMode,
+} from './credit.enums';
 
 /** Injection token for the Redis client supplied by the host application. */
 export const CREDIT_REDIS_CLIENT = 'REDIS_CLIENT';
@@ -89,11 +108,6 @@ export interface ResolvedCreditTransportOptions {
   pendingIdleMs: number;
 }
 
-export type CreditSettlementMode = 'IMMEDIATE' | 'DEFERRED';
-export type CreditAccountType = 'USER' | 'BUSINESS' | 'SERVICE' | string;
-export type CreditEnvironment = 'PROD' | 'DEV';
-export type CreditBillingMode = 'ENFORCE' | 'OBSERVE';
-
 /**
  * Uniquely identifies the wallet from which credits are deducted.
  * `appId` alone is sufficient for a global wallet. Add dimensions only
@@ -102,14 +116,14 @@ export type CreditBillingMode = 'ENFORCE' | 'OBSERVE';
 export interface CreditSubject {
   appId: string;
   tenantId?: string;
-  appType?: CreditAccountType;
+  appType?: CreditAccountType | string;
   creditType?: string;
 }
 
 export interface CreditRequestContext {
   subject: CreditSubject;
   requestId?: string;
-  /** Trusted per-request environment. PROD enforces billing; DEV observes only. */
+  /** Trusted per-request environment. prod enforces billing; dev observes only. */
   environment: CreditEnvironment;
 }
 
@@ -139,7 +153,7 @@ export interface CreditCatalog {
   version: string;
   globalPrefix?: string;
   /** URI inserts v<version> into the route; NONE covers header/media/custom versioning. */
-  versioning?: 'URI' | 'NONE';
+  versioning?: CreditCatalogVersioning;
   uriVersionPrefix?: string;
   /** Version applied by Nest when a controller or handler has no @Version metadata. */
   defaultVersion?: string;
@@ -152,8 +166,8 @@ export interface ReserveCreditInput {
   amount: number;
   settlementMode?: CreditSettlementMode;
   operation?: string;
-  /** Enforced deductions are production-only. Defaults to PROD. */
-  environment?: 'PROD';
+  /** Enforced deductions are production-only. Defaults to prod. */
+  environment?: CreditEnvironment.PROD;
   /**
    * When false, scheduled recovery never refunds this reservation merely
    * because its lease elapsed. It must be explicitly committed or rolled back.
@@ -170,8 +184,8 @@ export interface ReserveCreditResult {
   remainingBalance: number;
   expiresAt: number;
   autoRecover: boolean;
-  environment: 'PROD';
-  billingMode: 'ENFORCE';
+  environment: CreditEnvironment.PROD;
+  billingMode: CreditBillingMode.ENFORCE;
   existing: boolean;
   settlementMode: CreditSettlementMode;
   subject: CreditSubject;
@@ -183,15 +197,15 @@ export interface ObserveCreditInput {
   requestId?: string;
   amount: number;
   operation?: string;
-  environment: 'DEV';
+  environment: CreditEnvironment.DEV;
 }
 
 export interface ObserveCreditResult {
   eventId: string;
   requestId: string;
   scopeId: string;
-  environment: 'DEV';
-  billingMode: 'OBSERVE';
+  environment: CreditEnvironment.DEV;
+  billingMode: CreditBillingMode.OBSERVE;
   requestedAmount: number;
   deductedAmount: 0;
   existing: boolean;
@@ -232,8 +246,6 @@ export interface CreditPlanAllocation {
   planBalanceAfter: number;
 }
 
-export type CreditPlanStatus = 'ACTIVE' | 'DEPLETED' | 'EXPIRED' | 'REVOKED';
-
 export interface CreditPlan {
   planId: string;
   subject: CreditSubject;
@@ -247,12 +259,6 @@ export interface CreditPlan {
   status: CreditPlanStatus;
 }
 
-export type CreditReservationStatus =
-  | 'RESERVED'
-  | 'COMMITTED'
-  | 'ROLLED_BACK'
-  | 'EXPIRED';
-
 export interface CreditReservation extends CreditSubject {
   subject: CreditSubject;
   reservationId: string;
@@ -264,8 +270,8 @@ export interface CreditReservation extends CreditSubject {
   createdAt: number;
   expiresAt: number;
   autoRecover: boolean;
-  environment: 'PROD';
-  billingMode: 'ENFORCE';
+  environment: CreditEnvironment.PROD;
+  billingMode: CreditBillingMode.ENFORCE;
   finalizedAt?: number;
   finalizationReason?: string;
   settlementMode: CreditSettlementMode;

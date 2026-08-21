@@ -1,3 +1,4 @@
+import { CreditEventName } from './credit.enums';
 import { CreditEnvironment, ResolvedCreditOptions } from './credit.types';
 export {
   GET_BALANCE_SCRIPT,
@@ -7,25 +8,8 @@ export {
 export const DEFAULT_KEY_PREFIX = 'credit';
 export const DEFAULT_REDIS_HASH_TAG = 'credit';
 
-/** BullMQ job names published or consumed by the SDK. */
-export const CREDIT_EVENT_NAMES = {
-  RESERVED: 'credit.reserved',
-  COMMITTED: 'credit.committed',
-  ROLLED_BACK: 'credit.rolled-back',
-  EXPIRED: 'credit.expired',
-  PLAN_EXPIRED: 'credit.plan-expired',
-  CREDIT_GRANTED: 'credit.granted',
-  CRITICAL_BALANCE: 'credit.critical-balance',
-  CREDIT_OBSERVED: 'credit.observed',
-  COMMAND_REJECTED: 'credit.command-rejected',
-  GRANT_REQUESTED: 'credit.grant.requested',
-  RESERVE_REQUESTED: 'credit.reserve.requested',
-  COMMIT_REQUESTED: 'credit.commit.requested',
-  ROLLBACK_REQUESTED: 'credit.rollback.requested',
-} as const;
-
-export type CreditEventName =
-  typeof CREDIT_EVENT_NAMES[keyof typeof CREDIT_EVENT_NAMES];
+/** Compatibility alias; prefer the exported `CreditEventName` enum. */
+export const CREDIT_EVENT_NAMES = CreditEventName;
 
 export const DEFAULT_CREDIT_OPTIONS: ResolvedCreditOptions = {
   catalog: {

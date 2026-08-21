@@ -1,5 +1,10 @@
 import { BadRequestException, Body, Controller, Get, Post, Query } from '@nestjs/common';
-import { CREDIT_EVENT_NAMES } from '../../src';
+import {
+  CreditAppType,
+  CreditEventName,
+  CreditServiceType,
+  CreditType,
+} from '../../src';
 import { ExampleBullMqProvider } from '../bullmq.module';
 import { CreditEventStore } from './event-store.service';
 
@@ -12,9 +17,6 @@ interface GrantCreditRequest {
   expiresAt?: unknown;
   reason?: unknown;
 }
-
-const SERVICE_TYPE = 'CAVACH_API';
-const CREDIT_TYPE = 'API_CREDIT';
 
 @Controller()
 export class CreditEventsController {
@@ -53,20 +55,20 @@ export class CreditEventsController {
       throw new BadRequestException('expiresAt must be in the future');
     }
     const tenantId = optionalString(body.tenantId);
-    const commandId = `grant-${SERVICE_TYPE}-${planId}`;
+    const commandId = `grant-${CreditServiceType.CAVACH_API}-${planId}`;
     const referenceId = `example-grant-${planId}`;
-    const queue = `credit.commands.${SERVICE_TYPE}`;
-    await this.bullMq.add(queue, CREDIT_EVENT_NAMES.GRANT_REQUESTED, {
+    const queue = `credit.commands.${CreditServiceType.CAVACH_API}`;
+    await this.bullMq.add(queue, CreditEventName.GRANT_REQUESTED, {
       schemaVersion: 3,
       commandId,
-      serviceType: SERVICE_TYPE,
+      serviceType: CreditServiceType.CAVACH_API,
       source: 'example-credit-event-server',
       requestedAt: new Date().toISOString(),
       payload: {
         subject: {
           appId,
-          appType: SERVICE_TYPE,
-          creditType: CREDIT_TYPE,
+          appType: CreditAppType.CAVACH_API,
+          creditType: CreditType.API_CREDIT,
           ...(tenantId ? { tenantId } : {}),
         },
         amount,

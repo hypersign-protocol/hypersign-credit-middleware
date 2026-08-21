@@ -3,6 +3,10 @@ import { MetadataScanner } from '@nestjs/core';
 import { CreditCatalogAuditor } from '../src/credit.catalog-auditor';
 import { CreditCatalogService } from '../src/credit.catalog';
 import { DEFAULT_CREDIT_OPTIONS } from '../src/credit.constants';
+import {
+  CreditServiceType,
+  CreditSettlementMode,
+} from '../src/credit.enums';
 import { resolveCreditOptions } from '../src/credit.module';
 
 const catalogOptions = (routes: any[]) => ({
@@ -20,7 +24,7 @@ describe('CreditCatalogService', () => {
       },
     } as any);
 
-    expect(resolved.catalog.serviceType).toBe('CAVACH_API');
+    expect(resolved.catalog.serviceType).toBe(CreditServiceType.CAVACH_API);
     expect(resolved.catalog.routes.length).toBeGreaterThan(0);
   });
 
@@ -89,7 +93,8 @@ describe('CreditCatalogService', () => {
     expect(() => new CreditCatalogService(catalogOptions([{
       method: 'POST', path: '/pay', charges: [{
         id: 'api', creditType: 'API', amount: 1,
-        settlementMode: 'IMMEDIATE', autoRecover: false,
+        settlementMode: CreditSettlementMode.IMMEDIATE,
+        autoRecover: false,
       }],
     }]))).toThrow('requires DEFERRED');
   });

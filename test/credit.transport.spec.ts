@@ -1,5 +1,11 @@
 import { CreditCatalogService } from '../src/credit.catalog';
 import { DEFAULT_CREDIT_OPTIONS } from '../src/credit.constants';
+import {
+  CreditBillingMode,
+  CreditEnvironment,
+  CreditEventName,
+  CreditEventType,
+} from '../src/credit.enums';
 import { CreditCommandWorker, CreditEventRelay } from '../src/credit.transport';
 
 const createTransport = () => {
@@ -37,7 +43,7 @@ describe('CreditEventRelay', () => {
 
     await (relay as any).publishEntries([[
       '1234-0',
-      ['event', 'COMMITTED', 'timestamp', '1234', 'serviceType', 'kyc',
+      ['event', CreditEventType.COMMITTED, 'timestamp', '1234', 'serviceType', 'kyc',
         'appId', 'a1', 'creditType', 'API', 'amount', '4',
         'balanceAfter', '96', 'reservationId', 'r1'],
     ]]);
@@ -45,7 +51,7 @@ describe('CreditEventRelay', () => {
     expect(provider.add).toHaveBeenCalledTimes(2);
     expect(provider.add).toHaveBeenCalledWith(
       'credit.lifecycle',
-      'credit.committed',
+      CreditEventName.COMMITTED,
       expect.objectContaining({
         eventId: '1234-0', schemaVersion: 3, catalogVersion: '7',
         event: expect.objectContaining({ amount: 4, balanceAfter: 96 }),
@@ -66,12 +72,12 @@ describe('CreditEventRelay', () => {
       options, new CreditCatalogService(options), infrastructure as any,
     );
     await expect((relay as any).publishEntries([[
-      '1234-0', ['event', 'RESERVED', 'serviceType', 'kyc'],
+      '1234-0', ['event', CreditEventType.RESERVED, 'serviceType', 'kyc'],
     ]])).rejects.toThrow('queue unavailable');
     expect(streamClient.xack).not.toHaveBeenCalled();
   });
 
-  it('relays DEV observations with numeric zero deduction and explicit mode', async () => {
+  it('relays dev observations with numeric zero deduction and explicit mode', async () => {
     const { provider, infrastructure, options } = createTransport();
     provider.add.mockResolvedValue({});
     const relay = new CreditEventRelay(
@@ -80,22 +86,27 @@ describe('CreditEventRelay', () => {
 
     await (relay as any).publishEntries([[
       '2000-0',
-      ['event', 'CREDIT_OBSERVED', 'timestamp', '2000', 'serviceType', 'kyc',
+      ['event', CreditEventType.CREDIT_OBSERVED,
+        'timestamp', '2000', 'serviceType', 'kyc',
         'scopeId', 'scope-a1', 'appId', 'a1', 'creditType', 'API',
         'requestId', 'request-dev:api', 'operation', 'POST /submit',
         'requestedAmount', '5', 'deductedAmount', '0',
-        'environment', 'DEV', 'billingMode', 'OBSERVE'],
+        'environment', CreditEnvironment.DEV,
+        'billingMode', CreditBillingMode.OBSERVE],
     ]]);
 
     expect(provider.add).toHaveBeenCalledWith(
       'credit.lifecycle',
-      'credit.observed',
+      CreditEventName.CREDIT_OBSERVED,
       expect.objectContaining({
         schemaVersion: 3,
         serviceType: 'kyc',
         event: expect.objectContaining({
-          type: 'CREDIT_OBSERVED', requestedAmount: 5, deductedAmount: 0,
-          environment: 'DEV', billingMode: 'OBSERVE',
+          type: CreditEventType.CREDIT_OBSERVED,
+          requestedAmount: 5,
+          deductedAmount: 0,
+          environment: CreditEnvironment.DEV,
+          billingMode: CreditBillingMode.OBSERVE,
         }),
       }),
       { jobId: 'kyc-2000-0' },

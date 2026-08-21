@@ -6,9 +6,18 @@ import {
   CREDIT_REQUEST_STATE,
   CreditInterceptor,
 } from '../src/credit.interceptor';
-import { CreditPolicyExecutor } from '../src/credit-policy.executor';
+import {
+  AppliedCreditObservation,
+  AppliedCreditReservation,
+  CreditPolicyExecutor,
+} from '../src/credit-policy.executor';
 import { CreditService, InsufficientCreditsException } from '../src/credit.service';
 import { DEFAULT_CREDIT_OPTIONS } from '../src/credit.constants';
+import {
+  CreditBillingMode,
+  CreditEnvironment,
+  CreditSettlementMode,
+} from '../src/credit.enums';
 
 const options = {
   ...DEFAULT_CREDIT_OPTIONS,
@@ -26,7 +35,8 @@ const options = {
           { id: 'api', creditType: 'API_CREDIT', amount: 5 },
           {
             id: 'txn', creditType: 'BLOCKCHAIN_CREDIT', amount: 25,
-            settlementMode: 'DEFERRED' as const, autoRecover: false,
+            settlementMode: CreditSettlementMode.DEFERRED,
+            autoRecover: false,
           },
         ],
       },
@@ -36,14 +46,17 @@ const options = {
 };
 
 const subject = { appId: 'user_123' };
-const reservation = (id: string, mode: 'IMMEDIATE' | 'DEFERRED' = 'IMMEDIATE') => ({
-  billingMode: 'ENFORCE' as const,
+const reservation = (
+  id: string,
+  mode: CreditSettlementMode = CreditSettlementMode.IMMEDIATE,
+): AppliedCreditReservation => ({
+  billingMode: CreditBillingMode.ENFORCE,
   charge: {
     id: id.includes('deferred') ? 'txn' : 'api',
     creditType: id.includes('deferred') ? 'BLOCKCHAIN_CREDIT' : 'API_CREDIT',
     amount: id.includes('deferred') ? 25 : 20,
     settlementMode: mode,
-    autoRecover: mode === 'IMMEDIATE',
+    autoRecover: mode === CreditSettlementMode.IMMEDIATE,
   },
   reservation: {
     reservationId: id,
@@ -51,9 +64,9 @@ const reservation = (id: string, mode: 'IMMEDIATE' | 'DEFERRED' = 'IMMEDIATE') =
     scopeId: 'scope',
     remainingBalance: 80,
     expiresAt: Date.now() + 60_000,
-    autoRecover: mode === 'IMMEDIATE',
-    environment: 'PROD' as const,
-    billingMode: 'ENFORCE' as const,
+    autoRecover: mode === CreditSettlementMode.IMMEDIATE,
+    environment: CreditEnvironment.PROD,
+    billingMode: CreditBillingMode.ENFORCE,
     existing: false,
     settlementMode: mode,
     subject,
@@ -61,15 +74,17 @@ const reservation = (id: string, mode: 'IMMEDIATE' | 'DEFERRED' = 'IMMEDIATE') =
   },
 });
 
-const observation = () => ({
-  billingMode: 'OBSERVE' as const,
+const observation = (): AppliedCreditObservation => ({
+  billingMode: CreditBillingMode.OBSERVE,
   charge: {
     id: 'api', creditType: 'API_CREDIT', amount: 20,
-    settlementMode: 'IMMEDIATE' as const, autoRecover: true,
+    settlementMode: CreditSettlementMode.IMMEDIATE,
+    autoRecover: true,
   },
   observation: {
     eventId: '100-0', requestId: 'request_1:api', scopeId: 'scope',
-    environment: 'DEV' as const, billingMode: 'OBSERVE' as const,
+    environment: CreditEnvironment.DEV,
+    billingMode: CreditBillingMode.OBSERVE,
     requestedAmount: 20, deductedAmount: 0 as const, existing: false,
     operation: 'POST /api/jobs', subject: { ...subject, creditType: 'API_CREDIT' },
   },
@@ -92,7 +107,9 @@ describe('catalog-driven CreditInterceptor', () => {
     requestContextResolver: (request: unknown) => ({
       subject,
       requestId: 'request_1',
-      environment: (request as { environment?: 'PROD' | 'DEV' }).environment ?? 'PROD',
+      environment:
+        (request as { environment?: CreditEnvironment }).environment ??
+        CreditEnvironment.PROD,
     }),
   };
   const catalog = new CreditCatalogService(configured);
@@ -117,7 +134,11 @@ describe('catalog-driven CreditInterceptor', () => {
 
     expect(executor.apply).toHaveBeenCalledWith(
       expect.objectContaining({ path: '/api/jobs', operation: 'POST /api/jobs' }),
-      { subject, requestId: 'request_1', environment: 'PROD' },
+      {
+        subject,
+        requestId: 'request_1',
+        environment: CreditEnvironment.PROD,
+      },
     );
     expect(credits.commit).toHaveBeenCalledWith('res_1');
     expect(request[CREDIT_REQUEST_STATE]).toBeDefined();
@@ -141,7 +162,7 @@ describe('catalog-driven CreditInterceptor', () => {
   it('commits immediate charges and leaves deferred charges reserved', async () => {
     executor.apply.mockResolvedValue([
       reservation('res_api'),
-      reservation('res_deferred', 'DEFERRED'),
+      reservation('res_deferred', CreditSettlementMode.DEFERRED),
     ]);
 
     await lastValueFrom(interceptor.intercept(
@@ -202,9 +223,11 @@ describe('catalog-driven CreditInterceptor', () => {
     expect(boundary.finalized).toBe(true);
   });
 
-  it('executes a DEV request after observation without committing credit', async () => {
+  it('executes a dev request after observation without committing credit', async () => {
     const request: Record<PropertyKey, unknown> = {
-      method: 'POST', originalUrl: '/api/jobs', environment: 'DEV',
+      method: 'POST',
+      originalUrl: '/api/jobs',
+      environment: CreditEnvironment.DEV,
     };
     executor.apply.mockResolvedValue([observation()]);
 
@@ -214,11 +237,15 @@ describe('catalog-driven CreditInterceptor', () => {
     ))).resolves.toEqual({ ok: true });
 
     expect(executor.apply).toHaveBeenCalledWith(expect.anything(), {
-      subject, requestId: 'request_1', environment: 'DEV',
+      subject,
+      requestId: 'request_1',
+      environment: CreditEnvironment.DEV,
     });
     expect(credits.commit).not.toHaveBeenCalled();
     expect(request[CREDIT_REQUEST_STATE]).toEqual(expect.objectContaining({
-      actions: [expect.objectContaining({ billingMode: 'OBSERVE' })],
+      actions: [expect.objectContaining({
+        billingMode: CreditBillingMode.OBSERVE,
+      })],
     }));
   });
 });
