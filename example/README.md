@@ -1,16 +1,12 @@
 # Integration examples
 
-These files are maintained in the repository and excluded from the published
-npm package.
+This folder contains SDK integration examples. It is excluded from the
+published npm package.
 
 | Directory | Role |
 | --- | --- |
-| [`host/`](host/README.md) | NestJS modules for the CAVACH API that owns the complete bundled route catalog. |
-| [`event-server/`](event-server/README.md) | External process that publishes plan grants and consumes lifecycle events. |
-
-The SDK audits the complete NestJS route table at startup. Integrate the host
-modules into the CAVACH API; this repository does not provide a partial API
-server.
+| [`host/`](host/README.md) | Example NestJS modules for registering the SDK. |
+| [`event-server/`](event-server/README.md) | Example server for granting plans and receiving lifecycle events. |
 
 ## Build
 

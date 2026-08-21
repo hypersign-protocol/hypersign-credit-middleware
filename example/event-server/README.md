@@ -1,13 +1,12 @@
 # Grant and lifecycle event server
 
-This repository process represents trusted billing infrastructure outside the
-SDK-installed API. It:
+Example server for sending grant commands and receiving lifecycle events. It:
 
 - publishes schema-v3 grants to `credit.commands.CAVACH_API`;
 - consumes jobs from `credit.lifecycle`; and
 - retains a bounded in-memory event list for local verification.
 
-The process is excluded from the published npm package.
+This server is excluded from the published npm package.
 
 ## Run
 

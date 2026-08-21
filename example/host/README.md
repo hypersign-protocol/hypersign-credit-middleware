@@ -1,7 +1,6 @@
-# CAVACH API host integration
+# NestJS host example
 
-These modules belong in the NestJS API whose controllers match the SDK's
-bundled CAVACH catalog. The route audit requires the complete application.
+Example modules for registering the SDK in a NestJS application.
 
 | Repository file | Host path | Responsibility |
 | --- | --- | --- |
@@ -99,7 +98,7 @@ npm run start:example:events
 ```
 
 Follow the [event-server reference](../event-server/README.md) to grant plans.
-Its HTTP endpoint owns the fixed service, application, and credit types,
+The example endpoint sets the fixed service, application, and credit types,
 generates internal identifiers, and calculates the critical threshold as 40%
 of the grant amount.
 
