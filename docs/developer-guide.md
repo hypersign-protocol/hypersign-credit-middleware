@@ -10,6 +10,7 @@ This guide explains how to integrate, operate, and troubleshoot
 ## Contents
 
 - [Overview](#overview)
+- [Start here: complete integration](#start-here-complete-integration)
 - [Integration requirements](#integration-requirements)
 - [Installation](#installation)
 - [Configure Redis](#configure-redis)
@@ -62,6 +63,269 @@ all-or-nothing: if the entire charge cannot be funded, no plan is deducted.
 
 The exact plan allocation is stored with the reservation. Commit, rollback,
 and recovery use that stored allocation and never recalculate FIFO order.
+
+## Start here: complete integration
+
+This section is the shortest complete path for a developer integrating the SDK
+for the first time. Later sections explain each decision and production edge
+case in detail.
+
+### 1. Understand the four runtime roles
+
+| Role | Responsibility |
+| --- | --- |
+| NestJS API host | Authenticates requests, supplies the trusted billing subject/environment, imports `CreditModule`, and runs recovery. |
+| Credit SDK | Audits routes, reserves/settles credits atomically, owns its Redis Stream relay and BullMQ command worker, and emits lifecycle events. |
+| Trusted plan producer | Creates a stable grant command after payment/onboarding and sends it to `credit.commands.CAVACH_API`. |
+| Lifecycle consumer | Consumes `credit.lifecycle`, persists usage/status changes idempotently by `eventId`, and acknowledges only after persistence succeeds. |
+
+One process may implement more than one role, but their responsibilities do not
+change. In particular, a plan stored only in the producer's database is not yet
+available to the SDK. It becomes available after the SDK successfully applies
+the grant and emits `CREDIT_GRANTED`.
+
+### 2. Install the packages
+
+In the NestJS API host:
+
+```sh
+npm install @hypersign-protocol/credit-middleware ioredis
+npm install @nestjs/schedule
+```
+
+The SDK includes BullMQ. Do not inject a BullMQ provider or a separate Redis
+Stream client into `CreditModule`. The host supplies one ordinary ioredis
+operation client; the SDK duplicates it for the connections it owns.
+
+### 3. Configure one Redis operation client
+
+Set the connection URL in the API host's environment:
+
+```dotenv
+REDIS_URL=redis://username:password@redis-host:6379/0
+```
+
+Register the exported token once:
+
+```ts
+// credit-infrastructure.module.ts
+import {
+  Global,
+  Inject,
+  Injectable,
+  Module,
+  OnApplicationShutdown,
+} from '@nestjs/common';
+import Redis from 'ioredis';
+import { CREDIT_REDIS_CLIENT } from '@hypersign-protocol/credit-middleware';
+
+@Injectable()
+class CreditRedisShutdown implements OnApplicationShutdown {
+  constructor(@Inject(CREDIT_REDIS_CLIENT) private readonly redis: Redis) {}
+
+  async onApplicationShutdown(): Promise<void> {
+    await this.redis.quit();
+  }
+}
+
+@Global()
+@Module({
+  providers: [
+    {
+      provide: CREDIT_REDIS_CLIENT,
+      useFactory: async () => {
+        if (!process.env.REDIS_URL) throw new Error('REDIS_URL is required');
+        const redis = new Redis(process.env.REDIS_URL, {
+          maxRetriesPerRequest: 2,
+          enableReadyCheck: true,
+        });
+        await redis.ping();
+        return redis;
+      },
+    },
+    CreditRedisShutdown,
+  ],
+  exports: [CREDIT_REDIS_CLIENT],
+})
+export class CreditInfrastructureModule {}
+```
+
+Do not configure ioredis's `keyPrefix`. The SDK's `keyPrefix` option controls
+financial keys, while `transport.prefix` controls BullMQ keys.
+
+### 4. Make trusted identity available before billing
+
+Authentication middleware or a guard must attach server-verified data to the
+request. Never accept these values directly from a request body or query:
+
+```ts
+interface TrustedCreditRequest {
+  service?: {
+    subdomain?: string; // tenantId
+    appId?: string;
+    env?: string;       // PROD or DEV for this API call
+  };
+  requestId?: string;   // stable ID created by trusted infrastructure
+}
+```
+
+The same server can process PROD and DEV calls. `env` is per-request trusted
+metadata, not an application-wide environment variable:
+
+- `PROD` reserves and deducts credit;
+- `DEV` emits an observation with `deductedAmount: 0`; and
+- missing/unknown values fail closed before the controller runs.
+
+### 5. Register the SDK and the five-minute recovery job
+
+```ts
+// credit-recovery.scheduler.ts
+import { Injectable } from '@nestjs/common';
+import { Cron, CronExpression } from '@nestjs/schedule';
+import { CreditRecoveryService } from '@hypersign-protocol/credit-middleware';
+
+@Injectable()
+export class CreditRecoveryScheduler {
+  constructor(private readonly recovery: CreditRecoveryService) {}
+
+  @Cron(CronExpression.EVERY_5_MINUTES, {
+    name: 'credit-recovery',
+    waitForCompletion: true,
+  })
+  async run(): Promise<void> {
+    await this.recovery.runOnce();
+  }
+}
+```
+
+```ts
+// app.module.ts
+import { Module, UnauthorizedException } from '@nestjs/common';
+import { ScheduleModule } from '@nestjs/schedule';
+import { CreditModule } from '@hypersign-protocol/credit-middleware';
+import { CreditInfrastructureModule } from './credit-infrastructure.module';
+import { CreditRecoveryScheduler } from './credit-recovery.scheduler';
+
+interface TrustedCreditRequest {
+  service?: {
+    subdomain?: string;
+    appId?: string;
+    env?: string;
+  };
+  requestId?: string;
+}
+
+@Module({
+  imports: [
+    ScheduleModule.forRoot(),
+    CreditInfrastructureModule,
+    CreditModule.forRootAsync({
+      imports: [CreditInfrastructureModule],
+      useFactory: () => ({
+        requestContextResolver: (unknownRequest: unknown) => {
+          const request = unknownRequest as TrustedCreditRequest;
+          const environment = request.service?.env?.trim().toUpperCase();
+          if (environment !== 'PROD' && environment !== 'DEV') {
+            throw new UnauthorizedException(
+              'Trusted service environment must be PROD or DEV',
+            );
+          }
+          return {
+            subject: {
+              tenantId: request.service?.subdomain,
+              appId: request.service?.appId ?? '',
+              appType: 'CAVACH_API',
+              creditType: 'API_CREDIT',
+            },
+            requestId: request.requestId,
+            environment,
+          };
+        },
+      }),
+    }),
+  ],
+  providers: [CreditRecoveryScheduler],
+})
+export class AppModule {}
+```
+
+`CreditModule` is global and installs the interceptor automatically. Do not add
+pricing decorators to controllers. The bundled catalog is authoritative, and
+startup fails if the application routes and catalog routes differ.
+
+`leaseMs`, `retentionMs`, queue names, Stream settings, and recovery batch size
+already have SDK defaults. Configure them only for a deliberate operational
+reason.
+
+### 6. Grant a plan into the exact same wallet
+
+For a same-process trusted flow, inject `CreditService` and call `grant()`:
+
+```ts
+await creditService.grant({
+  subject: {
+    tenantId: 'tenant/acme',
+    appType: 'CAVACH_API',
+    appId: 'app:123',
+    creditType: 'API_CREDIT',
+  },
+  planId: 'plan-001',
+  amount: 1_000,
+  criticalBalance: 400,
+  grantedAt: Date.now(),
+  expiresAt: Date.now() + 30 * 24 * 60 * 60 * 1_000,
+  referenceId: 'payment-001',
+  reason: 'credit_purchase',
+});
+```
+
+For an external dashboard/payment service, publish
+`credit.grant.requested` to `credit.commands.CAVACH_API`; the complete envelope
+is in [Command messages](#command-messages). Use the stable business event ID
+as both `commandId` and BullMQ `jobId`. The SDK creates its command worker, but
+the external producer still owns its own queue producer connection.
+
+The grant subject must exactly match the request resolver on all four fields.
+For example, `appType: 'BUSINESS'` and `appType: 'CAVACH_API'` are different
+wallets even when `appId` is identical.
+
+Grant every plan before the SDK needs to spend it. Multiple granted plans are
+safe: FIFO always uses the oldest available plan first. `criticalBalance` only
+emits a notification; it does not load the next plan into Redis.
+
+### 7. Consume lifecycle events idempotently
+
+Create a BullMQ worker for `credit.lifecycle`. For every job:
+
+1. validate `schemaVersion === 3` and `serviceType === 'CAVACH_API'`;
+2. insert the envelope `eventId` into a database column with a unique index;
+3. apply the corresponding plan/usage update in the same database transaction;
+4. return successfully only after the transaction commits; and
+5. throw on failure so BullMQ retries the job.
+
+Workers on the same queue compete. If reconciliation, notifications, and
+analytics must each receive every event, configure separate lifecycle queue
+names instead of attaching all consumers to `credit.lifecycle`.
+
+### 8. Verify the integration before enabling traffic
+
+Use this acceptance sequence:
+
+1. Start Redis and the NestJS API. Confirm the route catalog audit succeeds.
+2. Publish one grant and confirm the command job completes.
+3. Confirm a `credit.granted` lifecycle job and `CREDIT_GRANTED` event arrive.
+4. Call `creditService.getBalance(subject)` and confirm the granted amount.
+5. Call one priced route with `env=PROD`; confirm `RESERVED` then `COMMITTED`.
+6. Call it with `env=DEV`; confirm `CREDIT_OBSERVED` and no balance change.
+7. Grant two plans, exhaust plan 1, and confirm allocation continues into plan
+   2 without HTTP 402.
+8. Confirm the recovery scheduler runs and application shutdown closes Redis
+   and SDK-owned transport connections cleanly.
+
+If step 7 fails, follow [Diagnosing HTTP 402 before plan 2](redis-keyspace.md#diagnosing-http-402-before-plan-2).
+The [Redis keyspace reference](redis-keyspace.md) includes the exact pattern,
+type, retention rule, concrete key, and safe inspection command for every
+SDK-owned key family.
 
 ## Integration requirements
 

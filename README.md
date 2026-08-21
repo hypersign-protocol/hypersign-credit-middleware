@@ -5,7 +5,7 @@ immutable recharge plans instead of one aggregate balance or a balance provider.
 Each API reservation records exactly which plans funded it, consumes plans FIFO,
 and emits one settlement event per affected plan.
 
-- [Developer integration guide](docs/developer-guide.md)
+- [Developer integration guide — start here](docs/developer-guide.md#start-here-complete-integration)
 - [Technical architecture](docs/technical-architecture.md)
 - [Redis keys and records](docs/redis-keyspace.md)
 - [Lua state transitions](docs/lua-scripts.md)
@@ -70,6 +70,12 @@ reservation allocations:
 
 The allocation is stored in the reservation. Commit, rollback, and crash
 recovery never recalculate FIFO.
+
+Every plan must be granted to the SDK before it can participate in FIFO. A plan
+that exists only in a dashboard/payment database is not part of the Redis
+wallet. `criticalBalance` emits a lifecycle notification; it does not register
+or activate the next plan. See the
+[plan-2 HTTP 402 checklist](docs/redis-keyspace.md#diagnosing-http-402-before-plan-2).
 
 Commit writes one `COMMITTED` event per allocation. A database consumer can use
 `reservationId + planId + event type` as its idempotency key.
