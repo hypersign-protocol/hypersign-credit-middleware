@@ -1,6 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
-import { CreditRecoveryService } from '../src';
+import { CreditRecoveryService } from '../../src';
 
 @Injectable()
 export class CreditRecoveryScheduler {

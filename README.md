@@ -255,49 +255,51 @@ to an expired plan. Finalized reservation/request records use `retentionMs`.
 
 ## Examples
 
-Start the SDK server and the independent lifecycle/command server:
+Repository checkouts contain an `example/` folder with:
+
+- compile-checked modules to integrate into the real catalog-compatible CAVACH
+  API host; and
+- a runnable independent grant/lifecycle event server.
+
+The example sources are repository-only. They are not shipped in the npm
+package and are not part of the package's public import surface.
+
+Build the examples and start the external server:
 
 ```sh
-npm run start:example
+npm run build:example
 npm run start:example:events
 ```
 
-Grant two FIFO plans through the event server (use current millisecond values):
+Create a plan through the trusted example endpoint:
 
 ```sh
 curl -X POST http://localhost:3002/credit-commands/grant \
   -H 'content-type: application/json' \
   -d '{
-    "serviceType":"CAVACH_API",
-    "appId":"user_123",
-    "appType":"USER",
-    "creditType":"API_CREDIT",
+    "tenantId":"tenant/acme",
+    "appId":"app:123",
     "planId":"plan-old",
-    "amount":10,
-    "criticalBalance":2,
+    "amount":1000,
     "grantedAt":1780000000000,
-    "expiresAt":1900000000000,
-    "referenceId":"payment-old"
+    "expiresAt":1900000000000
   }'
 ```
 
-Repeat with a new `planId`, `referenceId`, and later `grantedAt`, then call:
+The server fixes the service/app type to `CAVACH_API`, fixes the credit type to
+`API_CREDIT`, generates stable internal command/reference IDs, and calculates
+the critical threshold as 40% of the plan amount. Repeat with another `planId`
+and later `grantedAt` to register plan 2 before traffic needs it.
+
+Inspect lifecycle events:
 
 ```sh
-curl -X POST http://localhost:3000/demo/cheap \
-  -H 'x-request-id: request-001' \
-  -H 'x-service-environment: PROD'
-
-curl http://localhost:3000/demo/plans
 curl 'http://localhost:3002/credit-events?limit=25'
 ```
 
-The multi-module server uses service type `CAVACH_API` and queue
-`credit.commands.CAVACH_API`:
-
-```sh
-npm run start:example:multi
-```
+There is deliberately no fake `/demo` API server: the SDK requires the host to
+implement the complete bundled route catalog and correctly rejects invented or
+missing routes at startup.
 
 ## Production requirements
 

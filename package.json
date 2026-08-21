@@ -33,8 +33,6 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "build:example": "tsc -p example/tsconfig.json",
-    "start:example": "npm run build:example && node dist-example/example/main.js",
-    "start:example:multi": "npm run build:example && node dist-example/example/multi-module/main.js",
     "start:example:events": "npm run build:example && node dist-example/example/event-server/main.js",
     "test": "jest --runInBand",
     "test:redis": "npm run build && node scripts/verify-redis.js",

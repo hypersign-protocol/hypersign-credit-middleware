@@ -1,23 +1,20 @@
 import { BadRequestException, Body, Controller, Get, Post, Query } from '@nestjs/common';
-import { randomUUID } from 'node:crypto';
 import { CREDIT_EVENT_NAMES } from '../../src';
 import { ExampleBullMqProvider } from '../bullmq.module';
 import { CreditEventStore } from './event-store.service';
 
 interface GrantCreditRequest {
-  serviceType?: unknown;
   tenantId?: unknown;
   appId?: unknown;
-  appType?: unknown;
-  creditType?: unknown;
   amount?: unknown;
-  criticalBalance?: unknown;
   planId?: unknown;
   grantedAt?: unknown;
   expiresAt?: unknown;
-  referenceId?: unknown;
   reason?: unknown;
 }
+
+const SERVICE_TYPE = 'CAVACH_API';
+const CREDIT_TYPE = 'API_CREDIT';
 
 @Controller()
 export class CreditEventsController {
@@ -37,34 +34,40 @@ export class CreditEventsController {
 
   @Post('credit-commands/grant')
   async grant(@Body() body: GrantCreditRequest) {
-    const serviceType = requiredString(body.serviceType, 'serviceType');
     const appId = requiredString(body.appId, 'appId');
-    const creditType = requiredString(body.creditType, 'creditType');
-    const referenceId = requiredString(body.referenceId, 'referenceId');
     const amount = positiveInteger(body.amount, 'amount');
-    const criticalBalance = nonNegativeInteger(
-      body.criticalBalance,
-      'criticalBalance',
-    );
+    const criticalBalance = Math.floor(amount * 0.4);
     const planId = requiredString(body.planId, 'planId');
+    if (planId.includes(':')) {
+      throw new BadRequestException('planId cannot contain a colon');
+    }
     const grantedAt = positiveInteger(body.grantedAt, 'grantedAt');
     const expiresAt = positiveInteger(body.expiresAt, 'expiresAt');
+    if (grantedAt > Date.now()) {
+      throw new BadRequestException('grantedAt cannot be in the future');
+    }
+    if (expiresAt <= grantedAt) {
+      throw new BadRequestException('expiresAt must be later than grantedAt');
+    }
+    if (expiresAt <= Date.now()) {
+      throw new BadRequestException('expiresAt must be in the future');
+    }
     const tenantId = optionalString(body.tenantId);
-    const appType = optionalString(body.appType);
-    const commandId = randomUUID();
-    const queue = `credit.commands.${serviceType}`;
+    const commandId = `grant-${SERVICE_TYPE}-${planId}`;
+    const referenceId = `example-grant-${planId}`;
+    const queue = `credit.commands.${SERVICE_TYPE}`;
     await this.bullMq.add(queue, CREDIT_EVENT_NAMES.GRANT_REQUESTED, {
       schemaVersion: 3,
       commandId,
-      serviceType,
+      serviceType: SERVICE_TYPE,
       source: 'example-credit-event-server',
       requestedAt: new Date().toISOString(),
       payload: {
         subject: {
           appId,
-          creditType,
+          appType: SERVICE_TYPE,
+          creditType: CREDIT_TYPE,
           ...(tenantId ? { tenantId } : {}),
-          ...(appType ? { appType } : {}),
         },
         amount,
         criticalBalance,
@@ -94,13 +97,6 @@ function optionalString(value: unknown): string | undefined {
 function positiveInteger(value: unknown, field: string): number {
   if (!Number.isSafeInteger(value) || Number(value) <= 0) {
     throw new BadRequestException(`${field} must be a positive safe integer`);
-  }
-  return Number(value);
-}
-
-function nonNegativeInteger(value: unknown, field: string): number {
-  if (!Number.isSafeInteger(value) || Number(value) < 0) {
-    throw new BadRequestException(`${field} must be a non-negative safe integer`);
   }
   return Number(value);
 }

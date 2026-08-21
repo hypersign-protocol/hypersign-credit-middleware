@@ -1,22 +1,9 @@
 import {
   Global,
-  Inject,
-  Injectable,
   Module,
-  OnApplicationShutdown,
 } from '@nestjs/common';
-import Redis from 'ioredis';
-import { CREDIT_REDIS_CLIENT } from '../src';
 
 export const REDIS_URL = 'REDIS_URL';
-@Injectable()
-class RedisShutdown implements OnApplicationShutdown {
-  constructor(@Inject(CREDIT_REDIS_CLIENT) private readonly redis: Redis) {}
-
-  async onApplicationShutdown(): Promise<void> {
-    await this.redis.quit();
-  }
-}
 
 @Global()
 @Module({
@@ -25,20 +12,7 @@ class RedisShutdown implements OnApplicationShutdown {
       provide: REDIS_URL,
       useValue: process.env.REDIS_URL ?? 'redis://localhost:6379',
     },
-    {
-      provide: CREDIT_REDIS_CLIENT,
-      inject: [REDIS_URL],
-      useFactory: async (url: string): Promise<Redis> => {
-        const redis = new Redis(url, {
-          maxRetriesPerRequest: 2,
-        });
-
-        await redis.ping();
-        return redis;
-      },
-    },
-    RedisShutdown,
   ],
-  exports: [CREDIT_REDIS_CLIENT, REDIS_URL],
+  exports: [REDIS_URL],
 })
 export class RedisModule {}

@@ -70,6 +70,10 @@ This section is the shortest complete path for a developer integrating the SDK
 for the first time. Later sections explain each decision and production edge
 case in detail.
 
+Repository checkouts also contain copy-ready modules and a runnable external
+grant/lifecycle process under `example/`. These demo sources are intentionally
+not part of the public npm package or its import surface.
+
 ### 1. Understand the four runtime roles
 
 | Role | Responsibility |
