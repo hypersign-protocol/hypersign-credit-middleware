@@ -21,7 +21,7 @@ Create an API-credit recharge plan:
 curl -X POST http://localhost:3002/credit-commands/grant \
   -H 'content-type: application/json' \
   -d '{
-    "serviceType":"KYC_SERVICE",
+    "serviceType":"CAVACH_API",
     "appId":"user_123",
     "appType":"USER",
     "creditType":"API_CREDIT",

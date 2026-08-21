@@ -5,7 +5,7 @@ of `@hypersign-protocol/credit-middleware` version 5.0.0. It follows commands,
 HTTP reservations, Redis state, outbox events, BullMQ jobs, settlement, and
 recovery down to their key relationships and atomicity boundaries.
 
-The examples use the bundled catalog `KYC_SERVICE@3.20.0` and default queue names.
+The examples use the bundled catalog `CAVACH_API@3.20.0` and default queue names.
 
 ## Contents
 
@@ -49,14 +49,14 @@ architecture refers to a durable BullMQ queue or to the internal Redis Stream.
 
 | Stage | Logical channel | Default identifier | Who writes | Who receives |
 | --- | --- | --- | --- | --- |
-| Inbound command | BullMQ queue | `credit.commands.KYC_SERVICE` | Trusted producer | `CreditCommandWorker` inside SDK hosts |
+| Inbound command | BullMQ queue | `credit.commands.CAVACH_API` | Trusted producer | `CreditCommandWorker` inside SDK hosts |
 | Transactional outbox | Redis Stream | `<keyPrefix>:v2:{<redisHashTag>}:events` | Credit Lua scripts | `CreditEventRelay` |
 | Outbound lifecycle | BullMQ queue | `credit.lifecycle` | `CreditEventRelay` | External lifecycle workers |
 | Command rejection | BullMQ lifecycle queue | configured lifecycle queue(s) | `CreditCommandWorker` directly | External lifecycle workers |
 
 Important delivery behavior:
 
-- API replicas listening to `credit.commands.KYC_SERVICE` are competing consumers.
+- API replicas listening to `credit.commands.CAVACH_API` are competing consumers.
   Exactly one available BullMQ worker processes a delivery attempt.
 - Lifecycle workers listening to one `credit.lifecycle` queue also compete.
   Create separate lifecycle queue names for consumers that each need a copy.
@@ -72,7 +72,7 @@ Important delivery behavior:
 flowchart LR
     Payment[Payment or billing service]
     Workflow[Workflow service]
-    CQ[[BullMQ command queue<br/>credit.commands.KYC_SERVICE]]
+    CQ[[BullMQ command queue<br/>credit.commands.CAVACH_API]]
 
     subgraph Host[SDK host application]
       CW[CreditCommandWorker]
@@ -204,7 +204,7 @@ operation.
 
 ### Participants
 
-- Producer queue: `credit.commands.KYC_SERVICE`
+- Producer queue: `credit.commands.CAVACH_API`
 - BullMQ command job name: `credit.grant.requested`
 - SDK receiver: `CreditCommandWorker`
 - financial operation: `CreditService.grant()`
@@ -219,7 +219,7 @@ operation.
 sequenceDiagram
     autonumber
     participant P as Payment service
-    participant CQ as BullMQ credit.commands.KYC_SERVICE
+    participant CQ as BullMQ credit.commands.CAVACH_API
     participant CW as CreditCommandWorker
     participant CS as CreditService
     participant R as Redis state + Stream
@@ -241,7 +241,7 @@ sequenceDiagram
 
     ER->>R: XAUTOCLAIM / XREADGROUP
     R-->>ER: CREDIT_GRANTED Stream entry + eventId
-    ER->>LQ: add credit.granted<br/>jobId=KYC_SERVICE-eventId
+    ER->>LQ: add credit.granted<br/>jobId=CAVACH_API-eventId
     LQ-->>ER: accepted
     ER->>R: XACK eventId
     LQ->>LC: deliver lifecycle job
@@ -260,7 +260,7 @@ await queue.add(
   {
     schemaVersion: 3,
     commandId: payment.eventId,
-    serviceType: 'KYC_SERVICE',
+    serviceType: 'CAVACH_API',
     source: 'payment-service',
     requestedAt: new Date().toISOString(),
     payload: {
@@ -291,7 +291,7 @@ and optional BullMQ `prefix`. The producer does not need the SDK `keyPrefix` or
 
 Every running SDK host with BullMQ enabled creates a worker on its configured
 `commandQueueName`. With the bundled catalog, the default is
-`credit.commands.KYC_SERVICE`.
+`credit.commands.CAVACH_API`.
 
 If three API replicas listen to that queue, they compete. BullMQ selects one
 worker for a delivery attempt. A different replica can receive a retry after a
@@ -319,7 +319,7 @@ Before Redis executes Lua, `CreditService.grant()`:
 
 The command worker separately requires `subject.appId` and
 `subject.creditType`, validates schema version `3`, and requires its
-`serviceType` to equal `KYC_SERVICE`.
+`serviceType` to equal `CAVACH_API`.
 
 ### Atomic Lua pseudocode
 
@@ -587,7 +587,7 @@ the final status and do not apply it again.
 ## Outbox relay algorithm
 
 The relay uses a dedicated blocking Redis connection. Its default consumer
-group is `credit-bull-relay:KYC_SERVICE`; each process creates a unique consumer name
+group is `credit-bull-relay:CAVACH_API`; each process creates a unique consumer name
 `<pid>-<UUID>`.
 
 ```text
@@ -648,7 +648,7 @@ interface CreditLifecycleEventEnvelope {
   eventId: string;          // Redis Stream ID, durable consumer idempotency key
   schemaVersion: 3;
   catalogVersion: string;   // 3.20.0 in this release
-  serviceType: string;        // KYC_SERVICE
+  serviceType: string;        // CAVACH_API
   event: Record<string, unknown>;
 }
 ```
@@ -885,7 +885,7 @@ For one financial operation, retain and log these correlation values:
 
 ### Grant trace procedure
 
-1. Find the command by `commandId`/BullMQ job ID on `credit.commands.KYC_SERVICE`.
+1. Find the command by `commandId`/BullMQ job ID on `credit.commands.CAVACH_API`.
 2. Confirm its job name, schema, service type, and immutable payload.
 3. Derive the subject scope and locate wallet plan metadata.
 4. Verify `plan-owner:<planId>` and `grant:<referenceId>` agree on scope and
@@ -895,7 +895,7 @@ For one financial operation, retain and log these correlation values:
 6. Locate the `CREDIT_GRANTED` Stream/lifecycle event by `planId` and
    `referenceId`.
 7. Trace the envelope `eventId` to lifecycle BullMQ job
-   `KYC_SERVICE-<eventId>`.
+   `CAVACH_API-<eventId>`.
 8. Confirm each required consumer stored the event receipt and applied its
    database transaction.
 

@@ -20,7 +20,7 @@ describe('CreditCatalogService', () => {
       },
     } as any);
 
-    expect(resolved.catalog.serviceType).toBe('KYC_SERVICE');
+    expect(resolved.catalog.serviceType).toBe('CAVACH_API');
     expect(resolved.catalog.routes.length).toBeGreaterThan(0);
   });
 
@@ -31,8 +31,8 @@ describe('CreditCatalogService', () => {
     expect(defaults.transport).toEqual({
       prefix: 'bull',
       lifecycleQueueNames: ['credit.lifecycle'],
-      commandQueueName: 'credit.commands.KYC_SERVICE',
-      consumerGroup: 'credit-bull-relay:KYC_SERVICE',
+      commandQueueName: 'credit.commands.CAVACH_API',
+      consumerGroup: 'credit-bull-relay:CAVACH_API',
       batchSize: 100,
       blockMs: 5_000,
       pendingIdleMs: 30_000,

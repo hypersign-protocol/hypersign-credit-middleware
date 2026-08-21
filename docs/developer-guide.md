@@ -4,7 +4,7 @@ This guide explains how to integrate, operate, and troubleshoot
 `@hypersign-protocol/credit-middleware` in a production NestJS application.
 
 > SDK version: `5.0.0`
-> Bundled catalog: `KYC_SERVICE@3.20.0`
+> Bundled catalog: `CAVACH_API@3.20.0`
 > Supported runtime: Node.js 18+, NestJS 9–11, Redis 6.2+
 
 ## Contents
@@ -73,7 +73,7 @@ catalog through `CreditModule` configuration.
 
 The bundled catalog uses:
 
-- service type `KYC_SERVICE`;
+- service type `CAVACH_API`;
 - catalog version `3.20.0`;
 - global prefix `api`;
 - URI versioning with prefix `v`; and
@@ -367,9 +367,9 @@ The SDK controls:
 | Queue role | Default name | Configuration |
 | --- | --- | --- |
 | Lifecycle delivery | `credit.lifecycle` | `transport.lifecycleQueueNames` |
-| Trusted commands | `credit.commands.KYC_SERVICE` | `transport.commandQueueName` |
+| Trusted commands | `credit.commands.CAVACH_API` | `transport.commandQueueName` |
 
-`KYC_SERVICE` comes from the bundled `serviceType`. If multiple lifecycle queue names are
+`CAVACH_API` comes from the bundled `serviceType`. If multiple lifecycle queue names are
 configured, the SDK publishes every event to each queue before acknowledging
 the Redis Stream entry.
 
@@ -395,11 +395,11 @@ bull:credit.lifecycle:failed
 bull:credit.lifecycle:events
 bull:credit.lifecycle:meta
 
-bull:credit.commands.KYC_SERVICE:wait
-bull:credit.commands.KYC_SERVICE:active
-bull:credit.commands.KYC_SERVICE:delayed
-bull:credit.commands.KYC_SERVICE:failed
-bull:credit.commands.KYC_SERVICE:events
+bull:credit.commands.CAVACH_API:wait
+bull:credit.commands.CAVACH_API:active
+bull:credit.commands.CAVACH_API:delayed
+bull:credit.commands.CAVACH_API:failed
+bull:credit.commands.CAVACH_API:events
 ```
 
 BullMQ also creates job records and internal keys such as IDs, markers,
@@ -424,8 +424,8 @@ Example lifecycle identifiers:
 
 ```text
 Redis Stream event ID:  1787123456789-0
-Service type:             KYC_SERVICE
-BullMQ job ID:          KYC_SERVICE-1787123456789-0
+Service type:             CAVACH_API
+BullMQ job ID:          CAVACH_API-1787123456789-0
 ```
 
 The stable lifecycle job ID helps BullMQ reject a duplicate while that job
@@ -434,7 +434,7 @@ created again after host retention removes the old record. Downstream consumers
 must enforce a durable unique constraint on envelope `eventId`.
 
 The Redis Stream consumer group is not a BullMQ key. By default it is named
-`credit-bull-relay:KYC_SERVICE` and is stored as metadata on the SDK outbox Stream. Each
+`credit-bull-relay:CAVACH_API` and is stored as metadata on the SDK outbox Stream. Each
 relay process uses a unique `<process-id>-<UUID>` consumer name so pending work
 can be reclaimed after `pendingIdleMs`.
 
@@ -474,7 +474,7 @@ interface AuthenticatedRequest {
           subject: {
             tenantId: request.service?.subdomain,
             appId: request.service?.appId ?? '',
-            appType: 'KYC_SERVICE',
+            appType: 'CAVACH_API',
           },
           requestId: request.requestId,
           environment,
@@ -758,7 +758,7 @@ CreditModule.forRootAsync({
         'credit.lifecycle.reconciliation',
         'credit.lifecycle.notifications',
       ],
-      commandQueueName: 'credit.commands.KYC_SERVICE',
+      commandQueueName: 'credit.commands.CAVACH_API',
     },
   }),
 });
@@ -843,12 +843,12 @@ Job name: `credit.grant.requested`
 
 ```ts
 await provider.add(
-  'credit.commands.KYC_SERVICE',
+  'credit.commands.CAVACH_API',
   'credit.grant.requested',
   {
     schemaVersion: 3,
     commandId: payment.eventId,
-    serviceType: 'KYC_SERVICE',
+    serviceType: 'CAVACH_API',
     source: 'payment-service',
     payload: {
       subject: {
@@ -882,7 +882,7 @@ Command-created reservations support only `DEFERRED` settlement.
 {
   "schemaVersion": 3,
   "commandId": "async-job-019",
-  "serviceType": "KYC_SERVICE",
+  "serviceType": "CAVACH_API",
   "source": "workflow-service",
   "payload": {
     "subject": {
@@ -911,7 +911,7 @@ Job names:
 {
   "schemaVersion": 3,
   "commandId": "async-job-019:commit",
-  "serviceType": "KYC_SERVICE",
+  "serviceType": "CAVACH_API",
   "payload": { "reservationId": "3db57c81-..." }
 }
 ```

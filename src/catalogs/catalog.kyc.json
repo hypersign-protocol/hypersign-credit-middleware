@@ -1,5 +1,5 @@
 {
-  "serviceType": "KYC_SERVICE",
+  "serviceType": "CAVACH_API",
   "version": "3.20.0",
   "globalPrefix": "api",
   "versioning": "URI",

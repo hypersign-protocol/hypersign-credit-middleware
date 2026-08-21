@@ -109,7 +109,7 @@ CreditModule.forRootAsync({
       return {
         subject: {
           tenantId: request.service.subdomain,
-          appType: 'KYC_SERVICE',
+          appType: 'CAVACH_API',
           appId: request.service.appId ?? '',
         },
         requestId: request.requestId,
@@ -187,12 +187,12 @@ Grant command example:
 
 ```ts
 await queueProvider.add(
-  'credit.commands.KYC_SERVICE',
+  'credit.commands.CAVACH_API',
   CREDIT_EVENT_NAMES.GRANT_REQUESTED,
   {
     schemaVersion: 3,
     commandId: payment.eventId,
-    serviceType: 'KYC_SERVICE',
+    serviceType: 'CAVACH_API',
     source: 'payment-service',
     payload: {
       subject: {
@@ -262,7 +262,7 @@ Grant two FIFO plans through the event server (use current millisecond values):
 curl -X POST http://localhost:3002/credit-commands/grant \
   -H 'content-type: application/json' \
   -d '{
-    "serviceType":"KYC_SERVICE",
+    "serviceType":"CAVACH_API",
     "appId":"user_123",
     "appType":"USER",
     "creditType":"API_CREDIT",
@@ -286,8 +286,8 @@ curl http://localhost:3000/demo/plans
 curl 'http://localhost:3002/credit-events?limit=25'
 ```
 
-The multi-module server uses service type `KYC_SERVICE` and queue
-`credit.commands.KYC_SERVICE`:
+The multi-module server uses service type `CAVACH_API` and queue
+`credit.commands.CAVACH_API`:
 
 ```sh
 npm run start:example:multi
