@@ -1,54 +1,47 @@
-# SDK integration examples
+# Integration examples
 
-If this is your first integration, start with the
-[integration guide](../docs/integration-guide.md). It explains what
-runs in the API host, what runs in the trusted event service, and how to verify
-the first `prod` and `dev` calls.
+These files are maintained in the repository and excluded from the published
+npm package.
 
-The example folder has two intentionally separate parts:
+| Directory | Role |
+| --- | --- |
+| [`host/`](host/README.md) | NestJS modules for the CAVACH API that owns the complete bundled route catalog. |
+| [`event-server/`](event-server/README.md) | External process that publishes plan grants and consumes lifecycle events. |
 
-- `host/` contains compile-checked NestJS modules to copy into the real CAVACH
-  API application that owns the complete bundled route catalog.
-- `event-server/` is a runnable external billing process. It publishes trusted
-  plan grants and consumes lifecycle events.
+The SDK audits the complete NestJS route table at startup. Integrate the host
+modules into the CAVACH API; this repository does not provide a partial API
+server.
 
-There is no standalone fake API server. `CreditModule` audits the complete
-bundled CAVACH catalog at startup, so a small server with invented `/demo`
-routes would correctly fail its route audit. Use the host snippets inside the
-real API whose controllers match the catalog.
-
-## Build the examples
+## Build
 
 ```sh
 npm run build:example
 ```
 
-## Integrate the API host
+## API host
 
-1. Copy or adapt the three files in `host/`.
-2. Ensure authenticated requests contain trusted `service.appId`,
-   `service.subdomain`, `service.env`, and `requestId` values before the global
-   credit interceptor executes.
-3. Import `CreditIntegrationModule` once in the root application module.
-4. Keep the application's global prefix and URI versioning aligned with the
-   bundled catalog (`api`, URI `v`, default version `1`).
-5. Do not pass a BullMQ provider or Redis Stream client to the SDK.
+Follow [the host file reference](host/README.md) to:
 
-Follow the complete, file-by-file instructions in
-[the host integration walkthrough](host/README.md).
+1. register `CREDIT_REDIS_CLIENT`;
+2. import `CreditModule`;
+3. map authenticated request data to a credit wallet;
+4. schedule recovery every five minutes; and
+5. verify `prod` deduction and `dev` observation behavior.
 
-The host supplies only `CREDIT_REDIS_CLIENT`. The SDK creates and closes its
-own duplicated Stream and BullMQ connections.
+The host supplies no BullMQ provider or Redis Stream client. The SDK creates
+those connections from the supplied Redis client.
 
-## Run the external event server
+## Grant and lifecycle service
+
+Start the external process:
 
 ```sh
 npm run start:example:events
 ```
 
-Continue with [the event-server walkthrough](event-server/README.md) to grant
-two plans, exercise `prod`/`dev` requests in the real host, and inspect lifecycle
-events.
+Use the [event-server reference](event-server/README.md) to grant plans and
+inspect lifecycle events.
 
-For a complete explanation of every step, see the
-[developer guide](../docs/developer-guide.md#start-here-complete-integration).
+The [integration guide](../docs/integration-guide.md) contains the full setup
+and verification sequence. The [developer reference](../docs/developer-guide.md)
+documents configuration, messages, storage, and operations.

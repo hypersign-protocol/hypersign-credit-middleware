@@ -1,8 +1,7 @@
 # Integration guide
 
-This guide takes a NestJS developer from installation to one verified credit
-grant and one charged API request. You do not need to understand Lua, Redis
-Streams, or BullMQ internals before following it.
+Install the SDK in a CAVACH NestJS API, grant a plan, and verify `prod` and
+`dev` request behavior.
 
 > SDK version: `5.0.0`  
 > Service type: `CreditServiceType.CAVACH_API` (`CAVACH_API` on the wire)  
@@ -13,8 +12,7 @@ Streams, or BullMQ internals before following it.
 They currently serialize to the same text, but they are used in different
 fields and are not interchangeable.
 
-The SDK exports enums for every closed domain value. Use enum members in
-TypeScript instead of typing strings yourself:
+Use SDK enums for protocol values:
 
 | Meaning | TypeScript | Stored or transmitted value |
 | --- | --- | --- |
@@ -28,9 +26,7 @@ TypeScript instead of typing strings yourself:
 Environment matching is strict. Uppercase `PROD` and `DEV` are invalid input;
 authentication must supply lowercase `prod` or `dev`.
 
-## First understand the two applications
-
-The integration has two separate applications:
+## Architecture
 
 ```text
 trusted billing/event service                  real CAVACH API
@@ -46,18 +42,16 @@ creates a plan                                 receives an API request
                     both use the same Redis
 ```
 
-- The **real CAVACH API** installs `CreditModule`. The SDK automatically charges
+- The **CAVACH API** installs `CreditModule`. The SDK charges
   routes from its bundled catalog.
-- The **trusted billing/event service** grants plans after payment or onboarding
-  and stores lifecycle events. The repository's `example/event-server` shows
-  this role.
+- The **billing/event service** grants plans after payment or onboarding and
+  stores lifecycle events. `example/event-server` implements this role.
 - Redis is shared infrastructure. The two applications may run on different
   servers, but their Redis and BullMQ settings must match.
 
-Do not add the example event server to the public API. It is trusted backend
-infrastructure, and its grant endpoint is only a local integration example.
+The example grant endpoint is local infrastructure, not a public API.
 
-## Before you start
+## Requirements
 
 You need:
 
@@ -68,13 +62,12 @@ You need:
   request is `prod` or `dev`; and
 - controllers that match the SDK's bundled CAVACH route catalog.
 
-The last requirement is important. At startup the SDK compares the entire
-NestJS route table with its bundled catalog. A small fake API with only one or
-two test routes will fail intentionally.
+At startup the SDK compares the complete NestJS route table with its bundled
+catalog. A partial test API fails this audit.
 
 ## Step 1: install the API-host dependencies
 
-Run this in the real CAVACH API:
+Run in the CAVACH API:
 
 ```sh
 npm install @hypersign-protocol/credit-middleware ioredis @nestjs/schedule
@@ -85,13 +78,13 @@ Stream client into `CreditModule`.
 
 ## Step 2: add the Redis connection
 
-Add this environment variable to the real API:
+Configure the API host:
 
 ```dotenv
 REDIS_URL=redis://username:password@redis-host:6379/0
 ```
 
-For local Redis, use:
+Local Redis:
 
 ```dotenv
 REDIS_URL=redis://localhost:6379/0
@@ -145,8 +138,8 @@ Do not set ioredis's `keyPrefix`. The SDK manages its own Redis key namespace.
 
 ## Step 3: add five-minute recovery
 
-Recovery finishes reservations left open when a request or process crashes and
-expires unused plan credit. Create `src/credit/credit-recovery.scheduler.ts`:
+Create `src/credit/credit-recovery.scheduler.ts`. Recovery finalizes abandoned
+reservations and expires unused plan credit.
 
 ```ts
 import { Injectable } from '@nestjs/common';
@@ -250,12 +243,10 @@ import { CreditIntegrationModule } from './credit/credit-integration.module';
 export class AppModule {}
 ```
 
-If the application already calls `ScheduleModule.forRoot()`, do not call it a
-second time. Keep the existing call and import scheduling only once.
+Call `ScheduleModule.forRoot()` once. Reuse an existing registration.
 
-The SDK supplies safe defaults for `leaseMs`, `retentionMs`, queue names,
-Stream settings, and recovery batch size. Do not set them just to complete the
-basic integration.
+The SDK supplies defaults for `leaseMs`, `retentionMs`, queues, Stream settings,
+and recovery batch size.
 
 ## Step 5: provide trusted identity for every request
 
@@ -271,11 +262,10 @@ request.service = {
 request.requestId = trustedRequestId; // optional; the SDK generates one if absent
 ```
 
-Use values obtained from a verified API key, access token, or database record.
-Never copy billing identity or environment directly from an unauthenticated
-request body, query parameter, or header.
+Derive these values from a verified API key, token, or service record. Do not
+accept them from an unauthenticated body, query parameter, or header.
 
-The environment belongs to the individual API call:
+Environment is per request:
 
 | Environment | Result |
 | --- | --- |
@@ -283,7 +273,7 @@ The environment belongs to the individual API call:
 | `dev` (`CreditEnvironment.DEV`) | The SDK emits `CREDIT_OBSERVED` with zero deduction. |
 | Missing or another value | The SDK rejects the request before the controller runs. |
 
-The resolved wallet has four exact fields:
+The resolver selects this wallet:
 
 ```ts
 {
@@ -294,7 +284,7 @@ The resolved wallet has four exact fields:
 }
 ```
 
-The plan grant must use exactly the same values, including letter case.
+Plan grants must match all four fields, including case.
 
 ## Step 6: keep the expected NestJS routing setup
 
@@ -312,20 +302,19 @@ app.enableVersioning({
 app.enableShutdownHooks();
 ```
 
-Start the API. A successful startup means the catalog auditor found the exact
-expected controllers and routes. Do not disable the audit to hide a mismatch.
+Start the API. A catalog mismatch is a deployment error; fix the routes or use
+a compatible SDK release.
 
 ## Step 7: grant the first plan
 
-In the SDK source repository, start the trusted example event server:
+From the SDK repository, start the event server:
 
 ```sh
 export REDIS_URL=redis://localhost:6379/0
 npm run start:example:events
 ```
 
-This example is repository-only; it is not included in or importable from the
-public npm package.
+The event server is repository-only and is not shipped in the npm package.
 
 In another terminal, create timestamps and send a grant:
 
@@ -345,26 +334,25 @@ curl -X POST http://localhost:3002/credit-commands/grant \
   }"
 ```
 
-Change `tenantId` and `appId` to the exact values resolved by the real API.
-The endpoint intentionally does not accept `serviceType`, `appType`,
+Set `tenantId` and `appId` to the values returned by the API resolver. The
+endpoint does not accept `serviceType`, `appType`,
 `creditType`, `referenceId`, or `criticalBalance`. The trusted server sets the
 fixed types, generates internal IDs, and calculates the critical threshold as
 40% of the granted amount.
 
-A successful response contains `"queued": true`. Shortly afterward this
-command should produce a `credit.granted` lifecycle job.
+The response contains `"queued": true`; the applied command emits
+`credit.granted`.
 
 ## Step 8: make the first prod and dev calls
 
-Call one real catalog-priced CAVACH route using a verified `prod` credential.
-The result should be:
+Call one priced CAVACH route with a verified `prod` credential:
 
 1. the controller runs;
 2. the wallet balance decreases by the route's catalog price; and
 3. `credit.reserved` and `credit.committed` lifecycle jobs appear.
 
-Call the same route using a verified `dev` credential. The controller still
-runs, but the wallet balance does not change and `credit.observed` appears.
+Call the same route with a verified `dev` credential. The controller runs,
+the balance is unchanged, and `credit.observed` appears.
 
 Inspect events received by the example process:
 
@@ -372,7 +360,7 @@ Inspect events received by the example process:
 curl 'http://localhost:3002/credit-events?limit=25'
 ```
 
-## Final acceptance checklist
+## Acceptance checklist
 
 - [ ] The real API starts without a catalog-audit error.
 - [ ] The grant response contains `queued: true`.
@@ -386,7 +374,7 @@ curl 'http://localhost:3002/credit-events?limit=25'
 
 ## Common integration problems
 
-| Symptom | Meaning and first check |
+| Symptom | Check |
 | --- | --- |
 | API fails during startup | The real controllers, global prefix, or URI versions do not match the bundled catalog. |
 | HTTP 401 before the controller | Authentication did not attach trusted `appId`, tenant, or a valid lowercase `prod`/`dev` environment. |
@@ -395,6 +383,5 @@ curl 'http://localhost:3002/credit-events?limit=25'
 | `dev` request deducts credit | The trusted authentication result incorrectly classified the call as `prod`. |
 | Duplicate event handling | Persist lifecycle events with a unique database constraint on envelope `eventId`. |
 
-After the first integration works, use the
-[complete developer guide](developer-guide.md) for configuration, event
-schemas, Redis keys, production operations, and troubleshooting details.
+See the [developer reference](developer-guide.md) for configuration, event
+schemas, Redis keys, and operations.

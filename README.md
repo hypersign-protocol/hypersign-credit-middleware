@@ -1,137 +1,81 @@
 # Hypersign Credit Middleware v5
 
-NestJS credit-lifecycle SDK backed by Redis Lua and BullMQ. Version 5 uses
-immutable recharge plans instead of one aggregate balance or a balance provider.
-Each API reservation records exactly which plans funded it, consumes plans FIFO,
-and emits one settlement event per affected plan.
+Catalog-driven credit enforcement for NestJS, backed by atomic Redis Lua
+transactions and BullMQ lifecycle transport.
 
-- [Integration guide — start here](docs/integration-guide.md)
+- [Integration guide](docs/integration-guide.md)
+- [Developer reference](docs/developer-guide.md)
 - [Technical architecture](docs/technical-architecture.md)
-- [Redis keys and records](docs/redis-keyspace.md)
+- [Redis keyspace](docs/redis-keyspace.md)
 - [Lua state transitions](docs/lua-scripts.md)
 
-## Credit model
+## Runtime contract
 
-A wallet is scoped by `tenantId`, `appType`, `appId`, and `creditType`.
-`serviceId` is not part of billing identity.
+- The SDK bundles the `CAVACH_API` route and price catalog. Controllers do not
+  declare prices.
+- Startup fails when the NestJS route table and bundled catalog differ.
+- The host provides one `CREDIT_REDIS_CLIENT`. The SDK creates and closes its
+  own Redis Stream and BullMQ connections.
+- SDK defaults cover leases, retention, recovery batches, Stream limits, and
+  queue names.
+- `prod` requests enforce credit. `dev` requests emit usage events with zero
+  deduction. The value is trusted per-request metadata, not a process-wide
+  environment setting.
 
-The trusted request context also carries a `CreditEnvironment` value. Its wire
-values are lowercase: `prod` calls enforce credit, while `dev` calls only
-record usage. Environment is not part of wallet identity.
-
-```ts
-import {
-  CreditAccountType,
-  CreditSubject,
-  CreditType,
-} from '@hypersign-protocol/credit-middleware';
-
-const subject: CreditSubject = {
-  tenantId: 'tenant_1',
-  appType: CreditAccountType.BUSINESS,
-  appId: 'business_123',
-  creditType: CreditType.API_CREDIT,
-};
-```
-
-Every recharge creates a distinct immutable plan:
+Use exported enums for protocol values:
 
 ```ts
-await credits.grant({
-  subject,
-  planId: 'plan_01',
-  amount: 100,
-  criticalBalance: 20,
-  grantedAt: Date.now(),
-  expiresAt: Date.now() + 30 * 24 * 60 * 60 * 1_000,
-  referenceId: 'payment_01',
-  reason: 'credit_purchase',
-});
+CreditEnvironment.PROD // 'prod'
+CreditEnvironment.DEV  // 'dev'
+CreditServiceType.CAVACH_API // catalog and transport identity
+CreditAppType.CAVACH_API     // subject.appType wallet dimension
+CreditType.API_CREDIT
 ```
 
-There is no `CreditBalanceProvider`. Before the first grant, `getBalance()`
-returns `null` and paid requests fail closed with insufficient credit.
+Uppercase `PROD` and `DEV` are invalid environment inputs.
 
-An exact retry of a grant is idempotent. Reusing a `planId` with another amount,
-expiry, grant time, critical balance, or reference is rejected. Reusing a
-reference for another plan is also rejected. Both `planId` ownership and
-payment references are
-enforced globally inside one SDK Redis namespace, not merely per wallet.
+## Installation
 
-## FIFO allocation
-
-Plans are ordered by `grantedAt`, then `planId`. Expired and depleted plans are
-skipped. If a cost cannot be paid completely, the reservation makes no credit
-deductions.
-
-```text
-plan-old remaining 10
-plan-new remaining 50
-request cost       25
-
-reservation allocations:
-  plan-old 10
-  plan-new 15
+```sh
+npm install @hypersign-protocol/credit-middleware ioredis @nestjs/schedule
 ```
 
-The allocation is stored in the reservation. Commit, rollback, and crash
-recovery never recalculate FIFO.
-
-Every plan must be granted to the SDK before it can participate in FIFO. A plan
-that exists only in a dashboard/payment database is not part of the Redis
-wallet. `criticalBalance` emits a lifecycle notification; it does not register
-or activate the next plan. See the
-[plan-2 HTTP 402 checklist](docs/redis-keyspace.md#diagnosing-http-402-before-plan-2).
-
-Commit writes one `COMMITTED` event per allocation. A database consumer can use
-`reservationId + planId + event type` as its idempotency key.
-
-Rollback restores each allocation to its original plan only while that plan is
-still active. If the plan expired while credit was reserved, rollback reports
-the allocation as expired and does not resurrect it. Commit remains valid after
-plan expiry because credit was reserved while eligible.
-
-## Catalog
-
-Controllers contain no pricing decorators. The authoritative KYC route and
-pricing catalog is bundled in `src/catalogs/catalog.kyc.json`. Host
-applications cannot supply or override it. Change that file and release a new
-SDK version whenever KYC routes or prices change.
-
-Startup fails if an application route is missing from the catalog, a catalog
-route is missing from the application, or routes/charges are invalid.
-
-`serviceType` identifies the SDK installation and transport. It is deliberately
-separate from `CreditSubject` and does not split a wallet.
+The package includes BullMQ. Do not register a BullMQ provider or Redis Stream
+client for the SDK.
 
 ## Registration
 
 ```ts
+import { UnauthorizedException } from '@nestjs/common';
 import {
   CreditAppType,
   CreditEnvironment,
   CreditModule,
+  CreditType,
 } from '@hypersign-protocol/credit-middleware';
 
 CreditModule.forRootAsync({
-  imports: [RedisModule],
+  imports: [CreditInfrastructureModule],
   useFactory: () => ({
-    keyPrefix: 'credit-kyc',
-    redisHashTag: 'credit-kyc',
-    requestContextResolver: (unknownRequest) => {
+    requestContextResolver: (unknownRequest: unknown) => {
       const request = unknownRequest as AuthenticatedRequest;
-      const environment = request.service.env?.trim();
+      const environment = request.service?.env?.trim();
+
       if (
         environment !== CreditEnvironment.PROD &&
         environment !== CreditEnvironment.DEV
       ) {
-        throw new Error('Trusted service environment must be prod or dev');
+        throw new UnauthorizedException(
+          'Trusted service environment must be prod or dev',
+        );
       }
+
       return {
         subject: {
-          tenantId: request.service.subdomain,
+          tenantId: request.service?.subdomain,
+          appId: request.service?.appId ?? '',
           appType: CreditAppType.CAVACH_API,
-          appId: request.service.appId ?? '',
+          creditType: CreditType.API_CREDIT,
         },
         requestId: request.requestId,
         environment,
@@ -141,202 +85,116 @@ CreditModule.forRootAsync({
 });
 ```
 
-The host supplies only `CREDIT_REDIS_CLIENT`. The SDK duplicates that ioredis
-client for its blocking Stream relay and BullMQ queues/workers, applies its own
-job policy, and closes only the connections it creates. Transport is enabled by
-default and can be disabled explicitly with `transport: false`.
+Authentication must populate the request context before the global credit
+interceptor runs. Do not accept wallet identity or environment from an
+unauthenticated body, query parameter, or header.
 
-## Request lifecycle
+See the [integration guide](docs/integration-guide.md) for the Redis provider,
+Nest module, scheduler, and verification flow.
+
+## Wallets and plans
+
+A wallet is identified by:
+
+```text
+tenantId + appType + appId + creditType
+```
+
+All values are trimmed and case-sensitive. `serviceType` is transport metadata
+and is not part of wallet identity.
+
+Each grant creates an immutable plan with its own amount, grant time, expiry,
+reference, and critical-balance threshold. Plans are consumed by `grantedAt`,
+then `planId`.
+
+```ts
+await creditService.grant({
+  subject,
+  planId: 'plan_01',
+  amount: 100,
+  criticalBalance: 40,
+  grantedAt: Date.now(),
+  expiresAt: Date.now() + 30 * 24 * 60 * 60 * 1_000,
+  referenceId: 'payment_01',
+});
+```
+
+A reservation may span several plans. Allocation is all-or-nothing: if the
+complete price cannot be funded, no plan is changed. Commit, rollback, and
+recovery use the allocations stored on the reservation rather than recalculating
+FIFO order.
+
+Grant retries are idempotent when every immutable field matches. Reusing a
+`planId` or `referenceId` with different semantics is rejected.
+
+## Request behavior
 
 ```text
 catalog match
-  -> resolve trusted per-request environment
-  -> prod: atomically reserve FIFO plan allocations
-  -> dev: atomically append CREDIT_OBSERVED with deductedAmount=0
+  -> resolve trusted subject and environment
+  -> prod: reserve plan allocations
+  -> dev: emit CREDIT_OBSERVED with deductedAmount=0
   -> execute controller
-  -> prod only: commit/leave deferred/roll back reservations
+  -> prod: commit, retain deferred work, or roll back
 ```
 
-Catalog routes may contain several credit types. Each catalog charge creates an
-independent prod reservation or dev observation. dev does not read balances,
-require a grant, or mutate plans. If a later prod charge fails, earlier new
-reservations are compensated.
+Before the first plan grant, `getBalance()` returns `null` and priced `prod`
+requests return HTTP 402. A plan stored only in an external database cannot
+fund a request; the SDK must first apply its grant command.
 
-For middleware that can return before the interceptor, use `boundary: true` and
-install `CreditBoundaryMiddleware` after trusted authentication context exists.
+## Transport
 
-## BullMQ transport
+Default queues:
 
-Transport envelopes use `schemaVersion: 3`.
+| Purpose | Queue |
+| --- | --- |
+| Lifecycle events | `credit.lifecycle` |
+| Trusted commands | `credit.commands.CAVACH_API` |
 
-Default lifecycle queue:
+Transport envelopes use `schemaVersion: 3`. BullMQ delivery is at least once;
+lifecycle consumers must enforce a durable unique constraint on `eventId`.
+Workers on the same queue compete. Use separate lifecycle queue names when
+multiple systems each need every event.
 
-```text
-credit.lifecycle
-```
+## Recovery
 
-Lifecycle job names:
-
-```text
-credit.granted
-credit.plan-expired
-credit.reserved
-credit.committed
-credit.rolled-back
-credit.expired
-credit.critical-balance
-credit.observed
-credit.command-rejected
-```
-
-Default inbound queue:
-
-```text
-credit.commands.<serviceType>
-```
-
-Supported command jobs:
-
-```text
-credit.grant.requested
-credit.reserve.requested
-credit.commit.requested
-credit.rollback.requested
-```
-
-Grant command example:
+Run recovery every five minutes:
 
 ```ts
-import {
-  CreditAppType,
-  CreditEventName,
-  CreditServiceType,
-  CreditType,
-} from '@hypersign-protocol/credit-middleware';
-
-await queueProvider.add(
-  `credit.commands.${CreditServiceType.CAVACH_API}`,
-  CreditEventName.GRANT_REQUESTED,
-  {
-    schemaVersion: 3,
-    commandId: payment.eventId,
-    serviceType: CreditServiceType.CAVACH_API,
-    source: 'payment-service',
-    payload: {
-      subject: {
-        tenantId: 'tenant_1',
-        appType: CreditAppType.CAVACH_API,
-        appId: 'business_123',
-        creditType: CreditType.API_CREDIT,
-      },
-      planId: payment.planId,
-      amount: 100,
-      criticalBalance: payment.criticalBalance,
-      grantedAt: payment.createdAt.getTime(),
-      expiresAt: payment.expiresAt.getTime(),
-      referenceId: payment.transactionId,
-      reason: 'credit_purchase',
-    },
-  },
-  { jobId: payment.eventId },
-);
-```
-
-The Redis Stream is the transactional outbox. It is acknowledged only after
-every configured lifecycle queue accepts the BullMQ job. BullMQ delivery is at
-least once, so consumers must persist `eventId` idempotently.
-
-BullMQ queues use competing consumers. Configure separate lifecycle queue names
-when reconciliation, notifications, and analytics each require every event.
-
-## Expiry and crash recovery
-
-No interval is started by the SDK. Invoke the stateless recovery entry point
-from a Nest scheduler or dedicated worker. The runnable example uses:
-
-```ts
-@Injectable()
-export class CreditRecoveryScheduler {
-  constructor(private readonly recovery: CreditRecoveryService) {}
-
-  @Cron(CronExpression.EVERY_5_MINUTES, {
-    name: 'credit-recovery',
-    waitForCompletion: true,
-  })
-  async run(): Promise<void> {
-    await this.recovery.runOnce();
-  }
+@Cron(CronExpression.EVERY_5_MINUTES, {
+  name: 'credit-recovery',
+  waitForCompletion: true,
+})
+async run(): Promise<void> {
+  await this.creditRecoveryService.runOnce();
 }
 ```
 
-One pass handles both expired reservation leases and expired unused plan credit.
-Redis Lua makes concurrent recovery workers safe.
+One pass handles expired reservation leases and expired unused plan credit.
+Redis transactions make concurrent recovery workers safe.
 
-Plan records do not use Redis TTL because an active reservation may still refer
-to an expired plan. Finalized reservation/request records use `retentionMs`.
+## Repository examples
 
-## Examples
-
-New to the SDK? Follow the
-[integration guide](docs/integration-guide.md) from installation to a
-verified grant, prod deduction, and dev zero-deduction request.
-
-Repository checkouts contain an `example/` folder with:
-
-- compile-checked modules to integrate into the real catalog-compatible CAVACH
-  API host; and
-- a runnable independent grant/lifecycle event server.
-
-The example sources are repository-only. They are not shipped in the npm
-package and are not part of the package's public import surface.
-
-Build the examples and start the external server:
+The repository contains host integration modules and a runnable external
+grant/lifecycle process:
 
 ```sh
 npm run build:example
 npm run start:example:events
 ```
 
-Create a plan through the trusted example endpoint:
-
-```sh
-curl -X POST http://localhost:3002/credit-commands/grant \
-  -H 'content-type: application/json' \
-  -d '{
-    "tenantId":"tenant/acme",
-    "appId":"app:123",
-    "planId":"plan-old",
-    "amount":1000,
-    "grantedAt":1780000000000,
-    "expiresAt":1900000000000
-  }'
-```
-
-The server fixes the service/app type to `CAVACH_API`, fixes the credit type to
-`API_CREDIT`, generates stable internal command/reference IDs, and calculates
-the critical threshold as 40% of the plan amount. Repeat with another `planId`
-and later `grantedAt` to register plan 2 before traffic needs it.
-
-Inspect lifecycle events:
-
-```sh
-curl 'http://localhost:3002/credit-events?limit=25'
-```
-
-There is deliberately no fake `/demo` API server: the SDK requires the host to
-implement the complete bundled route catalog and correctly rejects invented or
-missing routes at startup.
+The examples are not included in the npm package or public import surface.
+Instructions are in [example/README.md](example/README.md).
 
 ## Production requirements
 
-- Redis 6.2+ with AOF, replication, tested backups, and `noeviction`.
-- TLS/authentication and separate operation/blocking connections.
-- Stable request IDs, plan IDs, payment references, and grant timestamps.
-- A scheduler for `CreditRecoveryService.runOnce()`.
-- Alerts for recovery backlog, Stream pending entries, relay shutdown, BullMQ
-  failures, rejected commands, plan count, and insufficient-credit responses.
-- `eventStreamMaxLength` larger than the longest expected relay outage.
-- Idempotent database consumers keyed by the lifecycle `eventId`.
+- Redis 6.2+ with authentication, TLS, AOF, replication, tested backups, and
+  `noeviction`.
+- Stable request, plan, command, and payment identifiers.
+- A five-minute recovery schedule.
+- Idempotent lifecycle persistence keyed by `eventId`.
+- Monitoring for HTTP 402 rates, rejected commands, BullMQ failures, recovery
+  backlog, and pending Stream entries.
+- An `eventStreamMaxLength` large enough for the longest expected relay outage.
 
-Version 5 stores Redis state under `<keyPrefix>:v2:{<hashTag>}:...`; it does not
-read version 3 aggregate-balance keys.
+Redis state uses `<keyPrefix>:v2:{<hashTag>}:...`.

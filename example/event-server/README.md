@@ -1,30 +1,24 @@
-# Independent lifecycle and command server
+# Grant and lifecycle event server
 
-First-time integrators should follow the
-[integration guide](../../docs/integration-guide.md). It shows where
-this process fits, how to start it, and how to verify the first plan before the
-details below.
+This repository process represents trusted billing infrastructure outside the
+SDK-installed API. It:
 
-This process represents trusted billing infrastructure outside the SDK-installed
-API server. It:
+- publishes schema-v3 grants to `credit.commands.CAVACH_API`;
+- consumes jobs from `credit.lifecycle`; and
+- retains a bounded in-memory event list for local verification.
 
-- consumes plan-level lifecycle jobs from `credit.lifecycle`;
-- consumes `dev` `credit.observed` usage jobs from the same lifecycle queue;
-- publishes schema-v3 commands to `credit.commands.CAVACH_API`;
-- keeps a small in-memory event list only for demonstration.
+The process is excluded from the published npm package.
 
-Compile all examples and start this process:
+## Run
 
 ```sh
 npm run start:example:events
 ```
 
-The API host is the real CAVACH NestJS application with the modules from
-`example/host/` integrated. A fake API with a few demo routes is intentionally
-not provided because it would fail the bundled catalog's complete startup
-audit.
+The CAVACH API must contain the modules from [`example/host`](../host/README.md)
+and use the same Redis and BullMQ configuration.
 
-Create an API-credit recharge plan:
+## Grant a plan
 
 ```sh
 curl -X POST http://localhost:3002/credit-commands/grant \
@@ -36,60 +30,41 @@ curl -X POST http://localhost:3002/credit-commands/grant \
     "amount":1000,
     "grantedAt":1780000000000,
     "expiresAt":1900000000000,
-    "reason":"demo-credit-purchase"
+    "reason":"credit-purchase"
   }'
 ```
 
-The HTTP caller does not supply `serviceType`, `appType`, `creditType`,
-`referenceId`, or `criticalBalance`. The trusted server:
+The endpoint accepts plan and wallet business data. It does not accept
+`serviceType`, `appType`, `creditType`, `referenceId`, or
+`criticalBalance`. The server:
 
-- fixes `serviceType` and `appType` to `CAVACH_API`;
-- fixes `creditType` to `API_CREDIT`;
-- derives stable `commandId` and `referenceId` values from `planId`; and
-- calculates `criticalBalance` as `Math.floor(amount * 0.4)`.
+- sets `serviceType` and `appType` to `CAVACH_API`;
+- sets `creditType` to `API_CREDIT`;
+- derives stable command and reference IDs from `planId`; and
+- sets `criticalBalance` to `Math.floor(amount * 0.4)`.
 
-The response shows the generated internal identifiers. Retrying the same
-`planId` with identical data is idempotent; changing its amount or timestamps
-is rejected by the SDK.
+Retrying an identical `planId` is idempotent. Changing an immutable grant
+field for the same ID is rejected.
 
-Grant a second plan before the first plan runs out:
+Grant another plan with a later `grantedAt` before the first is depleted. The
+SDK consumes eligible plans by `grantedAt`, then `planId`. The grant wallet
+must exactly match the API request wallet.
 
-```sh
-curl -X POST http://localhost:3002/credit-commands/grant \
-  -H 'content-type: application/json' \
-  -d '{
-    "tenantId":"tenant/acme",
-    "appId":"app:123",
-    "planId":"api-plan-002",
-    "amount":500,
-    "grantedAt":1780000001000,
-    "expiresAt":1900000000000
-  }'
-```
-
-Both plan subjects must exactly match the API host's resolved `tenantId`,
-`appType`, `appId`, and `creditType`. The SDK then consumes the plans FIFO. A
-plan that exists only in an external database cannot fund a request.
-
-Inspect events received from the SDK:
+## Inspect lifecycle events
 
 ```sh
 curl 'http://localhost:3002/credit-events?limit=25'
 ```
 
-A split reservation produces separate `credit.reserved` and
-`credit.committed` jobs for every funding `planId`. Replace the in-memory store
-with a durable consumer that validates the envelope and applies a unique
-constraint on `eventId`. Persist the event receipt and its financial side
-effect in one database transaction before returning from the BullMQ worker.
+A `prod` request emits reservation and settlement events for each funding
+plan. A `dev` request emits `credit.observed` with
+`deductedAmount: 0` and does not change plan balances.
 
-A `dev` HTTP call produces `credit.observed` with `requestedAmount` and
-`deductedAmount: 0`; it does not produce reservation or settlement jobs.
+The in-memory event list is cleared on restart. A deployed consumer must
+validate the envelope, persist the event receipt and financial effect in one
+database transaction, enforce uniqueness on `eventId`, and throw on failure
+so BullMQ retries the job. Workers on the same queue compete; independent
+subscribers require separate lifecycle queues.
 
-This service and the API server must use the same Redis/BullMQ configuration.
-Do not run a lifecycle worker inside the API server: workers on one BullMQ queue
-compete instead of receiving independent copies.
-
-This event server validates `schemaVersion`, `serviceType`, event type, and
-`eventId`, and deduplicates its bounded in-memory view. The memory store is not
-production persistence and is cleared on restart.
+See the [integration guide](../../docs/integration-guide.md) for the complete
+host and event-service flow.

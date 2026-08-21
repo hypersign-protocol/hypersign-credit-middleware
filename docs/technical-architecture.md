@@ -1,4 +1,4 @@
-# Credit Middleware Technical Architecture
+# Credit middleware technical architecture
 
 This document describes the logical architecture and internal execution paths
 of `@hypersign-protocol/credit-middleware` version 5.0.0. It follows commands,
@@ -141,7 +141,7 @@ A missing dimension is `0`; a present dimension is
 Example:
 
 ```text
-tenant=1:tenant_1|appType=1:BUSINESS|app=1:business_123|creditType=1:API_CREDIT
+tenant=1:tenant_1|appType=1:CAVACH_API|app=1:app%3A123|creditType=1:API_CREDIT
 ```
 
 ### Key relationship diagram
@@ -256,7 +256,7 @@ The producer sends:
 
 ```ts
 import {
-  CreditAccountType,
+  CreditAppType,
   CreditEventName,
   CreditServiceType,
   CreditType,
@@ -273,8 +273,8 @@ await queue.add(
     payload: {
       subject: {
         tenantId: 'tenant_1',
-        appType: CreditAccountType.BUSINESS,
-        appId: 'business_123',
+        appType: CreditAppType.CAVACH_API,
+        appId: 'app:123',
         creditType: CreditType.API_CREDIT,
       },
       planId: payment.planId,
@@ -925,7 +925,8 @@ an audited application-level migration or idempotent replay.
 
 ## Related documentation
 
-- [Developer integration guide](developer-guide.md)
+- [Integration guide](integration-guide.md)
+- [Developer reference](developer-guide.md)
 - [Deterministic Redis keyspace](redis-keyspace.md)
 - [Lua state transitions](lua-scripts.md)
-- [Independent command/lifecycle example](../example/event-server/README.md)
+- [Grant and lifecycle example](../example/event-server/README.md)
