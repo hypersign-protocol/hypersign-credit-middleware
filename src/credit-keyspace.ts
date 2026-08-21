@@ -36,11 +36,17 @@ export class CreditKeyspace {
   planGrantedAt(subject: CreditSubject): string { return `${this.base()}:plans:granted-at:${this.scopeId(subject)}`; }
   planReferences(subject: CreditSubject): string { return `${this.base()}:plans:reference:${this.scopeId(subject)}`; }
   planStatuses(subject: CreditSubject): string { return `${this.base()}:plans:status:${this.scopeId(subject)}`; }
+  planCriticalBalances(subject: CreditSubject): string {
+    return `${this.base()}:plans:critical-balance:${this.scopeId(subject)}`;
+  }
   planExpirationMembers(subject: CreditSubject): string {
     return `${this.base()}:plans:expiration-member:${this.scopeId(subject)}`;
   }
   request(subject: CreditSubject, requestId: string): string {
     return `${this.base()}:request:${this.scopeId(subject)}:${encodeURIComponent(requestId)}`;
+  }
+  observation(subject: CreditSubject, requestId: string): string {
+    return `${this.base()}:observation:${this.scopeId(subject)}:${encodeURIComponent(requestId)}`;
   }
   reservation(id: string): string { return `${this.base()}:reservation:${encodeURIComponent(id)}`; }
   grant(referenceId: string): string {

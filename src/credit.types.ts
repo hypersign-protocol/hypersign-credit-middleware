@@ -3,6 +3,8 @@ import {
   ModuleMetadata,
   OptionalFactoryDependency,
 } from '@nestjs/common';
+import type Redis from 'ioredis';
+import type { RedisOptions } from 'ioredis';
 
 /** Injection token for the Redis client supplied by the host application. */
 export const CREDIT_REDIS_CLIENT = 'REDIS_CLIENT';
@@ -15,6 +17,8 @@ export interface CreditRedisClient {
     numberOfKeys: number,
     ...args: Array<string | number>
   ): Promise<unknown>;
+  /** Creates an independent connection for SDK-owned blocking/BullMQ work. */
+  duplicate?(override?: RedisOptions): Redis;
 }
 
 /** Dedicated Redis connection used only for blocking Stream consumption. */
@@ -35,7 +39,7 @@ export interface CreditBullMqWorker {
   close(): Promise<void>;
 }
 
-/** Structural adapter implemented by the host using its BullMQ connections. */
+/** Optional structural helper for external command producers/event consumers. */
 export interface CreditBullMqProvider {
   add(
     queueName: string,
@@ -49,19 +53,24 @@ export interface CreditBullMqProvider {
   ): Promise<CreditBullMqWorker>;
 }
 
-export interface CreditCommandEnvelope {
+export interface CreditCommandEnvelope<
+  TPayload extends Record<string, unknown> = Record<string, unknown>,
+> {
   commandId: string;
-  schemaVersion: 2;
-  catalogId: string;
+  schemaVersion: 3;
+  serviceType: string;
   requestedAt?: string;
   source?: string;
-  payload: Record<string, unknown>;
+  payload: TPayload;
 }
 
-export interface CreditBullMqOptions {
-  provider: CreditBullMqProvider;
-  /** Must not be the connection used by CreditService. */
-  streamClient: CreditEventStreamClient;
+export type GrantCreditCommandEnvelope = CreditCommandEnvelope<
+  GrantCreditsInput & Record<string, unknown>
+>;
+
+export interface CreditTransportOptions {
+  /** BullMQ Redis key prefix. Default: "bull". */
+  prefix?: string;
   lifecycleQueueNames?: string[];
   commandQueueName?: string;
   consumerGroup?: string;
@@ -70,8 +79,10 @@ export interface CreditBullMqOptions {
   pendingIdleMs?: number;
 }
 
-export interface ResolvedCreditBullMqOptions extends CreditBullMqOptions {
+export interface ResolvedCreditTransportOptions {
+  prefix: string;
   lifecycleQueueNames: string[];
+  commandQueueName: string;
   consumerGroup: string;
   batchSize: number;
   blockMs: number;
@@ -80,6 +91,8 @@ export interface ResolvedCreditBullMqOptions extends CreditBullMqOptions {
 
 export type CreditSettlementMode = 'IMMEDIATE' | 'DEFERRED';
 export type CreditAccountType = 'USER' | 'BUSINESS' | 'SERVICE' | string;
+export type CreditEnvironment = 'PROD' | 'DEV';
+export type CreditBillingMode = 'ENFORCE' | 'OBSERVE';
 
 /**
  * Uniquely identifies the wallet from which credits are deducted.
@@ -96,6 +109,8 @@ export interface CreditSubject {
 export interface CreditRequestContext {
   subject: CreditSubject;
   requestId?: string;
+  /** Trusted per-request environment. PROD enforces billing; DEV observes only. */
+  environment: CreditEnvironment;
 }
 
 export interface CreditCatalogCharge {
@@ -119,8 +134,8 @@ export interface CreditCatalogRoute {
 }
 
 export interface CreditCatalog {
-  /** Installation/catalog identity used for transport routing, never wallet scoping. */
-  catalogId: string;
+  /** Installation/service identity used for transport routing, never wallet scoping. */
+  serviceType: string;
   version: string;
   globalPrefix?: string;
   /** URI inserts v<version> into the route; NONE covers header/media/custom versioning. */
@@ -137,6 +152,8 @@ export interface ReserveCreditInput {
   amount: number;
   settlementMode?: CreditSettlementMode;
   operation?: string;
+  /** Enforced deductions are production-only. Defaults to PROD. */
+  environment?: 'PROD';
   /**
    * When false, scheduled recovery never refunds this reservation merely
    * because its lease elapsed. It must be explicitly committed or rolled back.
@@ -153,10 +170,33 @@ export interface ReserveCreditResult {
   remainingBalance: number;
   expiresAt: number;
   autoRecover: boolean;
+  environment: 'PROD';
+  billingMode: 'ENFORCE';
   existing: boolean;
   settlementMode: CreditSettlementMode;
   subject: CreditSubject;
   allocations: CreditPlanAllocation[];
+}
+
+export interface ObserveCreditInput {
+  subject: CreditSubject;
+  requestId?: string;
+  amount: number;
+  operation?: string;
+  environment: 'DEV';
+}
+
+export interface ObserveCreditResult {
+  eventId: string;
+  requestId: string;
+  scopeId: string;
+  environment: 'DEV';
+  billingMode: 'OBSERVE';
+  requestedAmount: number;
+  deductedAmount: 0;
+  existing: boolean;
+  operation?: string;
+  subject: CreditSubject;
 }
 
 export interface GrantCreditsInput {
@@ -164,6 +204,8 @@ export interface GrantCreditsInput {
   /** Immutable identifier of this recharge lot. */
   planId: string;
   amount: number;
+  /** Immutable low-balance threshold for this plan. */
+  criticalBalance: number;
   /** Authoritative recharge creation time used for deterministic FIFO ordering. */
   grantedAt: number;
   /** Unix epoch milliseconds after which unused credits cannot be reserved. */
@@ -178,6 +220,7 @@ export interface GrantCreditsResult {
   planBalance: number;
   balance: number;
   expiresAt: number;
+  criticalBalance: number;
   existing: boolean;
   subject: CreditSubject;
 }
@@ -197,6 +240,7 @@ export interface CreditPlan {
   scopeId: string;
   grantedAmount: number;
   availableAmount: number;
+  criticalBalance: number;
   grantedAt: number;
   expiresAt: number;
   referenceId: string;
@@ -220,6 +264,8 @@ export interface CreditReservation extends CreditSubject {
   createdAt: number;
   expiresAt: number;
   autoRecover: boolean;
+  environment: 'PROD';
+  billingMode: 'ENFORCE';
   finalizedAt?: number;
   finalizationReason?: string;
   settlementMode: CreditSettlementMode;
@@ -230,16 +276,14 @@ export interface CreditReservation extends CreditSubject {
 }
 
 export interface CreditOptions {
-  /** Optional durable BullMQ egress and trusted command ingress. */
-  bullMq?: CreditBullMqOptions;
+  /** SDK-owned BullMQ/Stream transport. Enabled with defaults unless false. */
+  transport?: false | CreditTransportOptions;
   /** How long a request owns a reservation without renewal. Default: 60s. */
   leaseMs?: number;
   /** How long finalized audit records and request mappings remain. Default: 7d. */
   retentionMs?: number;
   /** Maximum expired reservations processed per recovery pass. Default: 100. */
   recoveryBatchSize?: number;
-  /** Low-balance notification threshold. It never triggers replenishment. */
-  criticalBalance?: number | ((subject: CreditSubject) => number);
   /** Maximum number of active recharge plans one wallet may retain. */
   maxActivePlans?: number;
   /** Maximum number of plans one reservation may consume. */
@@ -259,11 +303,10 @@ export interface CreditOptions {
 
 export interface ResolvedCreditOptions {
   catalog: CreditCatalog;
-  bullMq?: ResolvedCreditBullMqOptions;
+  transport: false | ResolvedCreditTransportOptions;
   leaseMs: number;
   retentionMs: number;
   recoveryBatchSize: number;
-  criticalBalance: number | ((subject: CreditSubject) => number);
   maxActivePlans: number;
   maxPlanAllocationsPerReservation: number;
   keyPrefix: string;

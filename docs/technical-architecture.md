@@ -1,11 +1,11 @@
 # Credit Middleware Technical Architecture
 
 This document describes the logical architecture and internal execution paths
-of `@hypersign-protocol/credit-middleware` version 4.0.2. It follows commands,
+of `@hypersign-protocol/credit-middleware` version 5.0.0. It follows commands,
 HTTP reservations, Redis state, outbox events, BullMQ jobs, settlement, and
 recovery down to their key relationships and atomicity boundaries.
 
-The examples use the bundled catalog `hypersign-kyc-api-pricing@3.20.0` and default queue names.
+The examples use the bundled catalog `KYC_SERVICE@3.20.0` and default queue names.
 
 ## Contents
 
@@ -15,7 +15,7 @@ The examples use the bundled catalog `hypersign-kyc-api-pricing@3.20.0` and defa
 - [Deterministic state graph](#deterministic-state-graph)
 - [End-to-end grant command](#end-to-end-grant-command)
 - [Grant transaction algorithm](#grant-transaction-algorithm)
-- [HTTP reservation flow](#http-reservation-flow)
+- [Per-request HTTP billing flow](#per-request-http-billing-flow)
 - [Reservation algorithm](#reservation-algorithm)
 - [Commit, rollback, and recovery](#commit-rollback-and-recovery)
 - [Outbox relay algorithm](#outbox-relay-algorithm)
@@ -35,7 +35,7 @@ The architecture contains five logical systems:
 2. **SDK host application** — the NestJS API that imports `CreditModule`. It
    runs the command worker, HTTP interceptor, Redis operations, and Stream
    relay.
-3. **Redis credit state** — deterministic wallet, plan, reservation,
+3. **Redis credit state** — deterministic wallet, plan, reservation, observation,
    idempotency, expiry-index, and Stream keys changed by Lua.
 4. **BullMQ transport** — command and lifecycle queues. BullMQ owns its
    physical Redis keys.
@@ -49,14 +49,14 @@ architecture refers to a durable BullMQ queue or to the internal Redis Stream.
 
 | Stage | Logical channel | Default identifier | Who writes | Who receives |
 | --- | --- | --- | --- | --- |
-| Inbound command | BullMQ queue | `credit.commands.hypersign-kyc-api-pricing` | Trusted producer | `CreditCommandWorker` inside SDK hosts |
+| Inbound command | BullMQ queue | `credit.commands.KYC_SERVICE` | Trusted producer | `CreditCommandWorker` inside SDK hosts |
 | Transactional outbox | Redis Stream | `<keyPrefix>:v2:{<redisHashTag>}:events` | Credit Lua scripts | `CreditEventRelay` |
 | Outbound lifecycle | BullMQ queue | `credit.lifecycle` | `CreditEventRelay` | External lifecycle workers |
 | Command rejection | BullMQ lifecycle queue | configured lifecycle queue(s) | `CreditCommandWorker` directly | External lifecycle workers |
 
 Important delivery behavior:
 
-- API replicas listening to `credit.commands.hypersign-kyc-api-pricing` are competing consumers.
+- API replicas listening to `credit.commands.KYC_SERVICE` are competing consumers.
   Exactly one available BullMQ worker processes a delivery attempt.
 - Lifecycle workers listening to one `credit.lifecycle` queue also compete.
   Create separate lifecycle queue names for consumers that each need a copy.
@@ -72,7 +72,7 @@ Important delivery behavior:
 flowchart LR
     Payment[Payment or billing service]
     Workflow[Workflow service]
-    CQ[[BullMQ command queue<br/>credit.commands.hypersign-kyc-api-pricing]]
+    CQ[[BullMQ command queue<br/>credit.commands.KYC_SERVICE]]
 
     subgraph Host[SDK host application]
       CW[CreditCommandWorker]
@@ -151,8 +151,9 @@ flowchart TD
     Subject[CreditSubject] --> Scope[deterministic scopeId]
     Scope --> Balance[balance:scope]
     Scope --> Order[plans:order:scope]
-    Scope --> PlanHashes[plans amount / remaining / expires<br/>granted-at / reference / status]
+    Scope --> PlanHashes[plans amount / remaining / expires<br/>granted-at / reference / status / critical-balance]
     Scope --> Request[request:scope:requestId]
+    Scope --> Observation[observation:scope:requestId]
 
     PlanId[planId] --> PlanField[fields in wallet plan hashes]
     PlanId --> Owner[plan-owner:planId]
@@ -170,12 +171,13 @@ flowchart TD
     PlanId --> PlanExpiry[plan:expirations ZSET]
     Balance --> Stream[events Stream]
     Reservation --> Stream
+    Observation --> Stream
     PlanHashes --> Stream
 ```
 
 ### Keys used by a grant
 
-For one `grant()` call, TypeScript derives these 13 keys and passes them to one
+For one `grant()` call, TypeScript derives these 14 keys and passes them to one
 Lua invocation:
 
 | Lua key | Pattern | Role |
@@ -193,15 +195,16 @@ Lua invocation:
 | `KEYS[11]` | `<base>:grant:<encoded-referenceId>` | Global grant idempotency |
 | `KEYS[12]` | `<base>:plan:expirations` | Global due-plan sorted set |
 | `KEYS[13]` | `<base>:events` | Transactional outbox Stream |
+| `KEYS[14]` | `<base>:plans:critical-balance:<scope>` | Immutable plan thresholds |
 
-The common `{redisHashTag}` makes all 13 keys legal in one Redis Cluster Lua
+The common `{redisHashTag}` makes all 14 keys legal in one Redis Cluster Lua
 operation.
 
 ## End-to-end grant command
 
 ### Participants
 
-- Producer queue: `credit.commands.hypersign-kyc-api-pricing`
+- Producer queue: `credit.commands.KYC_SERVICE`
 - BullMQ command job name: `credit.grant.requested`
 - SDK receiver: `CreditCommandWorker`
 - financial operation: `CreditService.grant()`
@@ -216,7 +219,7 @@ operation.
 sequenceDiagram
     autonumber
     participant P as Payment service
-    participant CQ as BullMQ credit.commands.hypersign-kyc-api-pricing
+    participant CQ as BullMQ credit.commands.KYC_SERVICE
     participant CW as CreditCommandWorker
     participant CS as CreditService
     participant R as Redis state + Stream
@@ -227,9 +230,9 @@ sequenceDiagram
 
     P->>CQ: add credit.grant.requested<br/>jobId=paymentEventId
     CQ->>CW: deliver command job
-    CW->>CW: validate schemaVersion, catalogId,<br/>commandId, payload and subject
+    CW->>CW: validate schemaVersion, serviceType,<br/>commandId, payload and subject
     CW->>CS: grant(validated input)
-    CS->>CS: normalize subject and identifiers<br/>derive scope and 13 deterministic keys
+    CS->>CS: normalize subject and identifiers<br/>derive scope and 14 deterministic keys
     CS->>R: EVAL GRANT_SCRIPT
     Note over R: expire stale plans, validate idempotency,<br/>create plan, update balance/indexes,<br/>XADD CREDIT_GRANTED atomically
     R-->>CS: balance, plan balance, existing flag
@@ -238,7 +241,7 @@ sequenceDiagram
 
     ER->>R: XAUTOCLAIM / XREADGROUP
     R-->>ER: CREDIT_GRANTED Stream entry + eventId
-    ER->>LQ: add credit.granted<br/>jobId=hypersign-kyc-api-pricing-eventId
+    ER->>LQ: add credit.granted<br/>jobId=KYC_SERVICE-eventId
     LQ-->>ER: accepted
     ER->>R: XACK eventId
     LQ->>LC: deliver lifecycle job
@@ -255,9 +258,9 @@ The producer sends:
 await queue.add(
   'credit.grant.requested',
   {
-    schemaVersion: 2,
+    schemaVersion: 3,
     commandId: payment.eventId,
-    catalogId: 'hypersign-kyc-api-pricing',
+    serviceType: 'KYC_SERVICE',
     source: 'payment-service',
     requestedAt: new Date().toISOString(),
     payload: {
@@ -269,6 +272,7 @@ await queue.add(
       },
       planId: payment.planId,
       amount: 100,
+      criticalBalance: payment.criticalBalance,
       grantedAt: payment.createdAt.getTime(),
       expiresAt: payment.expiresAt.getTime(),
       referenceId: payment.transactionId,
@@ -287,7 +291,7 @@ and optional BullMQ `prefix`. The producer does not need the SDK `keyPrefix` or
 
 Every running SDK host with BullMQ enabled creates a worker on its configured
 `commandQueueName`. With the bundled catalog, the default is
-`credit.commands.hypersign-kyc-api-pricing`.
+`credit.commands.KYC_SERVICE`.
 
 If three API replicas listen to that queue, they compete. BullMQ selects one
 worker for a delivery attempt. A different replica can receive a retry after a
@@ -306,16 +310,16 @@ Before Redis executes Lua, `CreditService.grant()`:
 
 1. trims and validates the subject;
 2. trims `planId` and `referenceId` and rejects control characters;
-3. requires `amount`, `grantedAt`, and `expiresAt` to be positive safe
-   integers;
+3. requires `amount`, `grantedAt`, and `expiresAt` to be positive safe integers,
+   and `criticalBalance` to be a non-negative safe integer;
 4. rejects `grantedAt` in the future;
 5. requires `expiresAt > grantedAt`;
 6. derives the deterministic scope, expiry member, and all Redis keys; and
 7. supplies the current server time and configured limits to Lua.
 
 The command worker separately requires `subject.appId` and
-`subject.creditType`, validates schema version `2`, and requires its
-`catalogId` to equal `hypersign-kyc-api-pricing`.
+`subject.creditType`, validates schema version `3`, and requires its
+`serviceType` to equal `KYC_SERVICE`.
 
 ### Atomic Lua pseudocode
 
@@ -334,7 +338,7 @@ GRANT(input, now):
   persist corrected balance
 
   if planId already exists in this wallet:
-    if amount, expiresAt, grantedAt, or referenceId differ:
+    if amount, expiresAt, grantedAt, referenceId, or criticalBalance differ:
       reject conflicting plan retry
     return existing result without another CREDIT_GRANTED event
 
@@ -358,7 +362,8 @@ GRANT(input, now):
 
   increment cached balance
   add planId to FIFO ZSET with score grantedAt
-  write amount, remaining, expiry, grant time, reference and ACTIVE status
+  write amount, remaining, expiry, grant time, reference, critical balance,
+    and ACTIVE status
   write global plan ownership
   write global grant idempotency record
   add encoded plan member to plan-expiration ZSET
@@ -390,7 +395,7 @@ produce `PLAN_EXPIRED` events even if the new grant is later rejected. Those
 expiry transitions are valid cleanup, not partial application of the new
 grant.
 
-## HTTP reservation flow
+## Per-request HTTP billing flow
 
 ```mermaid
 flowchart TD
@@ -398,10 +403,15 @@ flowchart TD
     Match -- No --> Mismatch[500 catalog mismatch]
     Match -- Yes --> Free{charges empty?}
     Free -- Yes --> Controller[Execute controller]
-    Free -- No --> Context[Resolve trusted subject + requestId]
-    Context --> Identity{appId present?}
+    Free -- No --> Context[Resolve trusted subject + requestId + environment]
+    Context --> Identity{appId and PROD/DEV valid?}
     Identity -- No --> Unauthorized[401]
-    Identity -- Yes --> Charges[Reserve each catalog charge sequentially]
+    Identity -- Yes --> Environment{environment}
+    Environment -- DEV --> Observe[Atomically append one CREDIT_OBSERVED per charge]
+    Observe --> Observed{Any observation replayed?}
+    Observed -- Yes --> Conflict
+    Observed -- No --> Run
+    Environment -- PROD --> Charges[Reserve each catalog charge sequentially]
     Charges --> Funded{All reservations succeed?}
     Funded -- No --> Compensate[Rollback newly-created earlier reservations]
     Compensate --> Error[Return reservation error]
@@ -424,7 +434,29 @@ Each catalog charge gets its own request ID:
 
 Its `creditType` comes from the catalog and is applied to the trusted base
 subject. This makes charges for different credit types separate wallets and
-separate reservations.
+separate reservations. Environment is not added to wallet scope.
+
+### DEV observation algorithm
+
+One observation uses two keys: the scoped observation-idempotency hash and the
+transactional event Stream.
+
+```text
+OBSERVE(input, now):
+  if observation key exists:
+    reject if amount, operation, or environment changed
+    return original eventId with existing=true
+
+  append CREDIT_OBSERVED with requestedAmount and deductedAmount=0
+  retain eventId and immutable semantics for retentionMs
+  return eventId with existing=false
+```
+
+The script never reads or writes balance, plan, reservation, or expiry-index
+keys. Thus a DEV call works without any granted plan and cannot consume PROD
+credit. The observation remains an audit of attempted usage if the controller
+later fails or an early boundary ends the response. A missing or unknown
+environment is rejected before either Lua path.
 
 ## Reservation algorithm
 
@@ -462,8 +494,6 @@ RESERVE(input, now):
   store request-idempotency hash
   if autoRecover: add reservation to lease-expiry ZSET
   append one RESERVED event per allocation
-  if final balance <= criticalBalance:
-    append one CRITICAL_BALANCE event
 
   return reservation and allocation data
 ```
@@ -499,7 +529,9 @@ Commit does not deduct credits again. It:
 2. sets status `COMMITTED`, final time, and reason;
 3. removes the reservation from the lease-expiry index;
 4. applies `retentionMs` to reservation and request keys; and
-5. appends one `COMMITTED` event per immutable plan allocation.
+5. appends one `COMMITTED` event per immutable plan allocation; and
+6. for each allocation whose current plan balance is at or below that plan's
+   immutable threshold, appends one `CRITICAL_BALANCE` event.
 
 Commit remains valid after a plan expires because the credit was removed from
 availability when the reservation was created.
@@ -555,7 +587,7 @@ the final status and do not apply it again.
 ## Outbox relay algorithm
 
 The relay uses a dedicated blocking Redis connection. Its default consumer
-group is `credit-bull-relay:hypersign-kyc-api-pricing`; each process creates a unique consumer name
+group is `credit-bull-relay:KYC_SERVICE`; each process creates a unique consumer name
 `<pid>-<UUID>`.
 
 ```text
@@ -572,13 +604,13 @@ LOOP:
   publish new entries
 
 PUBLISH ONE ENTRY:
-  require catalogId
-  if catalogId belongs to another catalog:
+  require serviceType
+  if serviceType belongs to another catalog:
     XACK for this consumer group and skip
   map internal event type to lifecycle BullMQ job name
-  build schema-v2 lifecycle envelope
+  build schema-v3 lifecycle envelope
   for every lifecycleQueueName:
-    BullMQ add(jobName, envelope, jobId=catalogId-eventId)
+    BullMQ add(jobName, envelope, jobId=serviceType-eventId)
   only after every add succeeds:
     XACK Stream entry
 ```
@@ -600,7 +632,8 @@ configuration problem.
 | `CREDIT_GRANTED` | `credit.granted` | New grant Lua transaction | Once per new plan |
 | `PLAN_EXPIRED` | `credit.plan-expired` | Lazy expiry or recovery | Once per applied plan-expiry transition |
 | `RESERVED` | `credit.reserved` | Reserve Lua transaction | Once per plan allocation |
-| `CRITICAL_BALANCE` | `credit.critical-balance` | Successful reserve at/below threshold | Once per new reservation, not only on threshold crossing |
+| `CREDIT_OBSERVED` | `credit.observed` | DEV observation Lua transaction | Once per new catalog charge request ID |
+| `CRITICAL_BALANCE` | `credit.critical-balance` | Commit with a plan at/below its threshold | Once per qualifying committed plan allocation |
 | `COMMITTED` | `credit.committed` | Commit Lua transaction | Once per plan allocation |
 | `ROLLED_BACK` | `credit.rolled-back` | Explicit or interceptor rollback | Once per plan allocation |
 | `EXPIRED` | `credit.expired` | Lease recovery | Once per plan allocation |
@@ -613,9 +646,9 @@ All relayed Stream events use:
 ```ts
 interface CreditLifecycleEventEnvelope {
   eventId: string;          // Redis Stream ID, durable consumer idempotency key
-  schemaVersion: 2;
+  schemaVersion: 3;
   catalogVersion: string;   // 3.20.0 in this release
-  catalogId: string;        // hypersign-kyc-api-pricing
+  serviceType: string;        // KYC_SERVICE
   event: Record<string, unknown>;
 }
 ```
@@ -624,13 +657,26 @@ interface CreditLifecycleEventEnvelope {
 `creditType`. Numeric Stream fields are converted to numbers and `autoRecover`
 to a boolean.
 
+### `CREDIT_OBSERVED`
+
+Key fields:
+
+```text
+type, timestamp, subject, scopeId, requestId, operation,
+environment=DEV, billingMode=OBSERVE, requestedAmount, deductedAmount=0
+```
+
+Meaning: the SDK matched and recorded a DEV catalog charge but performed no
+balance check, reservation, plan allocation, or settlement. It therefore has
+no `planId` or `reservationId`.
+
 ### `CREDIT_GRANTED`
 
 Key fields:
 
 ```text
 type, timestamp, subject, scopeId, planId, referenceId,
-amount, balanceAfter, planBalanceAfter, grantedAt, expiresAt, reason
+amount, balanceAfter, planBalanceAfter, criticalBalance, grantedAt, expiresAt, reason
 ```
 
 Meaning: one immutable plan was created and made available. An exact grant
@@ -656,7 +702,7 @@ Key fields:
 type, timestamp, subject, scopeId, planId, reservationId, requestId,
 amount, totalAmount, allocationIndex, allocationCount,
 balanceAfter, planBalanceAfter, expiresAt,
-autoRecover, settlementMode, operation
+autoRecover, settlementMode, operation, environment=PROD, billingMode=ENFORCE
 ```
 
 Meaning: `amount` was allocated from this event's plan. `totalAmount` is the
@@ -668,12 +714,16 @@ and count to verify completeness.
 Key fields:
 
 ```text
-type, timestamp, subject, scopeId, planId, balance, threshold
+type, timestamp, subject, scopeId, planId,
+balanceAfter, planBalanceAfter, threshold,
+environment=PROD, billingMode=ENFORCE
 ```
 
-Meaning: a newly created reservation left the wallet at or below the configured
-threshold. The SDK can emit this for every successful reservation while the
-balance remains low; consumers should suppress notification noise as needed.
+Meaning: a committed allocation left this plan at or below the threshold fixed
+when the plan was granted. `balanceAfter` is the aggregate wallet balance and
+`planBalanceAfter` is the remaining balance of this event's plan. The SDK can
+emit this after every qualifying commit while the plan remains low; consumers
+should suppress notification noise as needed.
 
 ### `COMMITTED`
 
@@ -682,7 +732,8 @@ Key fields:
 ```text
 type, timestamp, subject, scopeId, planId, reservationId,
 amount, totalAmount, allocationIndex, allocationCount,
-balanceAfter, planBalanceAfter, operation
+balanceAfter, planBalanceAfter, operation,
+environment=PROD, billingMode=ENFORCE
 ```
 
 Meaning: the allocation became a permanent charge. `balanceAfter` and
@@ -697,7 +748,7 @@ Key fields:
 type, timestamp, subject, scopeId, planId, reservationId,
 amount, totalAmount, allocationIndex, allocationCount,
 restoredAmount, expiredAmount, balanceAfter, planBalanceAfter,
-operation, reason
+operation, reason, environment=PROD, billingMode=ENFORCE
 ```
 
 Meaning: the allocation was finalized without commitment. A still-active plan
@@ -710,8 +761,8 @@ This job is not a relayed lifecycle envelope and has no Redis Stream `eventId`:
 
 ```ts
 {
-  schemaVersion: 2;
-  catalogId: string;
+  schemaVersion: 3;
+  serviceType: string;
   planId?: string;
   commandId: string;
   commandName: string;
@@ -721,7 +772,7 @@ This job is not a relayed lifecycle envelope and has no Redis Stream `eventId`:
 ```
 
 It is sent directly to every lifecycle queue with job ID
-`<catalogId>-<commandId>-rejected`, then the command handler throws so BullMQ's
+`<serviceType>-<commandId>-rejected`, then the command handler throws so BullMQ's
 configured retry policy still applies.
 
 No lifecycle event is emitted for lease renewal. Renewal changes only the
@@ -736,7 +787,7 @@ reservation expiry/version and expiry-index score.
 | `credit.commit.requested` | `CreditCommandWorker` | `CreditService.commit()` | Returns settlement outcome |
 | `credit.rollback.requested` | `CreditCommandWorker` | `CreditService.rollback()` | Default reason is `external_command` |
 
-Every command requires `schemaVersion: 2`, the configured catalog ID, a
+Every command requires `schemaVersion: 3`, the configured service type, a
 non-empty command ID (or BullMQ job ID fallback), and an object payload.
 
 Reserve commands default `requestId` to `commandId` and `autoRecover` to true.
@@ -759,8 +810,9 @@ Idempotency exists at several independent layers:
 | Grant plan | global `plan-owner:<planId>` plus wallet plan hashes | Persistent | Prevent cross-wallet plan reuse and changed plan semantics |
 | Grant reference | global `grant:<referenceId>` | Persistent | Prevent payment reference reuse |
 | Reservation request | `request:<scope>:<requestId>` | Active + `retentionMs` after finalization | Return/reject duplicate reservation semantics |
+| DEV observation | `observation:<scope>:<requestId>` | `retentionMs` | Return original event ID or reject changed observation semantics |
 | Reservation finalization | reservation status | Active + `retentionMs` | Ensure only first final transition applies |
-| Stream relay job | `<catalogId>-<eventId>` | Host BullMQ retention | Reduce duplicate lifecycle jobs while job record exists |
+| Stream relay job | `<serviceType>-<eventId>` | Host BullMQ retention | Reduce duplicate lifecycle jobs while job record exists |
 | Downstream consumer | unique `eventId` in consumer database | Business retention | Permanent at-least-once delivery protection |
 
 No single layer replaces another. BullMQ job records can be removed; durable
@@ -829,12 +881,12 @@ For one financial operation, retain and log these correlation values:
 | `requestId` | API/workflow | Reservation idempotency mapping |
 | `reservationId` | SDK | Reservation state and allocation events |
 | Redis Stream `eventId` | Redis | Relay pending state and lifecycle idempotency |
-| Lifecycle BullMQ `jobId` | Relay | `<catalogId>-<eventId>` queue record |
+| Lifecycle BullMQ `jobId` | Relay | `<serviceType>-<eventId>` queue record |
 
 ### Grant trace procedure
 
-1. Find the command by `commandId`/BullMQ job ID on `credit.commands.hypersign-kyc-api-pricing`.
-2. Confirm its job name, schema, catalog ID, and immutable payload.
+1. Find the command by `commandId`/BullMQ job ID on `credit.commands.KYC_SERVICE`.
+2. Confirm its job name, schema, service type, and immutable payload.
 3. Derive the subject scope and locate wallet plan metadata.
 4. Verify `plan-owner:<planId>` and `grant:<referenceId>` agree on scope and
    plan.
@@ -843,7 +895,7 @@ For one financial operation, retain and log these correlation values:
 6. Locate the `CREDIT_GRANTED` Stream/lifecycle event by `planId` and
    `referenceId`.
 7. Trace the envelope `eventId` to lifecycle BullMQ job
-   `hypersign-kyc-api-pricing-<eventId>`.
+   `KYC_SERVICE-<eventId>`.
 8. Confirm each required consumer stored the event receipt and applied its
    database transaction.
 

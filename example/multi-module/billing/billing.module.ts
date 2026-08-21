@@ -1,15 +1,13 @@
 import { Global, Module } from '@nestjs/common';
-import Redis from 'ioredis';
-import { CreditModule } from '../../../src';
-import {
-  CREDIT_BULLMQ_PROVIDER,
-  ExampleBullMqModule,
-  ExampleBullMqProvider,
-} from '../../bullmq.module';
-import { CREDIT_EVENT_STREAM_REDIS, RedisModule } from '../../redis.module';
+import { CreditEnvironment, CreditModule } from '../../../src';
+import { RedisModule } from '../../redis.module';
 
 interface ServiceRequest {
-  service?: { businessId?: string; tenantId?: string };
+  service?: {
+    businessId?: string;
+    tenantId?: string;
+    environment?: CreditEnvironment;
+  };
   requestId?: string;
 }
 
@@ -17,16 +15,11 @@ interface ServiceRequest {
 @Module({
   imports: [
     RedisModule,
-    ExampleBullMqModule,
     CreditModule.forRootAsync({
-      imports: [RedisModule, ExampleBullMqModule],
-      inject: [CREDIT_BULLMQ_PROVIDER, CREDIT_EVENT_STREAM_REDIS],
-      useFactory: (bullMq: ExampleBullMqProvider, streamClient: Redis) => ({
+      imports: [RedisModule],
+      useFactory: () => ({
         keyPrefix: 'credit-multi',
         redisHashTag: 'credit-multi',
-        leaseMs: 30_000,
-        criticalBalance: 20,
-        bullMq: { provider: bullMq, streamClient },
         requestContextResolver: (unknownRequest: unknown) => {
           const request = unknownRequest as ServiceRequest;
           return {
@@ -36,6 +29,7 @@ interface ServiceRequest {
               appId: request.service?.businessId ?? '',
             },
             requestId: request.requestId,
+            environment: request.service?.environment as CreditEnvironment,
           };
         },
       }),

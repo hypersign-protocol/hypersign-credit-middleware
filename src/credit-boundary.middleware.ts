@@ -6,7 +6,7 @@ import {
 } from '@nestjs/common';
 import { CreditCatalogService, ResolvedCreditCatalogRoute } from './credit.catalog';
 import {
-  AppliedCreditReservation,
+  AppliedCreditAction,
   CreditPolicyExecutor,
 } from './credit-policy.executor';
 import { CREDIT_OPTIONS, ResolvedCreditOptions } from './credit.types';
@@ -15,7 +15,7 @@ export const CREDIT_BOUNDARY_STATE = Symbol('CREDIT_BOUNDARY_STATE');
 
 export interface CreditBoundaryState {
   route: ResolvedCreditCatalogRoute;
-  reservations: AppliedCreditReservation[];
+  actions: AppliedCreditAction[];
   claimedByInterceptor: boolean;
   finalized: boolean;
 }
@@ -53,13 +53,13 @@ export class CreditBoundaryMiddleware implements NestMiddleware {
     );
     if (!route || !route.boundary || route.charges.length === 0) return next();
 
-    const reservations = await this.executor.reserve(
+    const actions = await this.executor.apply(
       route,
       this.options.requestContextResolver(request),
     );
     const state: CreditBoundaryState = {
       route,
-      reservations,
+      actions,
       claimedByInterceptor: false,
       finalized: false,
     };
@@ -69,7 +69,7 @@ export class CreditBoundaryMiddleware implements NestMiddleware {
       if (state.claimedByInterceptor || state.finalized) return;
       state.finalized = true;
       void this.executor.rollbackAll(
-        state.reservations,
+        state.actions,
         'response_ended_before_credit_interceptor',
       ).catch((error: unknown) => {
         const message = error instanceof Error ? error.message : String(error);

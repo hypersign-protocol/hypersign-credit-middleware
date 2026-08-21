@@ -1,10 +1,12 @@
-# Hypersign Credit Middleware v4
+# Hypersign Credit Middleware v5
 
-NestJS credit-lifecycle SDK backed by Redis Lua and BullMQ. Version 4 uses
+NestJS credit-lifecycle SDK backed by Redis Lua and BullMQ. Version 5 uses
 immutable recharge plans instead of one aggregate balance or a balance provider.
 Each API reservation records exactly which plans funded it, consumes plans FIFO,
 and emits one settlement event per affected plan.
 
+- [Developer integration guide](docs/developer-guide.md)
+- [Technical architecture](docs/technical-architecture.md)
 - [Redis keys and records](docs/redis-keyspace.md)
 - [Lua state transitions](docs/lua-scripts.md)
 
@@ -12,6 +14,10 @@ and emits one settlement event per affected plan.
 
 A wallet is scoped by `tenantId`, `appType`, `appId`, and `creditType`.
 `serviceId` is not part of billing identity.
+
+The trusted request context also carries `environment: 'PROD' | 'DEV'`. It is
+not part of wallet identity: PROD calls enforce credit, while DEV calls only
+record usage.
 
 ```ts
 const subject: CreditSubject = {
@@ -29,6 +35,7 @@ await credits.grant({
   subject,
   planId: 'plan_01',
   amount: 100,
+  criticalBalance: 20,
   grantedAt: Date.now(),
   expiresAt: Date.now() + 30 * 24 * 60 * 60 * 1_000,
   referenceId: 'payment_01',
@@ -40,8 +47,9 @@ There is no `CreditBalanceProvider`. Before the first grant, `getBalance()`
 returns `null` and paid requests fail closed with insufficient credit.
 
 An exact retry of a grant is idempotent. Reusing a `planId` with another amount,
-expiry, grant time, or reference is rejected. Reusing a reference for another
-plan is also rejected. Both `planId` ownership and payment references are
+expiry, grant time, critical balance, or reference is rejected. Reusing a
+reference for another plan is also rejected. Both `planId` ownership and
+payment references are
 enforced globally inside one SDK Redis namespace, not merely per wallet.
 
 ## FIFO allocation
@@ -81,68 +89,64 @@ SDK version whenever KYC routes or prices change.
 Startup fails if an application route is missing from the catalog, a catalog
 route is missing from the application, or routes/charges are invalid.
 
-`catalogId` identifies the SDK installation and transport. It is deliberately
+`serviceType` identifies the SDK installation and transport. It is deliberately
 separate from `CreditSubject` and does not split a wallet.
 
 ## Registration
 
 ```ts
 CreditModule.forRootAsync({
-  imports: [RedisModule, CreditQueueModule],
-  inject: [CREDIT_BULLMQ_PROVIDER, STREAM_REDIS],
-  useFactory: (bullMq, streamClient) => ({
+  imports: [RedisModule],
+  useFactory: () => ({
     keyPrefix: 'credit-kyc',
     redisHashTag: 'credit-kyc',
-    leaseMs: 60_000,
-    retentionMs: 7 * 24 * 60 * 60 * 1_000,
-    criticalBalance: 20,
-    maxActivePlans: 1_000,
-    maxPlanAllocationsPerReservation: 100,
-    bullMq: {
-      provider: bullMq,
-      streamClient,
-      lifecycleQueueNames: ['credit.lifecycle'],
-      commandQueueName: 'credit.commands.KYC',
-    },
     requestContextResolver: (unknownRequest) => {
       const request = unknownRequest as AuthenticatedRequest;
+      const environment = request.service.env?.trim().toUpperCase();
+      if (environment !== 'PROD' && environment !== 'DEV') {
+        throw new Error('Trusted service environment must be PROD or DEV');
+      }
       return {
         subject: {
-          tenantId: request.service.tenantId,
-          appType: 'BUSINESS',
-          appId: request.service.appId,
+          tenantId: request.service.subdomain,
+          appType: 'KYC_SERVICE',
+          appId: request.service.appId ?? '',
         },
         requestId: request.requestId,
+        environment,
       };
     },
   }),
 });
 ```
 
-The operation Redis client and blocking Stream client must be different
-connections. A complete adapter is in `example/bullmq.module.ts`.
+The host supplies only `CREDIT_REDIS_CLIENT`. The SDK duplicates that ioredis
+client for its blocking Stream relay and BullMQ queues/workers, applies its own
+job policy, and closes only the connections it creates. Transport is enabled by
+default and can be disabled explicitly with `transport: false`.
 
 ## Request lifecycle
 
 ```text
 catalog match
-  -> atomically reserve FIFO plan allocations
+  -> resolve trusted per-request environment
+  -> PROD: atomically reserve FIFO plan allocations
+  -> DEV: atomically append CREDIT_OBSERVED with deductedAmount=0
   -> execute controller
-  -> commit IMMEDIATE reservations after success
-  -> leave DEFERRED reservations active
-  -> roll back active reservations after failure
+  -> PROD only: commit/leave deferred/roll back reservations
 ```
 
 Catalog routes may contain several credit types. Each catalog charge creates an
-independent reservation. If a later charge fails, earlier new reservations are
-compensated.
+independent PROD reservation or DEV observation. DEV does not read balances,
+require a grant, or mutate plans. If a later PROD charge fails, earlier new
+reservations are compensated.
 
 For middleware that can return before the interceptor, use `boundary: true` and
 install `CreditBoundaryMiddleware` after trusted authentication context exists.
 
 ## BullMQ transport
 
-Transport envelopes use `schemaVersion: 2`.
+Transport envelopes use `schemaVersion: 3`.
 
 Default lifecycle queue:
 
@@ -160,13 +164,14 @@ credit.committed
 credit.rolled-back
 credit.expired
 credit.critical-balance
+credit.observed
 credit.command-rejected
 ```
 
 Default inbound queue:
 
 ```text
-credit.commands.<catalogId>
+credit.commands.<serviceType>
 ```
 
 Supported command jobs:
@@ -182,12 +187,12 @@ Grant command example:
 
 ```ts
 await queueProvider.add(
-  'credit.commands.KYC',
+  'credit.commands.KYC_SERVICE',
   CREDIT_EVENT_NAMES.GRANT_REQUESTED,
   {
-    schemaVersion: 2,
+    schemaVersion: 3,
     commandId: payment.eventId,
-    catalogId: 'KYC',
+    serviceType: 'KYC_SERVICE',
     source: 'payment-service',
     payload: {
       subject: {
@@ -198,6 +203,7 @@ await queueProvider.add(
       },
       planId: payment.planId,
       amount: 100,
+      criticalBalance: payment.criticalBalance,
       grantedAt: payment.createdAt.getTime(),
       expiresAt: payment.expiresAt.getTime(),
       referenceId: payment.transactionId,
@@ -218,10 +224,21 @@ when reconciliation, notifications, and analytics each require every event.
 ## Expiry and crash recovery
 
 No interval is started by the SDK. Invoke the stateless recovery entry point
-from an external scheduler or dedicated worker:
+from a Nest scheduler or dedicated worker. The runnable example uses:
 
 ```ts
-await creditRecoveryService.runOnce();
+@Injectable()
+export class CreditRecoveryScheduler {
+  constructor(private readonly recovery: CreditRecoveryService) {}
+
+  @Cron(CronExpression.EVERY_5_MINUTES, {
+    name: 'credit-recovery',
+    waitForCompletion: true,
+  })
+  async run(): Promise<void> {
+    await this.recovery.runOnce();
+  }
+}
 ```
 
 One pass handles both expired reservation leases and expired unused plan credit.
@@ -245,12 +262,13 @@ Grant two FIFO plans through the event server (use current millisecond values):
 curl -X POST http://localhost:3002/credit-commands/grant \
   -H 'content-type: application/json' \
   -d '{
-    "catalogId":"example-service",
+    "serviceType":"KYC_SERVICE",
     "appId":"user_123",
     "appType":"USER",
     "creditType":"API_CREDIT",
     "planId":"plan-old",
     "amount":10,
+    "criticalBalance":2,
     "grantedAt":1780000000000,
     "expiresAt":1900000000000,
     "referenceId":"payment-old"
@@ -261,14 +279,15 @@ Repeat with a new `planId`, `referenceId`, and later `grantedAt`, then call:
 
 ```sh
 curl -X POST http://localhost:3000/demo/cheap \
-  -H 'x-request-id: request-001'
+  -H 'x-request-id: request-001' \
+  -H 'x-service-environment: PROD'
 
 curl http://localhost:3000/demo/plans
 curl 'http://localhost:3002/credit-events?limit=25'
 ```
 
-The multi-module server uses catalog ID `kyc` and queue
-`credit.commands.kyc`:
+The multi-module server uses service type `KYC_SERVICE` and queue
+`credit.commands.KYC_SERVICE`:
 
 ```sh
 npm run start:example:multi
@@ -285,5 +304,5 @@ npm run start:example:multi
 - `eventStreamMaxLength` larger than the longest expected relay outage.
 - Idempotent database consumers keyed by the lifecycle `eventId`.
 
-Version 4 stores Redis state under `<keyPrefix>:v2:{<hashTag>}:...`; it does not
+Version 5 stores Redis state under `<keyPrefix>:v2:{<hashTag>}:...`; it does not
 read version 3 aggregate-balance keys.

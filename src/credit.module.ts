@@ -10,6 +10,7 @@ import { CreditRecoveryService } from "./credit-recovery.service";
 import { CreditInterceptor } from "./credit.interceptor";
 import { CreditService } from "./credit.service";
 import { CreditBoundaryMiddleware } from "./credit-boundary.middleware";
+import { CreditTransportInfrastructure } from "./credit-transport.infrastructure";
 import {
   CREDIT_OPTIONS,
   CreditModuleAsyncOptions,
@@ -25,6 +26,7 @@ const runtimeProviders: Provider[] = [
   CreditCatalogService,
   CreditCatalogAuditor,
   CreditPolicyExecutor,
+  CreditTransportInfrastructure,
   CreditEventRelay,
   CreditCommandWorker,
   CreditService,
@@ -36,13 +38,13 @@ const runtimeProviders: Provider[] = [
 export function resolveCreditOptions(
   options: CreditOptions,
 ): ResolvedCreditOptions {
-  const catalogId = CATALOG_KYC.catalogId?.trim();
+  const serviceType = CATALOG_KYC.serviceType?.trim();
   const catalogVersion = CATALOG_KYC.version?.trim();
-  if (!catalogId) throw new TypeError("catalog.catalogId is required");
+  if (!serviceType) throw new TypeError("catalog.serviceType is required");
   if (!catalogVersion) throw new TypeError("catalog.version is required");
   const catalog = {
     ...CATALOG_KYC,
-    catalogId,
+    serviceType,
     version: catalogVersion,
   };
   const keyPrefix =
@@ -67,21 +69,21 @@ export function resolveCreditOptions(
       options.maxPlanAllocationsPerReservation ??
       DEFAULT_CREDIT_OPTIONS.maxPlanAllocationsPerReservation,
     eventStreamKey: `${keyPrefix}:v2:{${redisHashTag}}:events`,
-    bullMq: options.bullMq
-      ? {
-          ...options.bullMq,
-          lifecycleQueueNames: options.bullMq.lifecycleQueueNames ?? [
-            "credit.lifecycle",
-          ],
-          commandQueueName:
-            options.bullMq.commandQueueName ?? `credit.commands.${catalogId}`,
-          consumerGroup:
-            options.bullMq.consumerGroup ?? `credit-bull-relay:${catalogId}`,
-          batchSize: options.bullMq.batchSize ?? 100,
-          blockMs: options.bullMq.blockMs ?? 5_000,
-          pendingIdleMs: options.bullMq.pendingIdleMs ?? 30_000,
-        }
-      : undefined,
+    transport:
+      options.transport === false
+        ? false
+        : {
+            prefix: options.transport?.prefix?.trim() || "bull",
+            lifecycleQueueNames:
+              options.transport?.lifecycleQueueNames ?? ["credit.lifecycle"],
+            commandQueueName:
+              options.transport?.commandQueueName ?? `credit.commands.${serviceType}`,
+            consumerGroup:
+              options.transport?.consumerGroup ?? `credit-bull-relay:${serviceType}`,
+            batchSize: options.transport?.batchSize ?? 100,
+            blockMs: options.transport?.blockMs ?? 5_000,
+            pendingIdleMs: options.transport?.pendingIdleMs ?? 30_000,
+          },
   };
   for (const [name, value] of [
     ["leaseMs", resolved.leaseMs],
@@ -98,29 +100,25 @@ export function resolveCreditOptions(
       throw new TypeError(`${name} must be a positive safe integer`);
     }
   }
-  if (
-    typeof resolved.criticalBalance === "number" &&
-    (!Number.isSafeInteger(resolved.criticalBalance) ||
-      resolved.criticalBalance < 0)
-  ) {
-    throw new TypeError("criticalBalance must be a non-negative safe integer");
-  }
-  if (resolved.bullMq) {
+  if (resolved.transport) {
     for (const [name, value] of [
-      ["bullMq.batchSize", resolved.bullMq.batchSize],
-      ["bullMq.blockMs", resolved.bullMq.blockMs],
-      ["bullMq.pendingIdleMs", resolved.bullMq.pendingIdleMs],
+      ["transport.batchSize", resolved.transport.batchSize],
+      ["transport.blockMs", resolved.transport.blockMs],
+      ["transport.pendingIdleMs", resolved.transport.pendingIdleMs],
     ] as const) {
       if (!Number.isSafeInteger(value) || value <= 0) {
         throw new TypeError(`${name} must be a positive safe integer`);
       }
     }
     if (
-      resolved.bullMq.lifecycleQueueNames.length === 0 ||
-      resolved.bullMq.lifecycleQueueNames.some((name) => !name.trim())
+      resolved.transport.lifecycleQueueNames.length === 0 ||
+      resolved.transport.lifecycleQueueNames.some((name) => !name.trim()) ||
+      !resolved.transport.commandQueueName.trim() ||
+      !resolved.transport.consumerGroup.trim() ||
+      !resolved.transport.prefix.trim()
     ) {
       throw new TypeError(
-        "bullMq.lifecycleQueueNames must contain valid queue names",
+        "transport queue and consumer-group names must be valid",
       );
     }
   }

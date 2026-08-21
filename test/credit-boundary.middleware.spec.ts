@@ -10,7 +10,7 @@ describe('catalog-driven CreditBoundaryMiddleware', () => {
   const options = {
     ...DEFAULT_CREDIT_OPTIONS,
     catalog: {
-      catalogId: 'test', version: '1', routes: [
+      serviceType: 'test', version: '1', routes: [
         {
           method: 'POST', path: '/paid/:id', boundary: true,
           charges: [{ id: 'api', creditType: 'API_CREDIT', amount: 10 }],
@@ -21,10 +21,12 @@ describe('catalog-driven CreditBoundaryMiddleware', () => {
     requestContextResolver: () => ({
       subject: { appId: 'user_123' },
       requestId: 'req_1',
+      environment: 'PROD' as const,
     }),
   };
   const catalog = new CreditCatalogService(options);
   const applied = [{
+    billingMode: 'ENFORCE' as const,
     charge: catalog.find('POST', '/paid/123')!.charges[0],
     reservation: {
       reservationId: 'res_1', remainingBalance: 90, leaseToken: 'lease_1',
@@ -32,15 +34,16 @@ describe('catalog-driven CreditBoundaryMiddleware', () => {
         { planId: 'plan-1', amount: 10, planBalanceAfter: 90 },
       ],
       expiresAt: Date.now() + 60_000, existing: false, autoRecover: true,
+      environment: 'PROD' as const, billingMode: 'ENFORCE' as const,
       settlementMode: 'IMMEDIATE' as const,
     },
   }];
-  const executor = { reserve: jest.fn(), rollbackAll: jest.fn() };
+  const executor = { apply: jest.fn(), rollbackAll: jest.fn() };
   const middleware = new CreditBoundaryMiddleware(catalog, executor as any, options);
 
   beforeEach(() => {
     jest.clearAllMocks();
-    executor.reserve.mockResolvedValue(applied);
+    executor.apply.mockResolvedValue(applied);
     executor.rollbackAll.mockResolvedValue(undefined);
   });
 
@@ -73,6 +76,6 @@ describe('catalog-driven CreditBoundaryMiddleware', () => {
       next,
     );
     expect(next).toHaveBeenCalled();
-    expect(executor.reserve).not.toHaveBeenCalled();
+    expect(executor.apply).not.toHaveBeenCalled();
   });
 });

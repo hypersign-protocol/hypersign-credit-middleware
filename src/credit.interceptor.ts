@@ -27,7 +27,7 @@ import {
   CreditBoundaryState,
 } from './credit-boundary.middleware';
 import {
-  AppliedCreditReservation,
+  AppliedCreditAction,
   CreditPolicyExecutor,
 } from './credit-policy.executor';
 import { CreditService } from './credit.service';
@@ -41,7 +41,7 @@ export const CREDIT_REQUEST_STATE = Symbol('CREDIT_REQUEST_STATE');
 
 export interface CreditRequestState {
   route: { method: string; path: string; operation: string };
-  reservations: AppliedCreditReservation[];
+  actions: AppliedCreditAction[];
 }
 
 interface CreditRequest {
@@ -77,21 +77,21 @@ export class CreditInterceptor implements NestInterceptor {
 
     const requestContext = this.options.requestContextResolver(request);
     const boundary = request[CREDIT_BOUNDARY_STATE];
-    const reservationPromise = boundary
+    const actionPromise = boundary
       ? this.claimBoundary(route, requestContext, boundary)
-      : this.executor.reserve(route, requestContext);
+      : this.executor.apply(route, requestContext);
 
-    return from(reservationPromise).pipe(
-      mergeMap((reservations) => {
+    return from(actionPromise).pipe(
+      mergeMap((actions) => {
         request[CREDIT_REQUEST_STATE] = {
           route: { method: route.method, path: route.path, operation: route.operation },
-          reservations,
+          actions,
         };
         const controllerResult = defer(() => next.handle());
         return controllerResult.pipe(
-          concatWith(defer(() => this.commitImmediate(reservations, boundary))),
+          concatWith(defer(() => this.commitImmediate(actions, boundary))),
           catchError((error: unknown) => this.rollbackAndRethrow(
-            reservations,
+            actions,
             boundary,
             error,
           )),
@@ -104,24 +104,24 @@ export class CreditInterceptor implements NestInterceptor {
     route: ResolvedCreditCatalogRoute,
     requestContext: CreditRequestContext,
     boundary: CreditBoundaryState,
-  ): Promise<AppliedCreditReservation[]> {
+  ): Promise<AppliedCreditAction[]> {
     if (boundary.route.method !== route.method || boundary.route.path !== route.path) {
       throw new CreditCatalogMismatchException('early boundary route changed before interceptor');
     }
-    const reservations = await this.executor.claim(
+    const actions = await this.executor.claim(
       route,
       requestContext,
-      boundary.reservations,
+      boundary.actions,
     );
     boundary.claimedByInterceptor = true;
-    return reservations;
+    return actions;
   }
 
   private commitImmediate(
-    reservations: AppliedCreditReservation[],
+    actions: AppliedCreditAction[],
     boundary?: CreditBoundaryState,
   ): Observable<never> {
-    return from(this.commitSequentially(reservations)).pipe(
+    return from(this.commitSequentially(actions)).pipe(
       mergeMap(() => {
         if (boundary) boundary.finalized = true;
         return EMPTY;
@@ -129,8 +129,10 @@ export class CreditInterceptor implements NestInterceptor {
     );
   }
 
-  private async commitSequentially(reservations: AppliedCreditReservation[]): Promise<void> {
-    for (const { charge, reservation } of reservations) {
+  private async commitSequentially(actions: AppliedCreditAction[]): Promise<void> {
+    for (const action of actions) {
+      if (action.billingMode !== 'ENFORCE') continue;
+      const { charge, reservation } = action;
       if (charge.settlementMode !== 'IMMEDIATE') continue;
       if (!await this.credits.commit(reservation.reservationId)) {
         throw new ServiceUnavailableException(
@@ -141,16 +143,16 @@ export class CreditInterceptor implements NestInterceptor {
   }
 
   private rollbackAndRethrow(
-    reservations: AppliedCreditReservation[],
+    actions: AppliedCreditAction[],
     boundary: CreditBoundaryState | undefined,
     error: unknown,
   ): Observable<never> {
     const reason = error instanceof Error ? error.message : String(error);
     this.logger.warn(
-      `Request execution or credit settlement failed; rolling back ` +
-      `${reservations.length} reservation(s) (reason=${reason})`,
+      `Request execution or credit settlement failed; finalizing ` +
+      `${actions.length} credit action(s) (reason=${reason})`,
     );
-    return from(this.executor.rollbackAll(reservations, reason)).pipe(
+    return from(this.executor.rollbackAll(actions, reason)).pipe(
       catchError((rollbackError: unknown) => {
         const message = rollbackError instanceof Error
           ? rollbackError.message

@@ -1,30 +1,25 @@
 import { MiddlewareConsumer, Module, NestModule } from '@nestjs/common';
-import { CreditBoundaryMiddleware, CreditModule } from '../src';
+import { ScheduleModule } from '@nestjs/schedule';
 import {
-  CREDIT_BULLMQ_PROVIDER,
-  ExampleBullMqModule,
-  ExampleBullMqProvider,
-} from './bullmq.module';
+  CreditBoundaryMiddleware,
+  CreditEnvironment,
+  CreditModule,
+} from '../src';
 import { ExampleDemoController } from './demo.controller';
 import { EarlyReturnMiddleware } from './early-return.middleware';
-import { CREDIT_EVENT_STREAM_REDIS, RedisModule } from './redis.module';
-import Redis from 'ioredis';
+import { RedisModule } from './redis.module';
+import { CreditRecoveryScheduler } from './recovery.scheduler';
 import { RequestContextMiddleware } from './request-context.middleware';
 
 @Module({
   imports: [
+    ScheduleModule.forRoot(),
     RedisModule,
-    ExampleBullMqModule,
     CreditModule.forRootAsync({
-      imports: [RedisModule, ExampleBullMqModule],
-      inject: [CREDIT_BULLMQ_PROVIDER, CREDIT_EVENT_STREAM_REDIS],
-      useFactory: (bullMq: ExampleBullMqProvider, streamClient: Redis) => ({
+      imports: [RedisModule],
+      useFactory: () => ({
         keyPrefix: 'credit-example',
         redisHashTag: 'credit-example',
-        leaseMs: 10_000, // Short only so orphan recovery is easy to demonstrate
-        retentionMs: 60 * 60 * 1_000,
-        criticalBalance: 20,
-        bullMq: { provider: bullMq, streamClient },
         requestContextResolver: (request: unknown) => {
           const value = request as {
             creditSubject?: {
@@ -33,16 +28,19 @@ import { RequestContextMiddleware } from './request-context.middleware';
               creditType: string;
             };
             requestId?: string;
+            creditEnvironment?: CreditEnvironment;
           };
           return {
             subject: value.creditSubject ?? { appId: '' },
             requestId: value.requestId,
+            environment: value.creditEnvironment as CreditEnvironment,
           };
         },
       }),
     }),
   ],
   controllers: [ExampleDemoController],
+  providers: [CreditRecoveryScheduler],
 })
 export class AppModule implements NestModule {
   configure(consumer: MiddlewareConsumer): void {

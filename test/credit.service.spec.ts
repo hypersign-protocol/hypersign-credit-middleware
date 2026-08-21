@@ -13,6 +13,7 @@ import {
   GET_PLANS_SCRIPT,
   GET_RESERVATION_SCRIPT,
   GRANT_SCRIPT,
+  OBSERVE_SCRIPT,
   RECOVER_SCRIPT,
   REMOVE_EXPIRATION_SCRIPT,
   RENEW_SCRIPT,
@@ -51,6 +52,7 @@ class PlanRedis {
     const argv = args.slice(numberOfKeys).map(String);
 
     if (script === GRANT_SCRIPT) return this.grant(keys, argv);
+    if (script === OBSERVE_SCRIPT) return this.observe(keys, argv);
     if (script === RESERVE_SCRIPT) return this.reserve(keys, argv);
     if (script === COMMIT_SCRIPT) return this.commit(keys, argv);
     if (script === ROLLBACK_SCRIPT) return this.refund(keys, argv, false);
@@ -81,6 +83,7 @@ class PlanRedis {
         grantedAt: Number(this.hash(keys[3]).get(planId)),
         referenceId: this.hash(keys[4]).get(planId),
         status: this.hash(keys[5]).get(planId),
+        criticalBalance: Number(this.hash(keys[6]).get(planId)),
       })));
     }
     throw new Error('Unexpected script');
@@ -106,7 +109,8 @@ class PlanRedis {
     if (existing) {
       if (existing !== amount || this.hash(keys[4]).get(planId) !== expiresAt ||
           this.hash(keys[5]).get(planId) !== grantedAt ||
-          this.hash(keys[6]).get(planId) !== argv[10]) return [-1];
+          this.hash(keys[6]).get(planId) !== argv[10] ||
+          this.hash(keys[13]).get(planId) !== argv[17]) return [-1];
       return [this.strings.get(keys[0]) ?? 0,
         Number(this.hash(keys[3]).get(planId) ?? 0), 1];
     }
@@ -129,19 +133,46 @@ class PlanRedis {
     this.hash(keys[6]).set(planId, argv[10]);
     this.hash(keys[7]).set(planId, 'ACTIVE');
     this.hash(keys[8]).set(planId, argv[16]);
+    this.hash(keys[13]).set(planId, argv[17]);
     this.hash(keys[9]).set('scopeId', argv[5]);
     this.hash(keys[10]).set('planId', planId);
     this.hash(keys[10]).set('scopeId', argv[5]);
     this.zset(keys[11]).set(argv[16], Number(expiresAt));
-    this.events.push({ type: 'CREDIT_GRANTED', planId, amount: Number(amount), balanceAfter: balance });
+    this.events.push({
+      type: 'CREDIT_GRANTED', planId, amount: Number(amount),
+      criticalBalance: Number(argv[17]), balanceAfter: balance,
+    });
     return [balance, Number(amount), 0];
+  }
+
+  private observe(keys: string[], argv: string[]) {
+    const existing = this.hashes.get(keys[0]);
+    if (existing?.has('eventId')) {
+      if (existing.get('amount') !== argv[9] ||
+          existing.get('operation') !== argv[8] ||
+          existing.get('environment') !== argv[10]) return [-1];
+      return [existing.get('eventId')!, 1];
+    }
+    const eventId = `${this.events.length + 1}-0`;
+    this.hashes.set(keys[0], new Map(Object.entries({
+      eventId, amount: argv[9], operation: argv[8], environment: argv[10],
+    })));
+    this.events.push({
+      type: 'CREDIT_OBSERVED', timestamp: Number(argv[0]), serviceType: argv[1],
+      scopeId: argv[2], appId: argv[3], tenantId: argv[4], appType: argv[5],
+      creditType: argv[6], requestId: argv[7], operation: argv[8],
+      requestedAmount: Number(argv[9]), deductedAmount: 0,
+      environment: argv[10], billingMode: 'OBSERVE', eventId,
+    });
+    return [eventId, 0];
   }
 
   private reserve(keys: string[], argv: string[]) {
     const request = this.hashes.get(keys[8]);
     if (request?.has('reservationId')) {
       if (request.get('amount') !== argv[0] || request.get('settlementMode') !== argv[12] ||
-          request.get('operation') !== argv[13] || request.get('autoRecover') !== argv[14]) return [-2];
+          request.get('operation') !== argv[13] || request.get('autoRecover') !== argv[14] ||
+          request.get('environment') !== argv[18]) return [-2];
       return [request.get('reservationId')!, request.get('remainingBalance')!,
         request.get('expiresAt')!, 1, request.get('leaseToken')!,
         request.get('autoRecover')!, request.get('allocations')!];
@@ -166,7 +197,7 @@ class PlanRedis {
       if (needed <= 0) break;
       const available = Number(this.hash(keys[2]).get(planId) ?? 0);
       if (available <= 0) continue;
-      if (allocations.length >= Number(argv[17])) return [-4];
+      if (allocations.length >= Number(argv[16])) return [-4];
       const amount = Math.min(available, needed);
       allocations.push({ planId, amount });
       needed -= amount;
@@ -192,7 +223,8 @@ class PlanRedis {
       appType: argv[5], creditType: argv[6], requestId: argv[7], amount: argv[0],
       remainingBalance: String(wallet), status: 'RESERVED', leaseToken: argv[10],
       createdAt: argv[8], expiresAt: String(expiresAt), version: '1',
-      settlementMode: argv[12], operation: argv[13], autoRecover: argv[14], allocations: json,
+      settlementMode: argv[12], operation: argv[13], autoRecover: argv[14],
+      environment: argv[18], allocations: json,
     };
     this.hashes.set(keys[7], new Map(Object.entries(values)));
     this.hashes.set(keys[8], new Map(Object.entries(values)));
@@ -200,6 +232,7 @@ class PlanRedis {
     allocations.forEach((allocation, index) => this.events.push({
       type: 'RESERVED', reservationId: argv[1], planId: allocation.planId,
       amount: allocation.amount, allocationIndex: index, allocationCount: allocations.length,
+      environment: argv[18], billingMode: 'ENFORCE',
     }));
     return [argv[1], wallet, expiresAt, 0, argv[10], argv[14], json];
   }
@@ -216,7 +249,18 @@ class PlanRedis {
     allocations.forEach((allocation: any, index: number) => this.events.push({
       type: 'COMMITTED', reservationId: argv[1], planId: allocation.planId,
       amount: allocation.amount, allocationIndex: index, allocationCount: allocations.length,
+      environment: reservation.get('environment'), billingMode: 'ENFORCE',
     }));
+    allocations.forEach((allocation: any) => {
+      const planBalanceAfter = Number(this.hash(keys[4]).get(allocation.planId) ?? 0);
+      const threshold = Number(this.hash(keys[5]).get(allocation.planId) ?? 0);
+      if (planBalanceAfter <= threshold) {
+        this.events.push({
+          type: 'CRITICAL_BALANCE', planId: allocation.planId,
+          planBalanceAfter, threshold, balanceAfter: this.strings.get(keys[6]) ?? 0,
+        });
+      }
+    });
     return [1];
   }
 
@@ -260,6 +304,7 @@ class PlanRedis {
     outcomes.forEach((outcome: any) => this.events.push({
       type: argv[0], reservationId: argv[3], planId: outcome.planId,
       restoredAmount: outcome.restoredAmount, expiredAmount: outcome.expiredAmount,
+      environment: reservation.get('environment'), billingMode: 'ENFORCE',
     }));
     return [1, reservation.get('scopeId')!, reservation.get('appId')!,
       reservation.get('tenantId')!, reservation.get('appType')!,
@@ -311,15 +356,21 @@ describe('CreditService FIFO recharge plans', () => {
     redis = new PlanRedis();
     service = new CreditService(redis, {
       ...DEFAULT_CREDIT_OPTIONS,
-      catalog: { catalogId: 'kyc', version: '1', routes: [] },
+      catalog: { serviceType: 'kyc', version: '1', routes: [] },
     });
   });
 
   afterEach(() => jest.restoreAllMocks());
 
-  const grant = (planId: string, amount: number, grantedAt: number, expiresAt: number) =>
+  const grant = (
+    planId: string,
+    amount: number,
+    grantedAt: number,
+    expiresAt: number,
+    criticalBalance = 0,
+  ) =>
     service.grant({
-      subject, planId, amount, grantedAt, expiresAt,
+      subject, planId, amount, criticalBalance, grantedAt, expiresAt,
       referenceId: `reference-${planId}`,
     });
 
@@ -331,14 +382,49 @@ describe('CreditService FIFO recharge plans', () => {
     expect(await service.getBalance(subject)).toBe(100);
   });
 
+  it('records an idempotent DEV observation without creating or changing a wallet', async () => {
+    const input = {
+      subject,
+      requestId: 'dev-request:api',
+      amount: 10,
+      operation: 'POST /api/verify',
+      environment: 'DEV' as const,
+    };
+    await expect(service.observe(input)).resolves.toMatchObject({
+      eventId: '1-0', existing: false, requestedAmount: 10,
+      deductedAmount: 0, environment: 'DEV', billingMode: 'OBSERVE',
+    });
+    await expect(service.observe(input)).resolves.toMatchObject({
+      eventId: '1-0', existing: true,
+    });
+    await expect(service.observe({ ...input, amount: 11 }))
+      .rejects.toBeInstanceOf(BadRequestException);
+    expect(await service.getBalance(subject)).toBeNull();
+    expect(await service.getPlans(subject)).toEqual([]);
+    expect(redis.events).toEqual([
+      expect.objectContaining({
+        type: 'CREDIT_OBSERVED', requestedAmount: 10, deductedAmount: 0,
+        environment: 'DEV', billingMode: 'OBSERVE',
+      }),
+    ]);
+  });
+
+  it('rejects using the observation API for production traffic', async () => {
+    await expect(service.observe({
+      subject, amount: 10, environment: 'PROD' as any,
+    })).rejects.toThrow('observe() supports only the DEV environment');
+  });
+
   it('deduplicates an exact plan retry and rejects changed semantics', async () => {
     const input = {
       subject, planId: 'plan-1', amount: 100, grantedAt: clock - 100,
-      expiresAt: clock + 10_000, referenceId: 'reference-plan-1',
+      expiresAt: clock + 10_000, referenceId: 'reference-plan-1', criticalBalance: 20,
     };
     expect((await service.grant(input)).existing).toBe(false);
     expect((await service.grant(input)).existing).toBe(true);
     await expect(service.grant({ ...input, amount: 101 }))
+      .rejects.toBeInstanceOf(BadRequestException);
+    await expect(service.grant({ ...input, criticalBalance: 21 }))
       .rejects.toBeInstanceOf(BadRequestException);
     expect(await service.getBalance(subject)).toBe(100);
   });
@@ -348,11 +434,11 @@ describe('CreditService FIFO recharge plans', () => {
     await expect(service.grant({
       subject: { ...subject, appId: 'app-2' }, planId: 'plan-1', amount: 100,
       grantedAt: clock - 100, expiresAt: clock + 10_000,
-      referenceId: 'another-reference',
+      referenceId: 'another-reference', criticalBalance: 20,
     })).rejects.toThrow('planId is already owned by another wallet');
     await expect(service.grant({
       subject, planId: 'plan-2', amount: 100, grantedAt: clock - 100,
-      expiresAt: clock + 10_000, referenceId: 'reference-plan-1',
+      expiresAt: clock + 10_000, referenceId: 'reference-plan-1', criticalBalance: 20,
     })).rejects.toThrow('referenceId is already assigned to another plan');
   });
 
@@ -360,16 +446,47 @@ describe('CreditService FIFO recharge plans', () => {
     await grant('old-plan', 10, clock - 200, clock + 10_000);
     await grant('new-plan', 50, clock - 100, clock + 20_000);
     const reservation = await service.reserve({ subject, amount: 25, requestId: 'request-1' });
+    expect(reservation).toMatchObject({
+      environment: 'PROD', billingMode: 'ENFORCE',
+    });
     expect(reservation.allocations).toEqual([
       { planId: 'old-plan', amount: 10, planBalanceAfter: 0 },
       { planId: 'new-plan', amount: 15, planBalanceAfter: 35 },
     ]);
     expect(await service.commit(reservation.reservationId)).toBe(true);
+    expect(redis.events.filter((event) => event.type === 'RESERVED'))
+      .toEqual(expect.arrayContaining([
+        expect.objectContaining({ environment: 'PROD', billingMode: 'ENFORCE' }),
+      ]));
     expect(redis.events.filter((event) => event.type === 'COMMITTED')).toEqual([
-      expect.objectContaining({ planId: 'old-plan', amount: 10, allocationIndex: 0 }),
-      expect.objectContaining({ planId: 'new-plan', amount: 15, allocationIndex: 1 }),
+      expect.objectContaining({
+        planId: 'old-plan', amount: 10, allocationIndex: 0,
+        environment: 'PROD', billingMode: 'ENFORCE',
+      }),
+      expect.objectContaining({
+        planId: 'new-plan', amount: 15, allocationIndex: 1,
+        environment: 'PROD', billingMode: 'ENFORCE',
+      }),
     ]);
     expect(await service.getBalance(subject)).toBe(35);
+  });
+
+  it('stores immutable plan thresholds and emits critical balance only on commit', async () => {
+    await grant('plan-1', 100, clock - 100, clock + 10_000, 25);
+    expect(await service.getPlans(subject)).toEqual([
+      expect.objectContaining({ planId: 'plan-1', criticalBalance: 25 }),
+    ]);
+
+    const reservation = await service.reserve({ subject, amount: 80 });
+    expect(redis.events.filter((event) => event.type === 'CRITICAL_BALANCE')).toHaveLength(0);
+
+    await service.commit(reservation.reservationId);
+    const critical = redis.events.find((event) => event.type === 'CRITICAL_BALANCE');
+    expect(critical).toEqual(expect.objectContaining({
+      type: 'CRITICAL_BALANCE', planId: 'plan-1', planBalanceAfter: 20,
+      threshold: 25, balanceAfter: 20,
+    }));
+    expect(critical).not.toHaveProperty('balance');
   });
 
   it('does not partially deduct when combined plans are insufficient', async () => {

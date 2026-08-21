@@ -1,4 +1,4 @@
-import { ResolvedCreditOptions } from './credit.types';
+import { CreditEnvironment, ResolvedCreditOptions } from './credit.types';
 export {
   GET_BALANCE_SCRIPT,
   GET_RESERVATION_SCRIPT,
@@ -16,6 +16,7 @@ export const CREDIT_EVENT_NAMES = {
   PLAN_EXPIRED: 'credit.plan-expired',
   CREDIT_GRANTED: 'credit.granted',
   CRITICAL_BALANCE: 'credit.critical-balance',
+  CREDIT_OBSERVED: 'credit.observed',
   COMMAND_REJECTED: 'credit.command-rejected',
   GRANT_REQUESTED: 'credit.grant.requested',
   RESERVE_REQUESTED: 'credit.reserve.requested',
@@ -28,14 +29,22 @@ export type CreditEventName =
 
 export const DEFAULT_CREDIT_OPTIONS: ResolvedCreditOptions = {
   catalog: {
-    catalogId: 'unconfigured',
+    serviceType: 'unconfigured',
     version: '0',
     routes: [],
   },
   leaseMs: 60_000,
   retentionMs: 7 * 24 * 60 * 60 * 1_000,
   recoveryBatchSize: 100,
-  criticalBalance: 0,
+  transport: {
+    prefix: 'bull',
+    lifecycleQueueNames: ['credit.lifecycle'],
+    commandQueueName: 'credit.commands.unconfigured',
+    consumerGroup: 'credit-bull-relay:unconfigured',
+    batchSize: 100,
+    blockMs: 5_000,
+    pendingIdleMs: 30_000,
+  },
   maxActivePlans: 1_000,
   maxPlanAllocationsPerReservation: 100,
   keyPrefix: DEFAULT_KEY_PREFIX,
@@ -50,6 +59,7 @@ export const DEFAULT_CREDIT_OPTIONS: ResolvedCreditOptions = {
         appId?: string;
         id?: string;
         tenantId?: string;
+        environment?: CreditEnvironment;
       };
       requestId?: string;
     };
@@ -64,6 +74,7 @@ export const DEFAULT_CREDIT_OPTIONS: ResolvedCreditOptions = {
         tenantId: req.service?.tenantId,
       },
       requestId: req.requestId,
+      environment: req.service?.environment as CreditEnvironment,
     };
   },
 };

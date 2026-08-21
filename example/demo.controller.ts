@@ -85,12 +85,16 @@ export class ExampleDemoController {
   @Post("blockchain-operation")
   async blockchainOperation(@Req() req: any) {
     const state = getCreditRequestState(req);
-    const reservationId = state?.reservations.find(
+    const action = state?.actions.find(
       ({ charge }) => charge.settlementMode === "DEFERRED",
-    )?.reservation.reservationId;
+    );
+    const reservationId = action?.billingMode === 'ENFORCE'
+      ? action.reservation.reservationId
+      : undefined;
 
     return {
       reservationId,
+      billingMode: action?.billingMode,
     };
   }
 

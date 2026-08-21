@@ -19,14 +19,20 @@ async function removeVerificationKeys(redis, base) {
 }
 
 async function main() {
-  const redis = new Redis(process.env.REDIS_URL ?? 'redis://localhost:6379');
+  const redis = new Redis(process.env.REDIS_URL ?? 'redis://localhost:6379', {
+    lazyConnect: true,
+    connectTimeout: 2_000,
+    maxRetriesPerRequest: 1,
+    retryStrategy: () => null,
+  });
+  redis.on('error', () => undefined);
   const suffix = randomUUID();
   const keyPrefix = `credit-integration-${suffix}`;
   const redisHashTag = `credit-integration-${suffix}`;
   const base = `${keyPrefix}:v2:{${redisHashTag}}`;
   const options = {
     ...DEFAULT_CREDIT_OPTIONS,
-    catalog: { catalogId: 'integration', version: '1', routes: [] },
+    catalog: { serviceType: 'integration', version: '1', routes: [] },
     keyPrefix,
     redisHashTag,
     eventStreamKey: `${base}:events`,
@@ -37,16 +43,36 @@ async function main() {
   const now = Date.now();
 
   try {
+    await redis.connect();
+    const devSubject = { appId: 'app-dev', creditType: 'API_CREDIT' };
+    const observation = await credits.observe({
+      subject: devSubject,
+      requestId: 'request-dev',
+      amount: 7,
+      operation: 'integration-observation',
+      environment: 'DEV',
+    });
+    assert.equal(observation.deductedAmount, 0);
+    assert.equal(observation.existing, false);
+    assert.equal((await credits.observe({
+      subject: devSubject,
+      requestId: 'request-dev',
+      amount: 7,
+      operation: 'integration-observation',
+      environment: 'DEV',
+    })).existing, true);
+    assert.equal(await credits.getBalance(devSubject), null);
+
     assert.deepEqual(await credits.getPlans(subject), []);
     const oldGrant = {
       subject, planId: 'old-plan', amount: 10, grantedAt: now - 200,
-      expiresAt: now + 60_000, referenceId: 'payment-old',
+      expiresAt: now + 60_000, referenceId: 'payment-old', criticalBalance: 0,
     };
     await credits.grant(oldGrant);
     assert.equal((await credits.grant(oldGrant)).existing, true);
     await credits.grant({
       subject, planId: 'new-plan', amount: 50, grantedAt: now - 100,
-      expiresAt: now + 120_000, referenceId: 'payment-new',
+      expiresAt: now + 120_000, referenceId: 'payment-new', criticalBalance: 40,
     });
     const reservation = await credits.reserve({
       subject, amount: 25, requestId: 'request-1', operation: 'integration-test',
@@ -72,12 +98,12 @@ async function main() {
     await credits.grant({
       subject: rollbackSubject, planId: 'rollback-old', amount: 5,
       grantedAt: now - 200, expiresAt: now + 120_000,
-      referenceId: 'payment-rollback-old',
+      referenceId: 'payment-rollback-old', criticalBalance: 0,
     });
     await credits.grant({
       subject: rollbackSubject, planId: 'rollback-new', amount: 10,
       grantedAt: now - 100, expiresAt: now + 120_000,
-      referenceId: 'payment-rollback-new',
+      referenceId: 'payment-rollback-new', criticalBalance: 0,
     });
     const rollbackReservation = await credits.reserve({
       subject: rollbackSubject, amount: 8, requestId: 'request-rollback',
@@ -96,7 +122,7 @@ async function main() {
     await credits.grant({
       subject: expirySubject, planId: 'expiring-plan', amount: 20,
       grantedAt: now - 100, expiresAt: now + 1_000,
-      referenceId: 'payment-expiring',
+      referenceId: 'payment-expiring', criticalBalance: 0,
     });
     const expiryReservation = await credits.reserve({
       subject: expirySubject, amount: 10, requestId: 'request-expiry',
@@ -106,8 +132,12 @@ async function main() {
     assert.equal(await credits.getBalance(expirySubject), 0);
     process.stdout.write('Real Redis FIFO Lua verification passed\n');
   } finally {
-    await removeVerificationKeys(redis, base);
-    await redis.quit();
+    if (redis.status === 'ready') {
+      await removeVerificationKeys(redis, base);
+      await redis.quit();
+    } else {
+      redis.disconnect();
+    }
   }
 }
 

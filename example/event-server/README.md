@@ -4,7 +4,8 @@ This process represents trusted billing infrastructure outside the SDK-installed
 API server. It:
 
 - consumes plan-level lifecycle jobs from `credit.lifecycle`;
-- publishes schema-v2 commands to `credit.commands.<catalogId>`;
+- consumes DEV `credit.observed` usage jobs from the same lifecycle queue;
+- publishes schema-v3 commands to `credit.commands.<serviceType>`;
 - keeps a small in-memory event list only for demonstration.
 
 Start it beside one API example:
@@ -20,12 +21,13 @@ Create an API-credit recharge plan:
 curl -X POST http://localhost:3002/credit-commands/grant \
   -H 'content-type: application/json' \
   -d '{
-    "catalogId":"example-service",
+    "serviceType":"KYC_SERVICE",
     "appId":"user_123",
     "appType":"USER",
     "creditType":"API_CREDIT",
     "planId":"api-plan-001",
     "amount":100,
+    "criticalBalance":20,
     "grantedAt":1780000000000,
     "expiresAt":1900000000000,
     "referenceId":"payment-001",
@@ -42,6 +44,9 @@ curl 'http://localhost:3002/credit-events?limit=25'
 A split reservation produces separate `credit.reserved` and
 `credit.committed` jobs for every funding `planId`. Replace the in-memory store
 with an idempotent TimescaleDB consumer keyed by the envelope `eventId`.
+
+A DEV HTTP call produces `credit.observed` with `requestedAmount` and
+`deductedAmount: 0`; it does not produce reservation or settlement jobs.
 
 This service and the API server must use the same Redis/BullMQ configuration.
 Do not run a lifecycle worker inside the API server: workers on one BullMQ queue

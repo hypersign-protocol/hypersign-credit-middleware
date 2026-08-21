@@ -12,7 +12,9 @@ async function bootstrap(): Promise<void> {
   const port = Number(process.env.PORT ?? 3001);
   await app.listen(port);
   console.log(`Multi-module demo: http://localhost:${port}/api/v1`);
-  console.log('Use headers: x-business-id: business_123, x-request-id: any-unique-id');
+  console.log(
+    'Use headers: x-business-id, x-request-id, x-service-environment: PROD|DEV',
+  );
 }
 
 void bootstrap();

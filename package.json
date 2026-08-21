@@ -1,6 +1,6 @@
 {
   "name": "@hypersign-protocol/credit-middleware",
-  "version": "4.0.2",
+  "version": "5.0.0",
   "description": "Catalog-driven NestJS credit lifecycle SDK with Redis and BullMQ",
   "license": "ISC",
   "author": "",
@@ -45,6 +45,10 @@
     "@nestjs/core": ">=9 <12",
     "rxjs": ">=7 <8"
   },
+  "dependencies": {
+    "bullmq": "5.81.3",
+    "ioredis": "^5.7.0"
+  },
   "devDependencies": {
     "@nestjs/common": "^11.1.6",
     "@nestjs/core": "^11.1.6",
@@ -52,8 +56,6 @@
     "@nestjs/schedule": "6.1.3",
     "@types/jest": "^30.0.0",
     "@types/node": "26.2.0",
-    "bullmq": "5.81.3",
-    "ioredis": "^5.7.0",
     "jest": "^30.0.5",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.2",

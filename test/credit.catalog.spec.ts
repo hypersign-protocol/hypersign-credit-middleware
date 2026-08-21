@@ -7,28 +7,47 @@ import { resolveCreditOptions } from '../src/credit.module';
 
 const catalogOptions = (routes: any[]) => ({
   ...DEFAULT_CREDIT_OPTIONS,
-  catalog: { catalogId: 'catalog-test', version: '1', routes },
+  catalog: { serviceType: 'catalog-test', version: '1', routes },
 });
 
 describe('CreditCatalogService', () => {
   it('always uses the SDK-bundled KYC catalog', () => {
     const resolved = resolveCreditOptions({
       catalog: {
-        catalogId: 'attempted-override',
+        serviceType: 'attempted-override',
         version: '999',
         routes: [],
       },
     } as any);
 
-    expect(resolved.catalog.catalogId).toBe('KYC');
+    expect(resolved.catalog.serviceType).toBe('KYC_SERVICE');
     expect(resolved.catalog.routes.length).toBeGreaterThan(0);
+  });
+
+  it('enables internal transport defaults and supports explicit disablement', () => {
+    const defaults = resolveCreditOptions({});
+    expect(defaults.leaseMs).toBe(60_000);
+    expect(defaults.retentionMs).toBe(7 * 24 * 60 * 60 * 1_000);
+    expect(defaults.transport).toEqual({
+      prefix: 'bull',
+      lifecycleQueueNames: ['credit.lifecycle'],
+      commandQueueName: 'credit.commands.KYC_SERVICE',
+      consumerGroup: 'credit-bull-relay:KYC_SERVICE',
+      batchSize: 100,
+      blockMs: 5_000,
+      pendingIdleMs: 30_000,
+    });
+    expect(resolveCreditOptions({
+      transport: { prefix: ' credit-bull ' },
+    }).transport).toMatchObject({ prefix: 'credit-bull' });
+    expect(resolveCreditOptions({ transport: false }).transport).toBe(false);
   });
 
   it('normalizes the configured default URI version', () => {
     const catalog = new CreditCatalogService({
       ...DEFAULT_CREDIT_OPTIONS,
       catalog: {
-        catalogId: 'kyc', version: '1', defaultVersion: ' 1 ', routes: [],
+        serviceType: 'kyc', version: '1', defaultVersion: ' 1 ', routes: [],
       },
     });
     expect(catalog.defaultVersion).toBe('1');
@@ -107,7 +126,7 @@ describe('CreditCatalogAuditor', () => {
     const options = {
       ...catalogOptions([]),
       catalog: {
-        catalogId: 'catalog-test', version: '1', globalPrefix: 'api',
+        serviceType: 'catalog-test', version: '1', globalPrefix: 'api',
         defaultVersion: '1',
         routes: [{ method: 'GET', path: '/api/v1/items/:itemId', charges: [] }],
       },

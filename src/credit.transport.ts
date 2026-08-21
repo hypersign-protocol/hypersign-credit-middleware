@@ -9,22 +9,22 @@ import { randomUUID } from 'node:crypto';
 import { CreditCatalogService } from './credit.catalog';
 import { CREDIT_EVENT_NAMES, CreditEventName } from './credit.constants';
 import { CreditService } from './credit.service';
+import { CreditTransportInfrastructure } from './credit-transport.infrastructure';
 import {
   CREDIT_OPTIONS,
-  CREDIT_REDIS_CLIENT,
   CreditBullMqJob,
   CreditCommandEnvelope,
   CreditEventStreamClient,
-  CreditRedisClient,
   CreditSubject,
+  ResolvedCreditTransportOptions,
   ResolvedCreditOptions,
 } from './credit.types';
 
 export interface CreditLifecycleEventEnvelope {
   eventId: string;
-  schemaVersion: 2;
+  schemaVersion: 3;
   catalogVersion: string;
-  catalogId: string;
+  serviceType: string;
   event: Record<string, unknown>;
 }
 
@@ -35,10 +35,11 @@ const JOB_NAMES: Record<string, CreditEventName> = {
   EXPIRED: CREDIT_EVENT_NAMES.EXPIRED,
   PLAN_EXPIRED: CREDIT_EVENT_NAMES.PLAN_EXPIRED,
   CREDIT_GRANTED: CREDIT_EVENT_NAMES.CREDIT_GRANTED,
+  CREDIT_OBSERVED: CREDIT_EVENT_NAMES.CREDIT_OBSERVED,
   CRITICAL_BALANCE: CREDIT_EVENT_NAMES.CRITICAL_BALANCE,
 };
 
-/** Relays the transactional Redis Stream outbox to the supplied BullMQ queues. */
+/** Relays the transactional Redis Stream outbox through SDK-owned BullMQ queues. */
 @Injectable()
 export class CreditEventRelay implements OnApplicationBootstrap, OnApplicationShutdown {
   private readonly logger = new Logger(CreditEventRelay.name);
@@ -47,22 +48,17 @@ export class CreditEventRelay implements OnApplicationBootstrap, OnApplicationSh
   private readonly consumer = `${process.pid}-${randomUUID()}`;
 
   constructor(
-    @Inject(CREDIT_REDIS_CLIENT) private readonly operationRedis: CreditRedisClient,
     @Inject(CREDIT_OPTIONS) private readonly options: ResolvedCreditOptions,
     private readonly catalog: CreditCatalogService,
+    private readonly infrastructure: CreditTransportInfrastructure,
   ) {}
 
   async onApplicationBootstrap(): Promise<void> {
-    const config = this.options.bullMq;
+    const config = this.options.transport;
     if (!config) return;
-    if ((config.streamClient as unknown) === (this.operationRedis as unknown)) {
-      throw new TypeError(
-        'bullMq.streamClient must be a dedicated Redis connection; blocking reads ' +
-        'cannot share the credit operation connection',
-      );
-    }
-    await this.createGroup(config.streamClient, config.consumerGroup);
-    const claimed = await config.streamClient.xautoclaim(
+    const streamClient = this.infrastructure.streamClient();
+    await this.createGroup(streamClient, config.consumerGroup);
+    const claimed = await streamClient.xautoclaim(
       this.options.eventStreamKey,
       config.consumerGroup,
       this.consumer,
@@ -78,15 +74,17 @@ export class CreditEventRelay implements OnApplicationBootstrap, OnApplicationSh
 
   async onApplicationShutdown(): Promise<void> {
     this.running = false;
+    this.infrastructure.stopStreamReads();
     await this.loop;
   }
 
   private async run(): Promise<void> {
-    const config = this.options.bullMq!;
+    const config = this.config();
+    const streamClient = this.infrastructure.streamClient();
     const stream = this.options.eventStreamKey;
     while (this.running) {
       try {
-        const claimed = await config.streamClient.xautoclaim(
+        const claimed = await streamClient.xautoclaim(
           stream,
           config.consumerGroup,
           this.consumer,
@@ -97,7 +95,7 @@ export class CreditEventRelay implements OnApplicationBootstrap, OnApplicationSh
         );
         await this.publishEntries(this.claimedEntries(claimed));
         if (!this.running) break;
-        const response = await config.streamClient.xreadgroup(
+        const response = await streamClient.xreadgroup(
           'GROUP',
           config.consumerGroup,
           this.consumer,
@@ -114,7 +112,7 @@ export class CreditEventRelay implements OnApplicationBootstrap, OnApplicationSh
         if (!this.running) break;
         if (this.isMissingConsumerGroup(error)) {
           try {
-            await this.createGroup(config.streamClient, config.consumerGroup);
+            await this.createGroup(streamClient, config.consumerGroup);
             this.logger.warn(
               `Recreated missing Redis Stream consumer group ${config.consumerGroup}`,
             );
@@ -140,18 +138,19 @@ export class CreditEventRelay implements OnApplicationBootstrap, OnApplicationSh
   }
 
   private async publishEntries(entries: StreamEntry[]): Promise<void> {
-    const config = this.options.bullMq!;
+    const config = this.config();
+    const streamClient = this.infrastructure.streamClient();
     for (const [eventId, values] of entries) {
       const fields = pairs(values);
-      const streamCatalogId = fields.catalogId;
-      if (!streamCatalogId) {
+      const streamServiceType = fields.serviceType;
+      if (!streamServiceType) {
         this.logger.error(
-          `Credit stream event ${eventId} has no catalogId; leaving it pending`,
+          `Credit stream event ${eventId} has no serviceType; leaving it pending`,
         );
         continue;
       }
-      if (streamCatalogId !== this.catalog.catalogId) {
-        await config.streamClient.xack(
+      if (streamServiceType !== this.catalog.serviceType) {
+        await streamClient.xack(
           this.options.eventStreamKey,
           config.consumerGroup,
           eventId,
@@ -165,17 +164,17 @@ export class CreditEventRelay implements OnApplicationBootstrap, OnApplicationSh
       }
       const envelope: CreditLifecycleEventEnvelope = {
         eventId,
-        schemaVersion: 2,
+        schemaVersion: 3,
         catalogVersion: this.catalog.version,
-        catalogId: this.catalog.catalogId,
+        serviceType: this.catalog.serviceType,
         event: normalizeEvent(fields),
       };
       for (const queueName of config.lifecycleQueueNames) {
-        await config.provider.add(queueName, jobName, envelope, {
-          jobId: `${this.catalog.catalogId}-${eventId}`,
+        await this.infrastructure.add(queueName, jobName, envelope, {
+          jobId: `${this.catalog.serviceType}-${eventId}`,
         });
       }
-      await config.streamClient.xack(
+      await streamClient.xack(
         this.options.eventStreamKey,
         config.consumerGroup,
         eventId,
@@ -210,9 +209,14 @@ export class CreditEventRelay implements OnApplicationBootstrap, OnApplicationSh
     }
     return result;
   }
+
+  private config(): ResolvedCreditTransportOptions {
+    if (!this.options.transport) throw new Error('Credit transport is disabled');
+    return this.options.transport;
+  }
 }
 
-/** Consumes trusted service-specific credit commands from the supplied BullMQ provider. */
+/** Consumes trusted service-specific credit commands through an SDK-owned worker. */
 @Injectable()
 export class CreditCommandWorker implements OnApplicationBootstrap, OnApplicationShutdown {
   private readonly logger = new Logger(CreditCommandWorker.name);
@@ -222,12 +226,13 @@ export class CreditCommandWorker implements OnApplicationBootstrap, OnApplicatio
     @Inject(CREDIT_OPTIONS) private readonly options: ResolvedCreditOptions,
     private readonly catalog: CreditCatalogService,
     private readonly credits: CreditService,
+    private readonly infrastructure: CreditTransportInfrastructure,
   ) {}
 
   async onApplicationBootstrap(): Promise<void> {
-    const config = this.options.bullMq;
-    if (!config?.commandQueueName) return;
-    this.worker = await config.provider.createWorker(
+    const config = this.options.transport;
+    if (!config) return;
+    this.worker = await this.infrastructure.createWorker(
       config.commandQueueName,
       (job) => this.process(job),
     );
@@ -247,6 +252,10 @@ export class CreditCommandWorker implements OnApplicationBootstrap, OnApplicatio
             subject: this.subject(command.payload.subject),
             planId: requiredString(command.payload.planId, 'payload.planId'),
             amount: positiveInteger(command.payload.amount, 'payload.amount'),
+            criticalBalance: nonNegativeInteger(
+              command.payload.criticalBalance,
+              'payload.criticalBalance',
+            ),
             grantedAt: positiveInteger(command.payload.grantedAt, 'payload.grantedAt'),
             expiresAt: positiveInteger(command.payload.expiresAt, 'payload.expiresAt'),
             referenceId: requiredString(
@@ -281,8 +290,8 @@ export class CreditCommandWorker implements OnApplicationBootstrap, OnApplicatio
     } catch (error) {
       await this.publishRejection(command ?? {
         commandId: typeof job.id === 'string' && job.id ? job.id : randomUUID(),
-        schemaVersion: 2,
-        catalogId: this.catalog.catalogId,
+        schemaVersion: 3,
+        serviceType: this.catalog.serviceType,
         payload: {},
       }, job.name, error);
       throw error;
@@ -291,13 +300,13 @@ export class CreditCommandWorker implements OnApplicationBootstrap, OnApplicatio
 
   private command(job: CreditBullMqJob): CreditCommandEnvelope {
     const value = job.data as Partial<CreditCommandEnvelope> | undefined;
-    if (!value || value.schemaVersion !== 2 || !value.payload) {
+    if (!value || value.schemaVersion !== 3 || !value.payload) {
       throw new TypeError('Invalid credit command envelope');
     }
     const commandId = requiredString(value.commandId ?? job.id, 'commandId');
-    if (value.catalogId !== this.catalog.catalogId) {
+    if (value.serviceType !== this.catalog.serviceType) {
       throw new TypeError(
-        `Command catalogId ${String(value.catalogId)} does not match ${this.catalog.catalogId}`,
+        `Command serviceType ${String(value.serviceType)} does not match ${this.catalog.serviceType}`,
       );
     }
     return { ...value, commandId } as CreditCommandEnvelope;
@@ -334,19 +343,20 @@ export class CreditCommandWorker implements OnApplicationBootstrap, OnApplicatio
     commandName: string,
     error: unknown,
   ): Promise<void> {
-    const config = this.options.bullMq!;
+    const config = this.options.transport;
+    if (!config) throw new Error('Credit transport is disabled');
     const reason = error instanceof Error ? error.message : String(error);
     this.logger.error(`Rejected credit command ${command.commandId}: ${reason}`);
     for (const queueName of config.lifecycleQueueNames) {
-      await config.provider.add(queueName, CREDIT_EVENT_NAMES.COMMAND_REJECTED, {
-        schemaVersion: 2,
-        catalogId: this.catalog.catalogId,
+      await this.infrastructure.add(queueName, CREDIT_EVENT_NAMES.COMMAND_REJECTED, {
+        schemaVersion: 3,
+        serviceType: this.catalog.serviceType,
         planId: optionalString(command.payload.planId),
         commandId: command.commandId,
         commandName,
         reason,
         timestamp: Date.now(),
-      }, { jobId: `${this.catalog.catalogId}-${command.commandId}-rejected` });
+      }, { jobId: `${this.catalog.serviceType}-${command.commandId}-rejected` });
     }
   }
 }
@@ -364,8 +374,9 @@ function pairs(values: string[]): Record<string, string> {
 function normalizeEvent(fields: Record<string, string>): Record<string, unknown> {
   const numeric = new Set([
     'timestamp', 'amount', 'totalAmount', 'balanceAfter', 'planBalanceAfter',
-    'balance', 'threshold', 'expiresAt', 'grantedAt', 'expiredAmount',
-    'restoredAmount', 'allocationIndex', 'allocationCount',
+    'threshold', 'expiresAt', 'grantedAt', 'expiredAmount',
+    'restoredAmount', 'allocationIndex', 'allocationCount', 'criticalBalance',
+    'requestedAmount', 'deductedAmount',
   ]);
   const result: Record<string, unknown> = {};
   for (const [name, value] of Object.entries(fields)) {
@@ -396,6 +407,13 @@ function optionalString(value: unknown): string | undefined {
 function positiveInteger(value: unknown, field: string): number {
   if (!Number.isSafeInteger(value) || Number(value) <= 0) {
     throw new TypeError(`${field} must be a positive safe integer`);
+  }
+  return Number(value);
+}
+
+function nonNegativeInteger(value: unknown, field: string): number {
+  if (!Number.isSafeInteger(value) || Number(value) < 0) {
+    throw new TypeError(`${field} must be a non-negative safe integer`);
   }
   return Number(value);
 }

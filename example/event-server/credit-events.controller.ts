@@ -5,12 +5,13 @@ import { ExampleBullMqProvider } from '../bullmq.module';
 import { CreditEventStore } from './event-store.service';
 
 interface GrantCreditRequest {
-  catalogId?: unknown;
+  serviceType?: unknown;
   tenantId?: unknown;
   appId?: unknown;
   appType?: unknown;
   creditType?: unknown;
   amount?: unknown;
+  criticalBalance?: unknown;
   planId?: unknown;
   grantedAt?: unknown;
   expiresAt?: unknown;
@@ -36,22 +37,26 @@ export class CreditEventsController {
 
   @Post('credit-commands/grant')
   async grant(@Body() body: GrantCreditRequest) {
-    const catalogId = requiredString(body.catalogId, 'catalogId');
+    const serviceType = requiredString(body.serviceType, 'serviceType');
     const appId = requiredString(body.appId, 'appId');
     const creditType = requiredString(body.creditType, 'creditType');
     const referenceId = requiredString(body.referenceId, 'referenceId');
     const amount = positiveInteger(body.amount, 'amount');
+    const criticalBalance = nonNegativeInteger(
+      body.criticalBalance,
+      'criticalBalance',
+    );
     const planId = requiredString(body.planId, 'planId');
     const grantedAt = positiveInteger(body.grantedAt, 'grantedAt');
     const expiresAt = positiveInteger(body.expiresAt, 'expiresAt');
     const tenantId = optionalString(body.tenantId);
     const appType = optionalString(body.appType);
     const commandId = randomUUID();
-    const queue = `credit.commands.${catalogId}`;
+    const queue = `credit.commands.${serviceType}`;
     await this.bullMq.add(queue, CREDIT_EVENT_NAMES.GRANT_REQUESTED, {
-      schemaVersion: 2,
+      schemaVersion: 3,
       commandId,
-      catalogId,
+      serviceType,
       source: 'example-credit-event-server',
       requestedAt: new Date().toISOString(),
       payload: {
@@ -62,6 +67,7 @@ export class CreditEventsController {
           ...(appType ? { appType } : {}),
         },
         amount,
+        criticalBalance,
         planId,
         grantedAt,
         expiresAt,
@@ -88,6 +94,13 @@ function optionalString(value: unknown): string | undefined {
 function positiveInteger(value: unknown, field: string): number {
   if (!Number.isSafeInteger(value) || Number(value) <= 0) {
     throw new BadRequestException(`${field} must be a positive safe integer`);
+  }
+  return Number(value);
+}
+
+function nonNegativeInteger(value: unknown, field: string): number {
+  if (!Number.isSafeInteger(value) || Number(value) < 0) {
+    throw new BadRequestException(`${field} must be a non-negative safe integer`);
   }
   return Number(value);
 }

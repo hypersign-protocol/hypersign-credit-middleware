@@ -35,7 +35,7 @@ export class CreditCatalogMismatchException extends HttpException {
 /** Normalizes, validates, and matches the one authoritative API price catalog. */
 @Injectable()
 export class CreditCatalogService {
-  readonly catalogId: string;
+  readonly serviceType: string;
   readonly version: string;
   readonly defaultVersion?: string;
   readonly routes: readonly ResolvedCreditCatalogRoute[];
@@ -43,7 +43,7 @@ export class CreditCatalogService {
 
   constructor(@Inject(CREDIT_OPTIONS) options: ResolvedCreditOptions) {
     const catalog = options.catalog;
-    this.catalogId = required(catalog.catalogId, 'catalog.catalogId');
+    this.serviceType = required(catalog.serviceType, 'catalog.serviceType');
     this.version = required(catalog.version, 'catalog.version');
     if (catalog.versioning !== undefined &&
         catalog.versioning !== 'URI' && catalog.versioning !== 'NONE') {

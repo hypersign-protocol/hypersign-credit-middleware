@@ -3,7 +3,7 @@
 For command-to-event sequence diagrams and complete execution algorithms, see
 the [technical architecture](technical-architecture.md).
 
-Version 4 uses a versioned base:
+Version 5 uses a versioned base:
 
 ```text
 <keyPrefix>:v2:{<redisHashTag>}
@@ -19,7 +19,7 @@ tenantId, appType, appId, creditType
 ```
 
 Each dimension records whether it is absent and URI-encodes its value. The
-catalog ID is transport identity and is not part of wallet scope.
+service type is transport identity and is not part of wallet scope.
 
 ## Deterministic construction
 
@@ -69,12 +69,14 @@ API instances and recovery workers.
 | Grant time | `plans:granted-at:<scope>` | Hash |
 | Business reference | `plans:reference:<scope>` | Hash |
 | Plan status | `plans:status:<scope>` | Hash |
+| Critical balance | `plans:critical-balance:<scope>` | Hash (`planId -> integer`) |
 | Expiration member | `plans:expiration-member:<scope>` | Hash |
 | Global plan ownership | `plan-owner:<planId>` | Hash |
 | Grant idempotency | `grant:<referenceId>` | Hash |
 | Plan expiry index | `plan:expirations` | Sorted set |
 | Reservation | `reservation:<reservationId>` | Hash |
 | Request idempotency | `request:<scope>:<requestId>` | Hash |
+| DEV observation idempotency | `observation:<scope>:<requestId>` | Hash |
 | Reservation expiry | `reservation:expirations` | Sorted set |
 | Transactional outbox | `events` | Stream |
 
@@ -100,9 +102,10 @@ DEPLETED -> EXPIRED      expiry while reserved
 ACTIVE/DEPLETED -> REVOKED (reserved for an explicit future command)
 ```
 
-A grant creates all plan attributes and the aggregate balance in one Lua call.
-The same call appends `CREDIT_GRANTED`. Grant idempotency records are persistent;
-they must not expire while a delayed BullMQ retry could reapply a payment.
+A grant creates all plan attributes, including its immutable low-balance
+threshold, and the aggregate balance in one Lua call. The same call appends
+`CREDIT_GRANTED`. Grant idempotency records are persistent; they must not expire
+while a delayed BullMQ retry could reapply a payment.
 
 ## Reservation state
 
@@ -112,7 +115,7 @@ A reservation stores:
 reservationId, scopeId, appId, tenantId, appType, creditType,
 requestId, total amount, aggregate balance after reservation,
 status, leaseToken, createdAt, expiresAt, version,
-settlementMode, operation, autoRecover, allocations JSON
+settlementMode, operation, autoRecover, environment=PROD, allocations JSON
 ```
 
 Allocation JSON is an array of:
@@ -130,6 +133,21 @@ It is immutable. Settlement always uses this stored array.
 Finalized reservation and request records receive `retentionMs`. Active records
 have no TTL. Only `autoRecover=true` reservations are added to the reservation
 expiry index.
+
+## DEV observation state
+
+A DEV catalog charge never creates a reservation and never reads or mutates
+wallet or plan keys. One Lua transaction appends `CREDIT_OBSERVED` to the outbox
+and stores this short idempotency hash:
+
+```text
+eventId, amount, operation, environment=DEV
+```
+
+The hash receives `retentionMs`. An exact retry returns the original event ID
+without appending another event; reuse with a different amount, operation, or
+environment is rejected. Environment is deliberately absent from wallet scope,
+so observation cannot create a parallel DEV balance.
 
 ## Expiration indexes
 
@@ -154,11 +172,10 @@ it. BullMQ itself creates keys such as:
 
 ```text
 bull:credit.lifecycle:*
-bull:credit.commands.<catalogId>:*
+bull:credit.commands.<serviceType>:*
 ```
 
-These physical names assume BullMQ's default `prefix: 'bull'`. A host adapter
-may configure another BullMQ prefix. The SDK's `keyPrefix` and
+These physical names use BullMQ's default `prefix: 'bull'`. The SDK's `keyPrefix` and
 `redisHashTag` affect only SDK-owned state and Stream keys; they do not affect
 BullMQ keys.
 
@@ -171,20 +188,20 @@ Default queue and relay identifiers are:
 
 ```text
 lifecycle queue:       credit.lifecycle
-command queue:         credit.commands.<catalogId>
-Stream consumer group: credit-bull-relay:<catalogId>
+command queue:         credit.commands.<serviceType>
+Stream consumer group: credit-bull-relay:<serviceType>
 ```
 
 Lifecycle BullMQ job IDs are deterministic:
 
 ```text
-<catalogId>-<redisStreamEventId>
+<serviceType>-<redisStreamEventId>
 ```
 
 A rejected command uses:
 
 ```text
-<catalogId>-<commandId>-rejected
+<serviceType>-<commandId>-rejected
 ```
 
 Inbound command job IDs are chosen by the trusted producer and should match the

@@ -1,8 +1,19 @@
 # Lua state transitions
 
-All financial read/check/write/event operations execute atomically in Redis.
+All state and outbox operations execute atomically in Redis.
 The TypeScript service owns validation and key construction; scripts own race
 safety and idempotency.
+
+## OBSERVE_SCRIPT
+
+Records one DEV catalog charge without reading or changing any wallet, plan, or
+reservation key. It atomically writes `CREDIT_OBSERVED` to the transactional
+outbox and an idempotency hash retained for `retentionMs`.
+
+- exact request retry returns the original Stream event ID;
+- changed amount, operation, or environment returns a conflict; and
+- the event reports `requestedAmount`, `deductedAmount=0`, `environment=DEV`,
+  and `billingMode=OBSERVE`.
 
 ## GRANT_SCRIPT
 
@@ -18,8 +29,9 @@ It validates both identifiers:
 - safe-integer overflow returns `-4`;
 - a new already-expired plan returns `-5`.
 
-On success it updates the FIFO order, plan attribute hashes, aggregate balance,
-plan-expiration index, idempotency hash, and `CREDIT_GRANTED` event.
+On success it updates the FIFO order, plan attribute hashes (including the
+immutable `criticalBalance`), aggregate balance, plan-expiration index,
+idempotency hash, and `CREDIT_GRANTED` event.
 
 ## RESERVE_SCRIPT
 
@@ -41,8 +53,8 @@ Return codes:
 
 Expired-plan cleanup may still occur when a reservation is insufficient; the
 credit reservation itself never partially deducts. One `RESERVED` event is
-appended per allocation. A threshold crossing appends `CRITICAL_BALANCE` with
-the final contributing plan ID.
+appended per allocation. Reserve never emits a low-balance alert because the
+deduction is not permanent until commit.
 
 Success returns:
 
@@ -55,7 +67,10 @@ Success returns:
 
 Changes `RESERVED` to `COMMITTED`, removes the lease index, applies retention,
 and appends one `COMMITTED` event for every stored plan allocation. Credit is not
-deducted again.
+deducted again. After each allocation event, it reads that plan's current
+remaining balance and immutable threshold. If the plan is at or below its
+threshold, it appends one `CRITICAL_BALANCE` event containing the plan and
+aggregate balances.
 
 Commit is allowed after a funding plan expires because eligibility was checked
 at reservation time.

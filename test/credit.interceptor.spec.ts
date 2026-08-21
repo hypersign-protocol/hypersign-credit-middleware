@@ -13,7 +13,7 @@ import { DEFAULT_CREDIT_OPTIONS } from '../src/credit.constants';
 const options = {
   ...DEFAULT_CREDIT_OPTIONS,
   catalog: {
-    catalogId: 'test-service',
+    serviceType: 'test-service',
     version: '1',
     routes: [
       {
@@ -37,6 +37,7 @@ const options = {
 
 const subject = { appId: 'user_123' };
 const reservation = (id: string, mode: 'IMMEDIATE' | 'DEFERRED' = 'IMMEDIATE') => ({
+  billingMode: 'ENFORCE' as const,
   charge: {
     id: id.includes('deferred') ? 'txn' : 'api',
     creditType: id.includes('deferred') ? 'BLOCKCHAIN_CREDIT' : 'API_CREDIT',
@@ -51,10 +52,26 @@ const reservation = (id: string, mode: 'IMMEDIATE' | 'DEFERRED' = 'IMMEDIATE') =
     remainingBalance: 80,
     expiresAt: Date.now() + 60_000,
     autoRecover: mode === 'IMMEDIATE',
+    environment: 'PROD' as const,
+    billingMode: 'ENFORCE' as const,
     existing: false,
     settlementMode: mode,
     subject,
     allocations: [{ planId: 'plan-1', amount: 20, planBalanceAfter: 80 }],
+  },
+});
+
+const observation = () => ({
+  billingMode: 'OBSERVE' as const,
+  charge: {
+    id: 'api', creditType: 'API_CREDIT', amount: 20,
+    settlementMode: 'IMMEDIATE' as const, autoRecover: true,
+  },
+  observation: {
+    eventId: '100-0', requestId: 'request_1:api', scopeId: 'scope',
+    environment: 'DEV' as const, billingMode: 'OBSERVE' as const,
+    requestedAmount: 20, deductedAmount: 0 as const, existing: false,
+    operation: 'POST /api/jobs', subject: { ...subject, creditType: 'API_CREDIT' },
   },
 });
 
@@ -66,13 +83,17 @@ const httpContext = (request: Record<PropertyKey, unknown>): ExecutionContext =>
 describe('catalog-driven CreditInterceptor', () => {
   const credits = { commit: jest.fn() } as unknown as jest.Mocked<CreditService>;
   const executor = {
-    reserve: jest.fn(),
+    apply: jest.fn(),
     claim: jest.fn(),
     rollbackAll: jest.fn(),
   } as unknown as jest.Mocked<CreditPolicyExecutor>;
   const configured = {
     ...options,
-    requestContextResolver: () => ({ subject, requestId: 'request_1' }),
+    requestContextResolver: (request: unknown) => ({
+      subject,
+      requestId: 'request_1',
+      environment: (request as { environment?: 'PROD' | 'DEV' }).environment ?? 'PROD',
+    }),
   };
   const catalog = new CreditCatalogService(configured);
   const interceptor = new CreditInterceptor(catalog, executor, credits, configured);
@@ -87,16 +108,16 @@ describe('catalog-driven CreditInterceptor', () => {
     const request: Record<PropertyKey, unknown> = {
       method: 'POST', originalUrl: '/api/jobs?trace=1',
     };
-    executor.reserve.mockResolvedValue([reservation('res_1')]);
+    executor.apply.mockResolvedValue([reservation('res_1')]);
 
     await expect(lastValueFrom(interceptor.intercept(
       httpContext(request),
       { handle: () => of({ ok: true }) } as CallHandler,
     ))).resolves.toEqual({ ok: true });
 
-    expect(executor.reserve).toHaveBeenCalledWith(
+    expect(executor.apply).toHaveBeenCalledWith(
       expect.objectContaining({ path: '/api/jobs', operation: 'POST /api/jobs' }),
-      { subject, requestId: 'request_1' },
+      { subject, requestId: 'request_1', environment: 'PROD' },
     );
     expect(credits.commit).toHaveBeenCalledWith('res_1');
     expect(request[CREDIT_REQUEST_STATE]).toBeDefined();
@@ -107,7 +128,7 @@ describe('catalog-driven CreditInterceptor', () => {
       httpContext({ method: 'GET', originalUrl: '/api/free' }),
       { handle: () => of('free') } as CallHandler,
     ))).resolves.toBe('free');
-    expect(executor.reserve).not.toHaveBeenCalled();
+    expect(executor.apply).not.toHaveBeenCalled();
   });
 
   it('rejects a runtime route that is absent from the catalog', () => {
@@ -118,7 +139,7 @@ describe('catalog-driven CreditInterceptor', () => {
   });
 
   it('commits immediate charges and leaves deferred charges reserved', async () => {
-    executor.reserve.mockResolvedValue([
+    executor.apply.mockResolvedValue([
       reservation('res_api'),
       reservation('res_deferred', 'DEFERRED'),
     ]);
@@ -133,7 +154,7 @@ describe('catalog-driven CreditInterceptor', () => {
   });
 
   it('does not execute the controller and preserves a reserve failure', async () => {
-    executor.reserve.mockRejectedValue(new InsufficientCreditsException());
+    executor.apply.mockRejectedValue(new InsufficientCreditsException());
     const next = { handle: jest.fn(() => of('never')) } as CallHandler;
 
     await expect(lastValueFrom(interceptor.intercept(
@@ -146,7 +167,7 @@ describe('catalog-driven CreditInterceptor', () => {
   it('rolls back every reservation when the controller fails', async () => {
     const applied = [reservation('res_1')];
     const failure = new Error('controller failed');
-    executor.reserve.mockResolvedValue(applied);
+    executor.apply.mockResolvedValue(applied);
 
     await expect(lastValueFrom(interceptor.intercept(
       httpContext({ method: 'POST', originalUrl: '/api/jobs' }),
@@ -160,7 +181,7 @@ describe('catalog-driven CreditInterceptor', () => {
     const route = catalog.find('POST', '/api/jobs')!;
     const boundary = {
       route,
-      reservations: applied,
+      actions: applied,
       claimedByInterceptor: false,
       finalized: false,
     };
@@ -175,9 +196,29 @@ describe('catalog-driven CreditInterceptor', () => {
       { handle: () => of('ok') } as CallHandler,
     ));
 
-    expect(executor.reserve).not.toHaveBeenCalled();
+    expect(executor.apply).not.toHaveBeenCalled();
     expect(executor.claim).toHaveBeenCalled();
     expect(boundary.claimedByInterceptor).toBe(true);
     expect(boundary.finalized).toBe(true);
+  });
+
+  it('executes a DEV request after observation without committing credit', async () => {
+    const request: Record<PropertyKey, unknown> = {
+      method: 'POST', originalUrl: '/api/jobs', environment: 'DEV',
+    };
+    executor.apply.mockResolvedValue([observation()]);
+
+    await expect(lastValueFrom(interceptor.intercept(
+      httpContext(request),
+      { handle: () => of({ ok: true }) } as CallHandler,
+    ))).resolves.toEqual({ ok: true });
+
+    expect(executor.apply).toHaveBeenCalledWith(expect.anything(), {
+      subject, requestId: 'request_1', environment: 'DEV',
+    });
+    expect(credits.commit).not.toHaveBeenCalled();
+    expect(request[CREDIT_REQUEST_STATE]).toEqual(expect.objectContaining({
+      actions: [expect.objectContaining({ billingMode: 'OBSERVE' })],
+    }));
   });
 });

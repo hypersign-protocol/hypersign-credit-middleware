@@ -16,6 +16,7 @@ import {
   GET_PLANS_SCRIPT,
   GET_RESERVATION_SCRIPT,
   GRANT_SCRIPT,
+  OBSERVE_SCRIPT,
   RECOVER_SCRIPT,
   REMOVE_EXPIRATION_SCRIPT,
   RENEW_SCRIPT,
@@ -35,6 +36,8 @@ import {
   CreditSubject,
   GrantCreditsInput,
   GrantCreditsResult,
+  ObserveCreditInput,
+  ObserveCreditResult,
   ReserveCreditInput,
   ReserveCreditResult,
   ResolvedCreditOptions,
@@ -77,10 +80,13 @@ export class CreditService {
     const subject = this.keys.subject(input.subject);
     positiveInteger(input.amount, 'amount');
     const settlementMode = input.settlementMode ?? 'IMMEDIATE';
+    const environment = input.environment ?? 'PROD';
+    if (environment !== 'PROD') {
+      throw new TypeError('reserve() supports only the PROD environment');
+    }
     if (input.autoRecover === false && settlementMode !== 'DEFERRED') {
       throw new TypeError('autoRecover can be disabled only for DEFERRED reservations');
     }
-    const threshold = this.resolveThreshold(subject);
     const reservationId = randomUUID();
     const leaseToken = randomUUID();
     const requestId = input.requestId?.trim() || randomUUID();
@@ -118,10 +124,10 @@ export class CreditService {
       settlementMode,
       operation,
       autoRecover ? '1' : '0',
-      threshold,
       this.options.eventStreamMaxLength,
       this.options.maxPlanAllocationsPerReservation,
-      this.options.catalog.catalogId,
+      this.options.catalog.serviceType,
+      environment,
     ) as Array<string | number>;
 
     if (!Array.isArray(result)) throw new Error(`Unexpected Redis reserve result: ${String(result)}`);
@@ -144,10 +150,66 @@ export class CreditService {
       remainingBalance: safeNonNegative(result[1], 'remainingBalance'),
       expiresAt: safePositive(result[2], 'expiresAt'),
       autoRecover: storedAutoRecover,
+      environment: 'PROD',
+      billingMode: 'ENFORCE',
       existing: Number(result[3]) === 1,
       settlementMode,
       subject,
       allocations,
+    };
+  }
+
+  /** Records a DEV usage event without reading or mutating wallet balances. */
+  async observe(input: ObserveCreditInput): Promise<ObserveCreditResult> {
+    const subject = this.keys.subject(input.subject);
+    positiveInteger(input.amount, 'amount');
+    if (input.environment !== 'DEV') {
+      throw new TypeError('observe() supports only the DEV environment');
+    }
+    const requestId = identifier(input.requestId?.trim() || randomUUID(), 'requestId');
+    const scopeId = this.keys.scopeId(subject);
+    const operation = input.operation?.trim() ?? '';
+    const result = await this.redis.eval(
+      OBSERVE_SCRIPT,
+      2,
+      this.keys.observation(subject, requestId),
+      this.keys.eventStream(),
+      Date.now(),
+      this.options.catalog.serviceType,
+      scopeId,
+      subject.appId,
+      subject.tenantId ?? '',
+      subject.appType ?? '',
+      subject.creditType ?? '',
+      requestId,
+      operation,
+      input.amount,
+      input.environment,
+      this.options.eventStreamMaxLength,
+      this.options.retentionMs,
+    ) as Array<string | number>;
+    if (!Array.isArray(result)) {
+      throw new Error(`Unexpected Redis observe result: ${String(result)}`);
+    }
+    if (Number(result[0]) === -1) {
+      throw new BadRequestException(
+        'requestId was reused with different observation semantics',
+      );
+    }
+    if (result.length !== 2) {
+      throw new Error(`Unexpected Redis observe result: ${String(result)}`);
+    }
+    return {
+      eventId: String(result[0]),
+      requestId,
+      scopeId,
+      environment: 'DEV',
+      billingMode: 'OBSERVE',
+      requestedAmount: input.amount,
+      deductedAmount: 0,
+      existing: Number(result[1]) === 1,
+      operation: operation || undefined,
+      subject,
     };
   }
 
@@ -157,6 +219,7 @@ export class CreditService {
     const planId = identifier(input.planId, 'planId');
     const referenceId = identifier(input.referenceId, 'referenceId');
     positiveInteger(input.amount, 'grant amount');
+    nonNegativeInteger(input.criticalBalance, 'criticalBalance');
     positiveInteger(input.grantedAt, 'grantedAt');
     positiveInteger(input.expiresAt, 'expiresAt');
     const now = Date.now();
@@ -168,7 +231,7 @@ export class CreditService {
     const expirationMember = this.keys.planExpirationMember(subject, planId);
     const result = await this.redis.eval(
       GRANT_SCRIPT,
-      13,
+      14,
       this.keys.balance(subject),
       this.keys.planOrder(subject),
       this.keys.planAmounts(subject),
@@ -182,6 +245,7 @@ export class CreditService {
       this.keys.grant(referenceId),
       this.keys.planExpirations(),
       this.keys.eventStream(),
+      this.keys.planCriticalBalances(subject),
       planId,
       input.amount,
       input.grantedAt,
@@ -197,8 +261,9 @@ export class CreditService {
       this.options.retentionMs,
       this.options.eventStreamMaxLength,
       this.options.maxActivePlans,
-      this.options.catalog.catalogId,
+      this.options.catalog.serviceType,
       expirationMember,
+      input.criticalBalance,
     ) as Array<string | number>;
     if (Number(result[0]) === -1) {
       throw new BadRequestException('planId was reused with different grant semantics');
@@ -226,6 +291,7 @@ export class CreditService {
       balance: safeNonNegative(result[0], 'balance'),
       planBalance: safeNonNegative(result[1], 'planBalance'),
       expiresAt: input.expiresAt,
+      criticalBalance: input.criticalBalance,
       existing: Number(result[2]) === 1,
       subject,
     };
@@ -236,16 +302,19 @@ export class CreditService {
     if (!reservation) return false;
     const result = await this.redis.eval(
       COMMIT_SCRIPT,
-      4,
+      7,
       this.keys.reservation(reservationId),
       this.keys.expirations(),
       this.keys.eventStream(),
       this.keys.request(reservation.subject, reservation.requestId!),
+      this.keys.planRemaining(reservation.subject),
+      this.keys.planCriticalBalances(reservation.subject),
+      this.keys.balance(reservation.subject),
       Date.now(),
       reservationId,
       this.options.retentionMs,
       this.options.eventStreamMaxLength,
-      this.options.catalog.catalogId,
+      this.options.catalog.serviceType,
     ) as Array<string | number>;
     return Number(result[0]) === 1;
   }
@@ -337,7 +406,7 @@ export class CreditService {
         now,
         planId,
         member,
-        this.options.catalog.catalogId,
+        this.options.catalog.serviceType,
         scopeId,
         subject.appId,
         subject.tenantId ?? '',
@@ -387,6 +456,8 @@ export class CreditService {
       createdAt: safePositive(data.createdAt, 'createdAt'),
       expiresAt: safePositive(data.expiresAt, 'expiresAt'),
       autoRecover: data.autoRecover !== '0',
+      environment: productionEnvironment(data.environment),
+      billingMode: 'ENFORCE',
       finalizedAt: data.finalizedAt ? safePositive(data.finalizedAt, 'finalizedAt') : undefined,
       finalizationReason: data.finalizationReason,
       settlementMode: settlementMode(data.settlementMode),
@@ -415,13 +486,14 @@ export class CreditService {
     const subject = this.keys.subject(subjectInput);
     const raw = await this.redis.eval(
       GET_PLANS_SCRIPT,
-      6,
+      7,
       this.keys.planAmounts(subject),
       this.keys.planRemaining(subject),
       this.keys.planExpires(subject),
       this.keys.planGrantedAt(subject),
       this.keys.planReferences(subject),
       this.keys.planStatuses(subject),
+      this.keys.planCriticalBalances(subject),
     );
     const parsed = JSON.parse(String(raw)) as Array<Record<string, unknown>>;
     const now = Date.now();
@@ -436,6 +508,10 @@ export class CreditService {
         availableAmount: status === 'EXPIRED'
           ? 0
           : safeNonNegative(plan.availableAmount, 'plan.availableAmount'),
+        criticalBalance: safeNonNegative(
+          plan.criticalBalance,
+          'plan.criticalBalance',
+        ),
         grantedAt: safePositive(plan.grantedAt, 'plan.grantedAt'),
         expiresAt,
         referenceId: identifier(plan.referenceId, 'plan.referenceId'),
@@ -485,7 +561,7 @@ export class CreditService {
       reservation.reservationId,
       this.options.retentionMs,
       this.options.eventStreamMaxLength,
-      this.options.catalog.catalogId,
+      this.options.catalog.serviceType,
     ) as Array<string | number>;
     if (Number(result[0]) !== 1) return null;
     const outcomes = JSON.parse(String(result[9])) as Array<Record<string, unknown>>;
@@ -499,14 +575,6 @@ export class CreditService {
     };
   }
 
-  private resolveThreshold(subject: CreditSubject): number {
-    const configured = this.options.criticalBalance;
-    const threshold = typeof configured === 'function' ? configured(subject) : configured;
-    if (!Number.isSafeInteger(threshold) || threshold < 0) {
-      throw new TypeError('criticalBalance must resolve to a non-negative safe integer');
-    }
-    return threshold;
-  }
 }
 
 function parseAllocations(raw: string): CreditPlanAllocation[] {
@@ -564,6 +632,20 @@ function positiveInteger(value: unknown, field: string): number {
   return Number(value);
 }
 
+function nonNegativeInteger(value: unknown, field: string): number {
+  if (!Number.isSafeInteger(value) || Number(value) < 0) {
+    throw new TypeError(`${field} must be a non-negative safe integer`);
+  }
+  return Number(value);
+}
+
+function productionEnvironment(value: unknown): 'PROD' {
+  if (value !== 'PROD') {
+    throw new Error('Redis reservation environment must be PROD');
+  }
+  return 'PROD';
+}
+
 function safePositive(value: unknown, field: string): number {
   return positiveInteger(Number(value), field);
 }
@@ -602,6 +684,7 @@ export {
   GET_BALANCE_SCRIPT,
   GET_PLANS_SCRIPT,
   GRANT_SCRIPT,
+  OBSERVE_SCRIPT,
   RECOVER_SCRIPT,
   REMOVE_EXPIRATION_SCRIPT,
   RENEW_SCRIPT,
