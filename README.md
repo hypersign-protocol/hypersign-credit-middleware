@@ -3,7 +3,7 @@
 Catalog-driven credit enforcement for NestJS, backed by atomic Redis Lua
 transactions and BullMQ lifecycle transport.
 
-- [Integration guide](docs/integration-guide.md)
+- [Complete integration procedure](docs/integration-guide.md)
 - [Developer reference](docs/developer-guide.md)
 - [Technical architecture](docs/technical-architecture.md)
 - [Redis keyspace](docs/redis-keyspace.md)
@@ -59,8 +59,12 @@ CreditModule.forRootAsync({
   useFactory: () => ({
     requestContextResolver: (unknownRequest: unknown) => {
       const request = unknownRequest as AuthenticatedRequest;
+      const appId = request.service?.appId?.trim();
       const environment = request.service?.env?.trim();
 
+      if (!appId) {
+        throw new UnauthorizedException('Trusted service appId is required');
+      }
       if (
         environment !== CreditEnvironment.PROD &&
         environment !== CreditEnvironment.DEV
@@ -72,8 +76,8 @@ CreditModule.forRootAsync({
 
       return {
         subject: {
-          tenantId: request.service?.subdomain,
-          appId: request.service?.appId ?? '',
+          tenantId: request.service?.subdomain?.trim() || undefined,
+          appId,
           appType: CreditAppType.CAVACH_API,
           creditType: CreditType.API_CREDIT,
         },

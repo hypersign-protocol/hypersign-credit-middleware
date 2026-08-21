@@ -508,11 +508,12 @@ can be reclaimed after `pendingIdleMs`.
 
 ```ts
 // app.module.ts
-import { Module } from '@nestjs/common';
+import { Module, UnauthorizedException } from '@nestjs/common';
 import {
   CreditAppType,
   CreditEnvironment,
   CreditModule,
+  CreditType,
 } from '@hypersign-protocol/credit-middleware';
 import { CreditInfrastructureModule } from './credit-infrastructure.module';
 
@@ -533,18 +534,27 @@ interface AuthenticatedRequest {
       redisHashTag: 'hypersign-credit',
       requestContextResolver: (unknownRequest) => {
         const request = unknownRequest as AuthenticatedRequest;
+        const appId = request.service?.appId?.trim();
         const environment = request.service?.env?.trim();
+        if (!appId) {
+          throw new UnauthorizedException(
+            'Trusted service appId is required',
+          );
+        }
         if (
           environment !== CreditEnvironment.PROD &&
           environment !== CreditEnvironment.DEV
         ) {
-          throw new Error('Trusted service environment must be prod or dev');
+          throw new UnauthorizedException(
+            'Trusted service environment must be prod or dev',
+          );
         }
         return {
           subject: {
-            tenantId: request.service?.subdomain,
-            appId: request.service?.appId ?? '',
+            tenantId: request.service?.subdomain?.trim() || undefined,
+            appId,
             appType: CreditAppType.CAVACH_API,
+            creditType: CreditType.API_CREDIT,
           },
           requestId: request.requestId,
           environment,

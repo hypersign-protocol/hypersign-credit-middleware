@@ -8,6 +8,10 @@ Example server for sending grant commands and receiving lifecycle events. It:
 
 This server is excluded from the published npm package.
 
+Use the [integration guide](../../docs/integration-guide.md) for the numbered
+API-server and credit-management-server setup. This page documents the example
+endpoint and process.
+
 ## Run
 
 ```sh

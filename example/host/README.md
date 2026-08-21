@@ -2,6 +2,9 @@
 
 Example modules for registering the SDK in a NestJS application.
 
+Use the [integration guide](../../docs/integration-guide.md) for the numbered
+setup and verification procedure. This page documents the example files.
+
 | Repository file | Host path | Responsibility |
 | --- | --- | --- |
 | `credit-infrastructure.module.ts` | `src/credit/credit-infrastructure.module.ts` | Provides and closes the Redis operation client. |
